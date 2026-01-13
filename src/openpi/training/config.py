@@ -96,7 +96,7 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
-
+    local_files_path: str | None = None
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -285,7 +285,7 @@ class DualYamDataConfig(DataConfigFactory):
     # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions: bool = True
     # If provided, will be injected into the input data if the "prompt" key is not present.
-    default_prompt: str | None
+    default_prompt: str | None = ""
     # If true, this will convert the joint and gripper values from the standard Aloha space to
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
@@ -618,13 +618,13 @@ _CONFIGS = [
             action_horizon=60,
         ),
         data=DualYamDataConfig(
-            repo_id="d900/wrap_toy_483",
-            assets="dual_yam",
-            base_config=DataConfig(prompt_from_task=True),
+            repo_id="d900/wrap_toy_483_old",
+            # assets=AssetsConfig()
+            base_config=DataConfig(prompt_from_task=True, local_files_path="/inspire/hdd/global_user/gongjingjing-25039/sdzhang/dataset/worldengine/we_lerobot_data/d900/wrap_toy_483_old"),
             use_delta_joint_actions=False,
             adapt_to_pi=False
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(""),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=64,
@@ -636,13 +636,13 @@ _CONFIGS = [
             action_horizon=60,
         ),
         data=DualYamDataConfig(
-            repo_id="d900/wrap_toy_483",
-            assets="dual_yam",
-            base_config=DataConfig(prompt_from_task=True),
+            repo_id="d900/wrap_toy_483_old",
+            # assets="dual_yam",
+            base_config=DataConfig(prompt_from_task=True,  local_files_path="/inspire/hdd/global_user/gongjingjing-25039/sdzhang/dataset/worldengine/we_lerobot_data/d900/wrap_toy_483_old"),
             use_delta_joint_actions=True,
             adapt_to_pi=False
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(""),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=64,
