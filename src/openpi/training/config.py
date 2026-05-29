@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.tabletop_policy as tabletop_policy
 import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -516,6 +517,77 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotTabletopDataConfig(DataConfigFactory):
+    """Data config for the Tabletop-Sim (dual-arm Aloha in MuJoCo).
+
+    The dataset is expected to be in LeRobot format with these keys:
+      observation.images.agentview    -- main overhead camera
+      observation.images.wrist_left   -- left wrist camera
+      observation.images.wrist_right  -- right wrist camera
+      observation.state.joint_pos     -- qpos [14]
+      action.joint_pos                -- target joint positions [14]
+      task                            -- language instruction
+
+    All gripper values are in tabletop's [-1, 1] normalized space.
+    We therefore set adapt_to_pi=False (no Aloha-specific gripper conversion).
+    """
+
+    # Convert arm joints to delta actions; keep grippers absolute.
+    # Set to False when dataset already stores absolute joint positions (tabletop default).
+    use_delta_joint_actions: bool = False
+
+    # Repack transform maps lerobot dataset keys to the inference observation keys.
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.agentview",
+                            "cam_left_wrist": "observation.images.wrist_left",
+                            "cam_right_wrist": "observation.images.wrist_right",
+                        },
+                        "state": "observation.state.joint_pos",
+                        "actions": "action.joint_pos",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action.joint_pos",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[tabletop_policy.TabletopInputs(
+                action_dim=model_config.action_dim,
+                model_type=model_config.model_type,
+            )],
+            outputs=[tabletop_policy.TabletopOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            # Arms: delta actions.  Grippers: absolute.
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            prompt_from_task=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -656,6 +728,35 @@ _CONFIGS = [
         batch_size=32,
         num_workers=64,
         save_interval=40_000
+    ),
+    #
+    # Fine-tuning Tabletop-Sim configs.
+    #
+    # Replace `repo_id` with your own LeRobot dataset and set `local_files_path` if needed.
+    TrainConfig(
+        name="pi0_tabletop",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_tabletop",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=16,
+        save_interval=5_000,
     ),
     #
     # Inference Aloha configs.

@@ -1,0 +1,125 @@
+"""Policy transforms for the Tabletop-Sim environment.
+
+The Tabletop-Sim uses the dual-arm Aloha robot in MuJoCo (via dm_control).
+
+State / action space (joint_pos mode, 14 dims):
+  [left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]
+  - Joint angles are in radians.
+  - Gripper values are in [-1, 1] (tabletop's own normalized space, NOT the
+    Aloha linear-space used by the real robot).
+
+Because the gripper normalization convention differs from the real Aloha robot,
+we use adapt_to_pi=False so no gripper-space conversion is performed.
+
+Camera names:
+  cam_high        -- main overhead/back camera (480x640 -> resized to 224x224)
+  cam_left_wrist  -- left wrist camera
+  cam_right_wrist -- right wrist camera
+"""
+
+import dataclasses
+
+import einops
+import numpy as np
+
+from openpi import transforms
+from openpi.models import model as _model
+
+
+def make_tabletop_example() -> dict:
+    """Creates a random input example for the tabletop policy (for testing)."""
+    return {
+        "state": np.random.rand(14).astype(np.float32),
+        "images": {
+            "cam_high": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+            "cam_left_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+            "cam_right_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
+        },
+        "prompt": "pick up the box",
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class TabletopInputs(transforms.DataTransformFn):
+    """Input transform for the Tabletop-Sim policy.
+
+    Expected inputs (from env or lerobot dataset after repack):
+      - images: dict[name, img] where img is CHW uint8 or float32.
+                name must be a subset of: cam_high, cam_left_wrist, cam_right_wrist.
+      - state:   float32 [14]  -- qpos in tabletop normalized space
+      - actions: float32 [T, 14] -- only present during training
+      - prompt:  str
+    """
+
+    action_dim: int
+    model_type: _model.ModelType = _model.ModelType.PI0
+
+    EXPECTED_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+
+    def __call__(self, data: dict) -> dict:
+        in_images = data["images"]
+        unknown = set(in_images) - set(self.EXPECTED_CAMERAS)
+        if unknown:
+            raise ValueError(f"Unexpected camera keys: {unknown}")
+
+        def to_hwc_uint8(img: np.ndarray) -> np.ndarray:
+            img = np.asarray(img)
+            if np.issubdtype(img.dtype, np.floating):
+                img = (255 * img).astype(np.uint8)
+            if img.shape[0] == 3:  # CHW -> HWC
+                img = einops.rearrange(img, "c h w -> h w c")
+            return img
+
+        base_image = to_hwc_uint8(in_images["cam_high"])
+
+        # Map camera names to model image slots.
+        match self.model_type:
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                extra_slots = {
+                    "left_wrist_0_rgb": "cam_left_wrist",
+                    "right_wrist_0_rgb": "cam_right_wrist",
+                }
+            case _model.ModelType.PI0_FAST:
+                extra_slots = {
+                    "base_1_rgb": "cam_left_wrist",
+                    "wrist_0_rgb": "cam_right_wrist",
+                }
+            case _:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
+
+        images = {"base_0_rgb": base_image}
+        image_masks = {"base_0_rgb": np.True_}
+
+        for dest, source in extra_slots.items():
+            if source in in_images:
+                images[dest] = to_hwc_uint8(in_images[source])
+                image_masks[dest] = np.True_
+            else:
+                images[dest] = np.zeros_like(base_image)
+                image_masks[dest] = np.False_
+
+        inputs = {
+            "image": images,
+            "image_mask": image_masks,
+            "state": transforms.pad_to_dim(np.asarray(data["state"]), self.action_dim),
+        }
+
+        if "actions" in data:
+            inputs["actions"] = transforms.pad_to_dim(np.asarray(data["actions"]), self.action_dim)
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class TabletopOutputs(transforms.DataTransformFn):
+    """Output transform for the Tabletop-Sim policy.
+
+    Returns the first 14 action dimensions (joint_pos format).
+    No gripper-space conversion is applied (tabletop uses its own [-1, 1] space).
+    """
+
+    def __call__(self, data: dict) -> dict:
+        return {"actions": np.asarray(data["actions"][:, :14])}

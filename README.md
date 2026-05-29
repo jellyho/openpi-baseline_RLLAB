@@ -83,6 +83,113 @@ This script refers to the implementation in [kai0](https://github.com/OpenDriveL
 
 ---
 
+# Tabletop-Sim
+
+`examples/tabletop_sim/` contains an inference / evaluation script for running openpi policies on the [Tabletop-Sim](third_party/Tabletop-Sim) MuJoCo environment (dual-arm Aloha robot).
+
+## Task: aloha_handover_box
+
+A bimanual coordination task that requires two distinct sub-skills in sequence.
+
+**Scenario**
+A soda box is placed on the left side of the table and a pink fabric cube (basket) is placed on the right side. The robot must:
+1. **Pick up** the box with the **left arm**.
+2. **Hand it over** to the **right arm** in the air.
+3. **Place** the box into the pink basket with the **right arm**.
+
+Success is defined as the box making contact with the basket and holding that contact for 20 consecutive simulation steps (~0.8 s). Episode length: **15 s**.
+
+**Randomisation per episode**
+
+| Object | Position jitter | Rotation jitter |
+|---|---|---|
+| Box | ±2.5 cm (x, y) | ±random yaw |
+| Basket | ±2.0 cm (x, y) | fixed |
+
+**Language instruction**: `"Handover the box and place into the pink basket"`
+
+**Variant — `aloha_handover_box_new`**: Same task and reward, but three distractor objects (stacking rings, a turtle toy, a flip animal toy) are added to the table to test visual robustness. This variant shares the same benchmark initial states as `aloha_handover_box`.
+
+## Action / State Space
+
+| Field | Dims | Convention |
+|---|---|---|
+| `state` (qpos) | 14 | `[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]` |
+| `actions` (joint_pos) | 14 | Same layout — absolute joint positions, gripper in **[-1, 1]** |
+
+Gripper values use the tabletop's own normalization (`ALOHA_GRIPPER_NORMALIZE_FN`), **not** the real Aloha linear-space convention. The policy therefore uses `adapt_to_pi=False`.
+
+## Training
+
+### 1. Prepare the dataset
+
+The dataset is uploaded to HuggingFace Hub as a LeRobot dataset and is referenced directly in the training config:
+
+```
+jellyho/aloha_handover_box_joint_pos_rl
+```
+
+No local conversion is needed — the dataloader pulls the dataset automatically via `HF_LEROBOT_HOME`. Set that env variable in [`setup_env.sh`](setup_env.sh) to control the cache location.
+
+### 2. Training config
+
+The `pi0_tabletop` and `pi05_tabletop` configs in [`src/openpi/training/config.py`](src/openpi/training/config.py) already point to this dataset. The `LeRobotTabletopDataConfig` repack transform maps lerobot keys to inference keys automatically:
+
+| Dataset key | Inference key |
+|---|---|
+| `observation.images.agentview` | `images["cam_high"]` |
+| `observation.images.wrist_left` | `images["cam_left_wrist"]` |
+| `observation.images.wrist_right` | `images["cam_right_wrist"]` |
+| `observation.state.joint_pos` | `state` |
+| `action.joint_pos` | `actions` |
+| `task` | `prompt` |
+
+### 3. Compute norm stats and run training
+
+```bash
+uv run scripts/compute_norm_stats.py --config-name pi0_tabletop
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_tabletop \
+    --exp-name my_run --overwrite
+```
+
+## Evaluation
+
+Start the policy server (in a separate terminal):
+
+```bash
+uv run scripts/serve_policy.py policy:checkpoint \
+    --policy.config=pi0_tabletop \
+    --policy.dir=checkpoints/pi0_tabletop/my_run/30000
+```
+
+Run the evaluation script:
+
+```bash
+# Single task, 50 episodes
+uv run examples/tabletop_sim/main.py \
+    --task_name aloha_lift_box \
+    --num_episodes 50
+
+# All tasks, 20 episodes each
+uv run examples/tabletop_sim/main.py \
+    --task_name all \
+    --num_episodes 20
+```
+
+Key options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--task_name` | `aloha_lift_box` | Task name, or `all` to evaluate every task |
+| `--num_episodes` | `50` | Rollouts per task |
+| `--replan_steps` | `5` | How many steps to execute per action chunk |
+| `--use_benchmark_init` | `True` | Use reproducible initial states |
+| `--video_out_path` | `data/tabletop_sim/videos` | Where to save rollout videos |
+| `--action_space` | `joint_pos` | `joint_pos`, `ee_quat_pos`, or `ee_6d_pos` |
+
+---
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
