@@ -738,6 +738,10 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(),
         data=LeRobotTabletopDataConfig(
             repo_id="jellyho/aloha_handover_box_joint_pos_rl",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi0_base/assets",
+                asset_id="trossen",
+            ),
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
         ),
@@ -749,6 +753,10 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotTabletopDataConfig(
             repo_id="jellyho/aloha_handover_box_joint_pos_rl",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
         ),
@@ -756,13 +764,17 @@ _CONFIGS = [
         num_train_steps=30_000,
         batch_size=32,
         num_workers=16,
-        save_interval=5_000,
+        save_interval=10_000,
     ),
     TrainConfig(
         name="pi05_tabletop_bc",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotTabletopDataConfig(
             repo_id="jellyho/aloha_handover_box_joint_pos_bc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
         ),
@@ -770,7 +782,7 @@ _CONFIGS = [
         num_train_steps=30_000,
         batch_size=32,
         num_workers=16,
-        save_interval=5_000,
+        save_interval=10_000,
     ),
     #
     # Inference Aloha configs.

@@ -134,12 +134,12 @@ The `pi05_tabletop', 'pi05_tabletop_bc' configs in [`src/openpi/training/config.
 | `action` | `actions` |
 | `task` | `prompt` |
 
-### 3. Compute norm stats and run training
+### 3. Run training
+
+Norm stats are loaded directly from the pi05 base checkpoint (`asset_id=trossen`), so **no separate norm stats computation is needed**.
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_tabletop
-
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_tabletop \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_tabletop_bc \
     --exp-name my_run --overwrite
 ```
 
