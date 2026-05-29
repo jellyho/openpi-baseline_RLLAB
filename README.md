@@ -160,7 +160,7 @@ Run the evaluation script:
 uv run examples/tabletop_sim/main.py \
     --args.task-name aloha_handover_box \
     --args.num-episodes 50 \
-    --args.replan-steps 8
+    --args.replan-steps 25
 ```
 
 Key options:
@@ -169,10 +169,17 @@ Key options:
 |---|---|---|
 | `--args.task-name` | `aloha_handover_box` | Task name, or `all` to evaluate every task |
 | `--args.num-episodes` | `50` | Rollouts per task |
-| `--args.replan-steps` | `5` | How many steps to execute per action chunk |
+| `--args.replan-steps` | `25` | Steps to execute per action chunk (= action_horizon / 2) |
 | `--args.use-benchmark-init` | `True` | Use reproducible initial states |
 | `--args.video-out-path` | `data/tabletop_sim/videos` | Where to save rollout videos |
-| `--args.action-space` | `joint_pos` | `joint_pos`, `ee_quat_pos`, or `ee_6d_pos` |
+
+### Baseline Results
+
+Evaluated on `aloha_handover_box` with `benchmark_init`, 50 episodes, `replan_steps=25`.
+
+| Model | Dataset | Success Rate |
+|---|---|---|
+| `pi05_tabletop_bc` | `jellyho/aloha_handvoer_box_joint_pos_bc` (success only) | --% |
 
 ---
 
