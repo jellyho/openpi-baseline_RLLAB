@@ -10,9 +10,9 @@ Follow the three steps below to reproduce the baseline.
 
 ### 0. Quick Environment Setup
 ```bash
-git clone https://github.com/posttraining-for-robotics/openpi-baseline.git
+git clone --recurse-submodules https://github.com/jellyho/openpi-baseline_RLLAB.git
 
-cd openpi-baseline
+cd openpi-baseline_RLLAB
 
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
@@ -97,18 +97,7 @@ A soda box is placed on the left side of the table and a pink fabric cube (baske
 2. **Hand it over** to the **right arm** in the air.
 3. **Place** the box into the pink basket with the **right arm**.
 
-Success is defined as the box making contact with the basket and holding that contact for 20 consecutive simulation steps (~0.8 s). Episode length: **15 s**.
-
-**Randomisation per episode**
-
-| Object | Position jitter | Rotation jitter |
-|---|---|---|
-| Box | ±2.5 cm (x, y) | ±random yaw |
-| Basket | ±2.0 cm (x, y) | fixed |
-
 **Language instruction**: `"Handover the box and place into the pink basket"`
-
-**Variant — `aloha_handover_box_new`**: Same task and reward, but three distractor objects (stacking rings, a turtle toy, a flip animal toy) are added to the table to test visual robustness. This variant shares the same benchmark initial states as `aloha_handover_box`.
 
 ## Action / State Space
 
@@ -126,30 +115,31 @@ Gripper values use the tabletop's own normalization (`ALOHA_GRIPPER_NORMALIZE_FN
 The dataset is uploaded to HuggingFace Hub as a LeRobot dataset and is referenced directly in the training config:
 
 ```
-jellyho/aloha_handover_box_joint_pos_rl
+jellyho/aloha_handover_box_joint_pos_rl (Including Failure)
+jellyho/aloha_handvoer_box_joint_pos_bc (Only Success)
 ```
 
 No local conversion is needed — the dataloader pulls the dataset automatically via `HF_LEROBOT_HOME`. Set that env variable in [`setup_env.sh`](setup_env.sh) to control the cache location.
 
 ### 2. Training config
 
-The `pi0_tabletop` and `pi05_tabletop` configs in [`src/openpi/training/config.py`](src/openpi/training/config.py) already point to this dataset. The `LeRobotTabletopDataConfig` repack transform maps lerobot keys to inference keys automatically:
+The `pi05_tabletop', 'pi05_tabletop_bc' configs in [`src/openpi/training/config.py`](src/openpi/training/config.py) already point to this dataset. The `LeRobotTabletopDataConfig` repack transform maps lerobot keys to inference keys automatically:
 
 | Dataset key | Inference key |
 |---|---|
-| `observation.images.agentview` | `images["cam_high"]` |
+| `observation.images.back` | `images["cam_high"]` |
 | `observation.images.wrist_left` | `images["cam_left_wrist"]` |
 | `observation.images.wrist_right` | `images["cam_right_wrist"]` |
-| `observation.state.joint_pos` | `state` |
-| `action.joint_pos` | `actions` |
+| `observation.state` | `state` |
+| `action` | `actions` |
 | `task` | `prompt` |
 
 ### 3. Compute norm stats and run training
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi0_tabletop
+uv run scripts/compute_norm_stats.py --config-name pi05_tabletop
 
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_tabletop \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_tabletop \
     --exp-name my_run --overwrite
 ```
 
@@ -159,34 +149,30 @@ Start the policy server (in a separate terminal):
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi0_tabletop \
-    --policy.dir=checkpoints/pi0_tabletop/my_run/30000
+    --policy.config=pi05_tabletop \
+    --policy.dir=checkpoints/pi05_tabletop/my_run/30000
 ```
 
 Run the evaluation script:
 
 ```bash
-# Single task, 50 episodes
+# Single task, 5 episodes
 uv run examples/tabletop_sim/main.py \
-    --task_name aloha_lift_box \
-    --num_episodes 50
-
-# All tasks, 20 episodes each
-uv run examples/tabletop_sim/main.py \
-    --task_name all \
-    --num_episodes 20
+    --args.task-name aloha_handover_box \
+    --args.num-episodes 50 \
+    --args.replan-steps 8
 ```
 
 Key options:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--task_name` | `aloha_lift_box` | Task name, or `all` to evaluate every task |
-| `--num_episodes` | `50` | Rollouts per task |
-| `--replan_steps` | `5` | How many steps to execute per action chunk |
-| `--use_benchmark_init` | `True` | Use reproducible initial states |
-| `--video_out_path` | `data/tabletop_sim/videos` | Where to save rollout videos |
-| `--action_space` | `joint_pos` | `joint_pos`, `ee_quat_pos`, or `ee_6d_pos` |
+| `--args.task-name` | `aloha_handover_box` | Task name, or `all` to evaluate every task |
+| `--args.num-episodes` | `50` | Rollouts per task |
+| `--args.replan-steps` | `5` | How many steps to execute per action chunk |
+| `--args.use-benchmark-init` | `True` | Use reproducible initial states |
+| `--args.video-out-path` | `data/tabletop_sim/videos` | Where to save rollout videos |
+| `--args.action-space` | `joint_pos` | `joint_pos`, `ee_quat_pos`, or `ee_6d_pos` |
 
 ---
 

@@ -8,6 +8,7 @@ import tyro
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.serving import websocket_policy_server
+from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 
 
@@ -54,6 +55,13 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # Optional path to a directory containing pre-computed norm stats (e.g. ./assets/pi05_tabletop).
+    # Useful when serving a base model checkpoint (e.g. pi05_base) with norm stats computed from a
+    # different dataset, without needing a fully trained fine-tuned checkpoint.
+    # The directory must contain <asset_id>/norm_stats.json (same layout as assets/ produced by
+    # compute_norm_stats.py). If not set, norm stats are loaded from inside the checkpoint directory.
+    norm_stats_dir: str | None = None
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -87,10 +95,21 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    norm_stats = None
+    if args.norm_stats_dir is not None:
+        train_config = _config.get_config(args.policy.config) if isinstance(args.policy, Checkpoint) else None
+        if train_config is not None:
+            data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+            norm_stats = _checkpoints.load_norm_stats(args.norm_stats_dir, data_config.asset_id)
+            logging.info("Loaded norm stats from %s (asset_id=%s)", args.norm_stats_dir, data_config.asset_id)
+
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                norm_stats=norm_stats,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)
