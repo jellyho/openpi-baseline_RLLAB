@@ -4,3 +4,6 @@
 [submodule "third_party/libero"]
 	path = third_party/libero
 	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+[submodule "third_party/Tabletop-Sim"]
+	path = third_party/Tabletop-Sim
+	url = https://github.com/jellyho/Tabletop-Sim.git
