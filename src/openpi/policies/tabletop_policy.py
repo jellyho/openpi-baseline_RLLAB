@@ -49,9 +49,10 @@ class TabletopInputs(transforms.DataTransformFn):
       - state:   float32 [14]  -- qpos in tabletop normalized space
       - actions: float32 [T, 14] -- only present during training
       - prompt:  str
+
+    Padding to action_dim is handled downstream by PadStatesAndActions in model_transforms.
     """
 
-    action_dim: int
     model_type: _model.ModelType = _model.ModelType.PI0
 
     EXPECTED_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
@@ -101,11 +102,11 @@ class TabletopInputs(transforms.DataTransformFn):
         inputs = {
             "image": images,
             "image_mask": image_masks,
-            "state": transforms.pad_to_dim(np.asarray(data["state"]), self.action_dim),
+            "state": np.asarray(data["state"]),
         }
 
         if "actions" in data:
-            inputs["actions"] = transforms.pad_to_dim(np.asarray(data["actions"]), self.action_dim)
+            inputs["actions"] = np.asarray(data["actions"])
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]

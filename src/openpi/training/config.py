@@ -562,7 +562,6 @@ class LeRobotTabletopDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
             inputs=[tabletop_policy.TabletopInputs(
-                action_dim=model_config.action_dim,
                 model_type=model_config.model_type,
             )],
             outputs=[tabletop_policy.TabletopOutputs()],
