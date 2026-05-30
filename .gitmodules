@@ -10,3 +10,6 @@
 [submodule "third_party/LPS"]
 	path = third_party/LPS
 	url = git@github.com:jellyho/LPS.git
+[submodule "third_party/alphaflow"]
+	path = third_party/alphaflow
+	url = https://github.com/snap-research/alphaflow.git
