@@ -117,7 +117,6 @@ The dataset is uploaded to HuggingFace Hub as a LeRobot dataset and is reference
 ```
 jellyho/aloha_handover_box_joint_pos_rl (Including Failure)
 jellyho/aloha_handvoer_box_joint_pos_bc (Only Success)
-
 ```
 
 No local conversion is needed — the dataloader pulls the dataset automatically via `HF_LEROBOT_HOME`. Set that env variable in [`setup_env.sh`](setup_env.sh) to control the cache location.
@@ -140,8 +139,8 @@ The `pi05_tabletop', 'pi05_tabletop_bc' configs in [`src/openpi/training/config.
 Norm stats are loaded directly from the pi05 base checkpoint (`asset_id=trossen`), so **no separate norm stats computation is needed**.
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_tabletop_bc \
-    --exp-name my_run --overwrite
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 srun --gres=gpu:1 --nodelist node200 -c 32 uv run scripts/train.py pi05_alphaflow_tabletop_bc_orig \
+    --exp-name alphaflow_orig --overwrite
 ```
 
 ## Evaluation

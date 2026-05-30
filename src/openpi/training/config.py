@@ -686,23 +686,22 @@ _CONFIGS = [
     #
     # Alpha-Flow fine-tuning configs  (use with scripts/train_alphaflow.py).
     #
-    # The weight_loader here is a no-op placeholder; AlphaFlowWeightLoader in
-    # train_alphaflow.py replaces it at runtime with the pretrained Pi05 params.
-    # When resuming, the alphaflow checkpoint is loaded instead.
+    # AlphaFlowWeightLoader loads the pretrained Pi05 base checkpoint and keeps
+    # new params (r_proj) at zero-init.  When resuming, the alphaflow checkpoint
+    # is loaded instead (standard orbax restore).
     #
     # Usage:
-    #   uv run scripts/train_alphaflow.py pi05_alphaflow_tabletop \
-    #       --pretrained-checkpoint <path/to/pi05/params> \
+    #   uv run scripts/train_alphaflow.py pi05_alphaflow_tabletop_bc_orig \
     #       --exp-name <run_name>
     #
     TrainConfig(
-        name="pi05_alphaflow_tabletop",
+        name="pi05_alphaflow_tabletop_bc_orig",
         model=pi0_alphaflow.Pi0AlphaFlowConfig(
             pi05=True,
             # warmup_ratio=0.2, transition_ratio=0.8  ← defaults, adapts to num_train_steps
         ),
         data=LeRobotTabletopDataConfig(
-            repo_id="jellyho/aloha_handover_box_joint_pos_bc",
+            repo_id="jellyho/aloha_handover_box_joint_pos_bc_orig",
             assets=AssetsConfig(
                 assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
                 asset_id="trossen",
@@ -710,7 +709,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
         ),
-        weight_loader=weight_loaders.NoOpWeightLoader(),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=32,
@@ -731,7 +730,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.NoOpWeightLoader(),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=64,
@@ -752,7 +751,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.NoOpWeightLoader(),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=64,

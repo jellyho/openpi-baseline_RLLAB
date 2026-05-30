@@ -13,27 +13,23 @@ Phases 1-2 share the same JIT-compiled train step (discrete).
 Phase 3 uses a separate JIT-compiled train step (JVP) to avoid paying
 the JVP cost during phases 1-2.  Switching is done at the Python level.
 
+The pretrained checkpoint is specified via AlphaFlowWeightLoader in the
+training config (config.py) — no extra CLI argument needed.
+
 Usage:
-    uv run scripts/train_alphaflow.py <config_name> \\
-        --pretrained-checkpoint <path/to/pi05/params> \\
-        --exp-name <run_name>
+    uv run scripts/train_alphaflow.py <config_name> --exp-name <run_name>
 
     # Resume
-    uv run scripts/train_alphaflow.py <config_name> \\
-        --pretrained-checkpoint <path/to/pi05/params> \\
-        --exp-name <run_name> --resume
+    uv run scripts/train_alphaflow.py <config_name> --exp-name <run_name> --resume
 """
 
-import argparse
 import dataclasses
 import functools
 import logging
 import platform
-import sys
 
 import etils.epath as epath
 import flax.nnx as nnx
-import flax.traverse_util as traverse_util
 from flax.training import common_utils
 import jax
 import jax.experimental
@@ -98,47 +94,6 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
             project=config.project_name,
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
-
-
-# ---------------------------------------------------------------------------
-# Weight loader: Pi05 checkpoint → Pi0AlphaFlow (r_proj stays at zero-init)
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass(frozen=True)
-class AlphaFlowWeightLoader(_weight_loaders.WeightLoader):
-    """
-    Loads a Pi05 checkpoint into Pi0AlphaFlow.
-
-    Params present in the checkpoint are copied over.
-    New params (r_proj) keep their zero-initialized values by returning a
-    jax.ShapeDtypeStruct placeholder — the same pattern used for LoRA weights.
-    """
-    params_path: str
-
-    def load(self, params: at.Params) -> at.Params:
-        loaded = _model.restore_params(
-            _weight_loaders.download.maybe_download(self.params_path),
-            restore_type=np.ndarray,
-        )
-        flat_ref    = traverse_util.flatten_dict(params, sep="/")
-        flat_loaded = traverse_util.flatten_dict(loaded, sep="/")
-
-        result = {}
-        for k, v in flat_loaded.items():
-            if k in flat_ref:
-                ref_dtype = flat_ref[k].dtype
-                result[k] = v.astype(ref_dtype) if v.dtype != ref_dtype else v
-
-        new_keys = set(flat_ref) - set(result)
-        if new_keys:
-            logging.info(
-                "AlphaFlowWeightLoader: %d new param(s) kept at zero-init: %s",
-                len(new_keys), sorted(new_keys),
-            )
-        for k in new_keys:
-            result[k] = flat_ref[k]   # ShapeDtypeStruct → filtered out later
-
-        return traverse_util.unflatten_dict(result, sep="/")
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +259,7 @@ def train_step_jvp(
 # Main loop
 # ---------------------------------------------------------------------------
 
-def main(config: _config.TrainConfig, pretrained_checkpoint: str):
+def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -341,12 +296,6 @@ def main(config: _config.TrainConfig, pretrained_checkpoint: str):
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
-
-    if not resuming:
-        config = dataclasses.replace(
-            config,
-            weight_loader=AlphaFlowWeightLoader(params_path=pretrained_checkpoint),
-        )
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -432,12 +381,4 @@ def main(config: _config.TrainConfig, pretrained_checkpoint: str):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--pretrained-checkpoint", required=True,
-                        help="Path to the Pi05 checkpoint params directory.")
-    known, remaining = parser.parse_known_args()
-
-    sys.argv = [sys.argv[0]] + remaining
-    train_config = _config.cli()
-
-    main(train_config, pretrained_checkpoint=known.pretrained_checkpoint)
+    main(_config.cli())

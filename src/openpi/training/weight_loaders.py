@@ -73,6 +73,27 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+@dataclasses.dataclass(frozen=True)
+class AlphaFlowWeightLoader(WeightLoader):
+    """Loads a Pi05 checkpoint into Pi0AlphaFlow.
+
+    Behaves like CheckpointWeightLoader but handles new params in Pi0AlphaFlow
+    (e.g. r_proj) that are absent from the pretrained Pi05 checkpoint.
+    New params are kept at their initialised values (zeros for r_proj)
+    by returning a jax.ShapeDtypeStruct placeholder — the same pattern
+    used for LoRA weights in CheckpointWeightLoader.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(
+            download.maybe_download(self.params_path), restore_type=np.ndarray
+        )
+        # Keep all new Pi0AlphaFlow params (e.g. r_proj) at init values.
+        return _merge_params(loaded_params, params, missing_regex=".*r_proj.*")
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
