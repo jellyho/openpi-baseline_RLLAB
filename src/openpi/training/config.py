@@ -15,6 +15,7 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
+import openpi.models.pi0_alphaflow as pi0_alphaflow
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -682,6 +683,81 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    #
+    # Alpha-Flow fine-tuning configs  (use with scripts/train_alphaflow.py).
+    #
+    # The weight_loader here is a no-op placeholder; AlphaFlowWeightLoader in
+    # train_alphaflow.py replaces it at runtime with the pretrained Pi05 params.
+    # When resuming, the alphaflow checkpoint is loaded instead.
+    #
+    # Usage:
+    #   uv run scripts/train_alphaflow.py pi05_alphaflow_tabletop \
+    #       --pretrained-checkpoint <path/to/pi05/params> \
+    #       --exp-name <run_name>
+    #
+    TrainConfig(
+        name="pi05_alphaflow_tabletop",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            # warmup_ratio=0.2, transition_ratio=0.8  ← defaults, adapts to num_train_steps
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_bc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    TrainConfig(
+        name="pi05_alphaflow_insert-mouse-battery",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            # warmup_ratio=0.2, transition_ratio=0.8  ← defaults, adapts to num_train_steps
+        ),
+        data=DualYamDataConfig(
+            repo_id="insert-mouse-battery/expert-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/Your/path/to/Posttraining-RFM-RSS2026/Challenge-phase1-dataset/insert-mouse-battery/expert-data",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=10_000,
+    ),
+    TrainConfig(
+        name="pi05_alphaflow_seal-water-bottle-cap",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            # warmup_ratio=0.2, transition_ratio=0.8  ← defaults, adapts to num_train_steps
+        ),
+        data=DualYamDataConfig(
+            repo_id="seal-water-bottle-cap/expert-data",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/Your/path/to/Posttraining-RFM-RSS2026/Challenge-phase1-dataset/seal-water-bottle-cap/expert-data",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=10_000,
+    ),
     # Challenge Baseline Examples
     TrainConfig(
         name="pi05_insert-mouse-battery",
