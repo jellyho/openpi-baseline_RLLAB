@@ -62,7 +62,11 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "mujoco==3.2.0", "dm-control==1.0.21"]
+# av 14.3.0/14.4.0 ship NO wheels (sdist only) → forces a source build that needs
+# ffmpeg 7 dev libs (we have ffmpeg 6, no -dev).  Pin to 14.2.0, the newest av with
+# prebuilt wheels that still satisfies lerobot's `av>=14.2.0`.  The wheel bundles
+# its own ffmpeg, so no system ffmpeg/dev packages are required.
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "mujoco==3.2.0", "dm-control==1.0.21", "av==14.2.0"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

@@ -143,6 +143,62 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 srun --gres=gpu:1 --nodelist node200 -c 32 uv
     --exp-name alphaflow_orig --overwrite
 ```
 
+### Available Training Configs
+
+All configs live in [`src/openpi/training/config.py`](src/openpi/training/config.py). Run any of them with `./train.sh <config> <gpus> <batch/gpu> <steps>` (default `30000` steps, batch `32`). Dataset suffixes: `_rl` = RL dataset (includes failures), `_bc` = behaviour-cloning (success only), `_orig` = the "orig" data variant, `_mc` = carries the Monte-Carlo `mc_return` column (required by critic / LPS configs, produced by [`scripts/compute_mc_returns.py`](scripts/compute_mc_returns.py)).
+
+For the `H#` / `O#` / `A#` references and the full debugging history of the alpha-flow 1-NFE work, see [`docs/alphaflow_troubleshooting.md`](docs/alphaflow_troubleshooting.md).
+
+**Standard flow-matching baselines** (`Pi0` / `Pi0Config`, multi-step sampling)
+
+| Config | Model | Dataset | Description |
+|---|---|---|---|
+| `pi05_tabletop` | Pi05 FM | `..._rl` | Standard Pi05 flow-matching fine-tune on the RL dataset (incl. failures). |
+| `pi05_tabletop_bc` | Pi05 FM | `..._bc` | Same, on the success-only BC dataset. |
+| `pi0_tabletop` | Pi0 FM | `..._rl` | Pi0 (not Pi05) flow-matching fine-tune on the RL dataset. |
+
+**Alpha-Flow 1-NFE distillation** (`Pi0AlphaFlow`) — fine-tunes Pi05 into a 1-step policy via the alpha-flow / MeanFlow curriculum. ⭐ = recommended.
+
+| Config | Dataset | Key knobs | Description |
+|---|---|---|---|
+| `pi05_alphaflow_tabletop_bc_orig` | `..._bc_orig` | defaults | Alpha-flow on the BC dataset. Defaults: JVP on, curriculum 0.3/0.7, adaptive reweight. |
+| `pi05_alphaflow_tabletop_rl_orig` | `..._rl_orig_mc` | defaults | Baseline alpha-flow on the RL dataset. **JVP diverges** at the end (see O5/O6). |
+| `pi05_alphaflow_tabletop_rl_orig_nojvp` | `..._rl_orig_mc` | `use_jvp=False` | H5: discrete-only MeanFlow (alpha floors at `alpha_min`, no JVP). Stable minimal-change control. |
+| `pi05_alphaflow_tabletop_rl_orig_beta` | `..._rl_orig_mc` | `time_sampler="beta"` | H2: pi05-matching beta time sampler instead of min-max. (O2: no effect — superseded.) |
+| `pi05_alphaflow_tabletop_rl_orig_gaussian` | `..._rl_orig_mc` | `sphere_latent=False` | H3: Gaussian latent prior instead of the sphere prior. (O2: ≈ identical — superseded.) |
+| `pi05_alphaflow_tabletop_mf_from_start` | `..._rl_orig_mc` | `warmup=0, transition=0, mf_loss_weight=1` | A1 ablation: MeanFlow from scratch, no curriculum (discrete). |
+| `pi05_alphaflow_tabletop_mf_from_start_jvp` | `..._rl_orig_mc` | `warmup=0, transition=0, use_jvp=True` | A1 ablation: MeanFlow from scratch with JVP (least stable, expected to diverge). |
+| ⭐ `pi05_alphaflow_tabletop_paper` | `..._rl_orig_mc` | TSE recipe | **AlphaFlowTSE (2603.10701) consolidated recipe** (O7): no JVP, bounded reweight, `alpha_min=0.1`, 15% large-span, 50/50 FM/MF split, λ 0.6/0.4. |
+| ⭐ `pi05_alphaflow_tabletop_paper_rl` | `..._rl_mc` | TSE recipe | Same TSE recipe, on the plain (non-"orig") RL dataset — same data as the critic runs. |
+| ⭐ `pi05_alphaflow_tabletop_paper_bc` | `..._bc_orig` | TSE recipe | Same TSE recipe, on the success-only BC dataset. |
+| `pi05_alphaflow_tabletop_paper_jvp` | `..._rl_orig_mc` | TSE recipe + JVP | Faithful JVP MeanFlow with the alpha=0 blow-up fixes: `use_jvp=True`, bounded reweight (learns mean-velocity during transition), clamped JVP target, `alpha_min=5e-3`, last ~20% is the exact-MeanFlow JVP phase. |
+| `pi05_alphaflow_insert-mouse-battery` | challenge | defaults | Alpha-flow on the `insert-mouse-battery` challenge task (DualYam data). |
+| `pi05_alphaflow_seal-water-bottle-cap` | challenge | defaults | Alpha-flow on the `seal-water-bottle-cap` challenge task (DualYam data). |
+
+**Alpha-Flow + Critic** (`Pi0WithCritic`) — adds a 3rd Gemma expert: a distributional C51/HL-Gauss value head trained jointly with the action expert (requires an `_mc` dataset).
+
+| Config | Dataset | Key knobs | Description |
+|---|---|---|---|
+| `pi05_alphaflow_critic_tabletop` | `..._rl_mc` | defaults | Joint alpha-flow + critic. **Uses the old (default) recipe → JVP diverges.** |
+| `pi05_alphaflow_critic_tabletop_orig` | `..._rl_orig_mc` | defaults | Same, on the orig dataset. Same JVP caveat. |
+| ⭐ `pi05_alphaflow_critic_tabletop_paper` | `..._rl_mc` | TSE recipe + critic | Critic + the validated AlphaFlowTSE recipe (no JVP, bounded reweight, etc.). **Use this to train a with-critic model.** |
+
+**LPS-RFT — offline RL via Latent Policy Steering** (`Pi0LPSRFT`) — loads a trained critic checkpoint, adds a latent-actor expert, freezes the VLM + action decoder, and steers the frozen 1-NFE policy toward high-value actions (CrossQ chunked-TD critic + DDPG actor).
+
+| Config | Dataset | Description |
+|---|---|---|
+| `pi05_lps_rft_tabletop` | `..._rl_mc` | Offline RL fine-tune. Init from a `pi05_alphaflow_critic_tabletop` checkpoint (update the `weight_loader` path to your run/step). |
+
+**Challenge-phase baselines** (standard Pi05 FM, 200k steps, DualYam data)
+
+| Config | Task |
+|---|---|
+| `pi05_insert-mouse-battery` | `insert-mouse-battery` challenge task |
+| `pi05_seal-water-bottle-cap` | `seal-water-bottle-cap` challenge task |
+| `pi05_tower-of-hanoi-game` | `tower-of-hanoi-game` challenge task |
+
+> The upstream openpi repo also ships generic configs (`pi05_libero`, `pi05_droid`, `pi05_aloha`, …) further down the file; those are not part of the RLLAB tabletop baseline.
+
 ## Evaluation
 
 Start the policy server (in a separate terminal):

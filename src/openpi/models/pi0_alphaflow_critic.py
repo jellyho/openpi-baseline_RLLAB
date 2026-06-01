@@ -233,6 +233,7 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self._transition_end = int(config.transition_ratio * config.num_train_steps)
         self._alpha_gamma    = config.alpha_gamma
         self._alpha_min      = config.alpha_min
+        self._alpha_eta      = config.alpha_eta
         self._mf_loss_weight = config.mf_loss_weight
         self.sphere_latent   = config.sphere_latent
         self.time_sampler    = config.time_sampler

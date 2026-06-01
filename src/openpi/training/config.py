@@ -894,8 +894,116 @@ _CONFIGS = [
             flow_ratio=0.5,
             lambda_fm=0.6,
             lambda_mf=0.4,
+            warmup_ratio=0.05,        # TSE: alpha=1 for the first 5%
+            transition_ratio=1.0,     # TSE: sigmoid 1->0.1 anneals over the rest (epochs 5-100)
+            alpha_gamma=15.0,         # TSE: sigmoid steepness k=15
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Same AlphaFlowTSE recipe as pi05_alphaflow_tabletop_paper, but on the plain
+    # (non-"orig") tabletop RL dataset _rl_mc — the same data the critic runs use.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_paper_rl",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=False,
+            alpha_min=0.1,
+            mf_reweight="bounded",
+            reweight_kappa=1.0,
+            large_span_ratio=0.15,
+            flow_ratio=0.5,
+            lambda_fm=0.6,
+            lambda_mf=0.4,
+            warmup_ratio=0.05,        # TSE: alpha=1 for the first 5%
+            transition_ratio=1.0,     # TSE: sigmoid 1->0.1 anneals over the rest (epochs 5-100)
+            alpha_gamma=15.0,         # TSE: sigmoid steepness k=15
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Same AlphaFlowTSE recipe as pi05_alphaflow_tabletop_paper, but on the
+    # success-only BC dataset _bc_orig (no mc_return needed — plain alpha-flow).
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_paper_bc",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=False,
+            alpha_min=0.1,
+            mf_reweight="bounded",
+            reweight_kappa=1.0,
+            large_span_ratio=0.15,
+            flow_ratio=0.5,
+            lambda_fm=0.6,
+            lambda_mf=0.4,
+            warmup_ratio=0.05,        # TSE: alpha=1 for the first 5%
+            transition_ratio=1.0,     # TSE: sigmoid 1->0.1 anneals over the rest (epochs 5-100)
+            alpha_gamma=15.0,         # TSE: sigmoid steepness k=15
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_bc_orig",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Faithful JVP MeanFlow with the two stability fixes for the alpha=0 blow-up
+    # (see docs/alphaflow_troubleshooting.md):
+    #   - mf_reweight="bounded": full-strength mean-velocity gradient during the
+    #     discrete transition (the old weight=alpha throttled it to ~0, so the
+    #     model entered JVP with a non-smooth u and exploding dudt).
+    #   - the JVP target is now clamped to ±10 like the discrete branch (was
+    #     unbounded), so a large dudt can't blow up the target the instant alpha=0.
+    # alpha_min=5e-3 (NOT 0.1) so eta is small and alpha actually reaches 0 → JVP;
+    # transition_ratio=0.8 leaves the last ~20% as the exact-MeanFlow JVP phase.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_paper_jvp",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=True,
+            jvp_fp32=True,
+            alpha_min=5e-3,
+            mf_reweight="bounded",
+            reweight_kappa=1.0,
+            large_span_ratio=0.15,
+            flow_ratio=0.5,
+            lambda_fm=0.6,
+            lambda_mf=0.4,
             warmup_ratio=0.05,
-            transition_ratio=0.67,
+            transition_ratio=0.8,     # last ~20% is the exact-MeanFlow JVP phase
+            alpha_gamma=15.0,         # TSE sigmoid steepness k=15
         ),
         data=LeRobotTabletopDataConfig(
             repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
@@ -919,6 +1027,44 @@ _CONFIGS = [
         name="pi05_alphaflow_critic_tabletop",
         model=pi0_alphaflow_critic.Pi0WithCriticConfig(
             pi05=True,
+            num_train_steps=30_000,   # keep in sync with TrainConfig.num_train_steps below
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Alpha-flow + Critic with the AlphaFlowTSE (2603.10701) recipe — same paper
+    # knobs as pi05_alphaflow_tabletop_paper (no JVP, bounded reweight, alpha_min
+    # 0.1, 15% large-span, 50/50 split, lambda 0.6/0.4) plus the C51 critic.
+    # Use this (not the default critic configs, which still run the old diverging
+    # JVP recipe) to train a with-critic model with the validated TSE design.
+    TrainConfig(
+        name="pi05_alphaflow_critic_tabletop_paper",
+        model=pi0_alphaflow_critic.Pi0WithCriticConfig(
+            pi05=True,
+            use_jvp=False,
+            alpha_min=0.1,
+            mf_reweight="bounded",
+            reweight_kappa=1.0,
+            large_span_ratio=0.15,
+            flow_ratio=0.5,
+            lambda_fm=0.6,
+            lambda_mf=0.4,
+            warmup_ratio=0.05,        # TSE: alpha=1 for the first 5%
+            transition_ratio=1.0,     # TSE: sigmoid 1->0.1 anneals over the rest (epochs 5-100)
+            alpha_gamma=15.0,         # TSE: sigmoid steepness k=15
             num_train_steps=30_000,   # keep in sync with TrainConfig.num_train_steps below
         ),
         data=LeRobotTabletopDataConfig(

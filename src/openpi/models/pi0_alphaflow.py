@@ -167,6 +167,7 @@ class Pi0AlphaFlow(Pi0):
         self._transition_end = int(config.transition_ratio * config.num_train_steps)
         self._alpha_gamma    = config.alpha_gamma
         self._alpha_min      = config.alpha_min
+        self._alpha_eta      = config.alpha_eta
         self._mf_loss_weight = config.mf_loss_weight
         self.sphere_latent   = config.sphere_latent
         self.time_sampler    = config.time_sampler
@@ -330,7 +331,7 @@ class Pi0AlphaFlow(Pi0):
         return alpha_schedule(
             self.train_step.value,
             self._warmup_end, self._transition_end,
-            self._alpha_gamma, self._alpha_min, floor,
+            self._alpha_gamma, self._alpha_eta, floor,
         )
 
     # ------------------------------------------------------------------
@@ -427,7 +428,8 @@ class Pi0AlphaFlow(Pi0):
         # lax.cond requires both branches to return identical dtypes — pin to fp32.
         return loss.astype(jnp.float32), raw_l2.astype(jnp.float32)
 
-    def _jvp_branch(self, prefix_kv, observation, actions, noise, t, r, n_fm):
+    def _jvp_branch(self, prefix_kv, observation, actions, noise, t, r, n_fm,
+                    utgt_clamp: float = 10.0):
         """Exact MeanFlow target via JVP (alpha = 0 phase).  Returns [b, ah].
 
         The prefix KV is a closure constant (independent of z, t, r), so jvp
@@ -451,7 +453,12 @@ class Pi0AlphaFlow(Pi0):
                                          compute_dtype=cdt)
 
         u_pred, dudt = jax.jvp(fn, (z_t, t, r), (v_t, jnp.ones_like(t), jnp.zeros_like(r)))
-        u_tgt = jax.lax.stop_gradient(v_t - (t_e - r_e) * dudt)
+        # Clamp the JVP target like the discrete branch.  When the mean-velocity is
+        # under-trained, dudt can be large and u_tgt = v_t - (t-r)*dudt is otherwise
+        # UNbounded — the immediate blow-up the moment alpha hits 0.  The discrete
+        # branch already clips its target to ±utgt_clamp; matching it here makes the
+        # discrete→JVP handoff continuous in target scale.
+        u_tgt = jax.lax.stop_gradient(jnp.clip(v_t - (t_e - r_e) * dudt, -utgt_clamp, utgt_clamp))
         err = u_pred - u_tgt
         loss   = _adaptive_l2_loss(err, weight_scale=1.0)         # [b, ah]
         raw_l2 = jnp.mean(jnp.square(err), axis=-1)               # [b, ah]  plain MSE
@@ -478,7 +485,7 @@ class Pi0AlphaFlow(Pi0):
         return jax.lax.cond(
             alpha > 0.0,
             lambda: self._discrete_branch(prefix_kv, observation, actions, noise, t, r, n_fm, alpha, utgt_clamp),
-            lambda: self._jvp_branch(prefix_kv, observation, actions, noise, t, r, n_fm),
+            lambda: self._jvp_branch(prefix_kv, observation, actions, noise, t, r, n_fm, utgt_clamp),
         )
 
     # ------------------------------------------------------------------
@@ -627,7 +634,14 @@ class Pi0AlphaFlowConfig(pi0_config.Pi0Config):
     warmup_ratio:     float = 0.3   # fraction at which alpha starts decreasing
     transition_ratio: float = 0.7   # fraction at which alpha reaches 0 (JVP starts)
     alpha_gamma:      float = 25.0  # sigmoid temperature (sharpness of transition)
-    alpha_min:        float = 5e-3  # snap-to-boundary threshold (eta in paper)
+    # alpha_min is the DISCRETE FLOOR (use_jvp=False): alpha never goes below this
+    # (AlphaFlowTSE uses 0.1).  It is NOT the boundary-snap threshold — see alpha_eta.
+    alpha_min:        float = 5e-3
+    # alpha_eta is the boundary-snap threshold (paper's eta): raw alpha above 1-eta
+    # snaps to 1, and (use_jvp=True) below eta snaps to 0 → JVP.  Must stay SMALL and
+    # is decoupled from alpha_min, so raising the floor (e.g. 0.1) does not distort
+    # the top of the curriculum / extend the warmup.
+    alpha_eta:        float = 5e-3
 
     # Latent prior: True = hypersphere (LPS), False = standard Gaussian (pi05).
     # Toggle to A/B test whether the sphere prior hurts the alpha-flow fine-tune.

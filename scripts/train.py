@@ -217,6 +217,39 @@ def main(config: _config.TrainConfig):
         )
         logging.info(f"Synced model.num_train_steps -> {config.num_train_steps}")
 
+    # Scale the cosine LR schedule to the run + global batch, so CLI overrides keep
+    # it consistent (reference: batch 32, 1000-step warmup):
+    #   - decay_steps  -> num_train_steps                  (decay spans the run)
+    #   - warmup_steps -> 1000 * 32 / global_batch         (constant warmup in
+    #     samples-seen: bigger batch → fewer warmup steps.  32->1000, 128->250.)
+    #   - peak_lr / decay_lr *= sqrt(global_batch / 32)    (sqrt LR-scaling rule for
+    #     Adam: a 4x bigger batch gets ~2x the LR.  batch 32 -> unchanged.)
+    # Only touch a CosineDecaySchedule that still uses the default decay_steps —
+    # configs that deliberately set a different value (e.g. the long 1_000_000
+    # droid/libero schedules) are left alone.
+    BASE_WARMUP_STEPS, BASE_BATCH = 1000, 32   # reference: 1000-step warmup at batch 32
+    sched = config.lr_schedule
+    if (
+        isinstance(sched, _optimizer.CosineDecaySchedule)
+        and sched.decay_steps == _optimizer.CosineDecaySchedule().decay_steps
+    ):
+        lr_scale = (config.batch_size / BASE_BATCH) ** 0.5   # sqrt LR-scaling rule
+        new_sched = dataclasses.replace(
+            sched,
+            decay_steps=config.num_train_steps,
+            warmup_steps=max(1, round(BASE_WARMUP_STEPS * BASE_BATCH / config.batch_size)),
+            peak_lr=sched.peak_lr * lr_scale,
+            decay_lr=sched.decay_lr * lr_scale,
+        )
+        if new_sched != sched:
+            config = dataclasses.replace(config, lr_schedule=new_sched)
+            logging.info(
+                f"Synced lr_schedule: decay_steps -> {new_sched.decay_steps}, "
+                f"warmup_steps -> {new_sched.warmup_steps}, "
+                f"peak_lr -> {new_sched.peak_lr:.3e} (sqrt-scaled x{lr_scale:.2f}), "
+                f"global batch {config.batch_size}"
+            )
+
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     rng = jax.random.key(config.seed)

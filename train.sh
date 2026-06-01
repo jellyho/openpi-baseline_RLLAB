@@ -13,9 +13,9 @@
 source setup_env.sh
 
 CONFIG=$1
-NUM_GPUS=${2:-1}
+NUM_GPUS=${2:-4}
 BATCH_PER_GPU=${3:-32}
-NUM_STEPS=${4:-30000}
+NUM_STEPS=${4:-7500}
 
 if [ -z "$CONFIG" ]; then
     echo "Usage: $0 <config> <num_gpus> <batch_per_gpu> <num_steps>"
