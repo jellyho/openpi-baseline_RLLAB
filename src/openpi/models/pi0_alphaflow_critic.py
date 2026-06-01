@@ -233,9 +233,18 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self._transition_end = int(config.transition_ratio * config.num_train_steps)
         self._alpha_gamma    = config.alpha_gamma
         self._alpha_min      = config.alpha_min
+        self._mf_loss_weight = config.mf_loss_weight
         self.sphere_latent   = config.sphere_latent
         self.time_sampler    = config.time_sampler
         self.use_jvp         = config.use_jvp
+        self.jvp_fp32        = config.jvp_fp32
+        self._mf_reweight    = config.mf_reweight
+        self._reweight_kappa = config.reweight_kappa
+        self._large_span_ratio = config.large_span_ratio
+        self._flow_ratio     = config.flow_ratio
+        self._lambda_fm      = config.lambda_fm
+        self._lambda_mf      = config.lambda_mf
+        self.delta_conditioning = config.delta_conditioning
         self.train_step      = nnx.Variable(jnp.array(0, dtype=jnp.int32))
 
         self.deterministic = True

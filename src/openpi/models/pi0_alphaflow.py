@@ -47,8 +47,19 @@ def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25
     floor>0.0 (use_jvp=False): alpha is clamped to `floor` (never 0) → the
         loss stays in the discrete branch forever (discrete-only MeanFlow, more
         stable than JVP).  end_val = floor.  `floor` is a static Python value.
+
+    Degenerate curriculum (transition_end <= warmup_end, e.g. both 0):  no
+        warmup / no transition → alpha == end_val from step 0.  This is the
+        "MeanFlow from scratch" ablation (train the mean-velocity objective
+        directly on the pretrained init, skipping the alpha curriculum).
     """
+    end_val = float(floor) if floor > 0.0 else 0.0
     step_f = step.astype(jnp.float32)
+
+    # No curriculum: alpha is constant at end_val for every step.
+    if transition_end <= warmup_end:
+        return jnp.full_like(step_f, end_val)
+
     midpoint = jnp.float32((warmup_end + transition_end) / 2.0)
     width    = jnp.float32(float(transition_end - warmup_end))
 
@@ -57,10 +68,8 @@ def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25
     raw = jnp.where(raw > 1.0 - eta, 1.0, raw)
     if floor > 0.0:
         raw = jnp.maximum(raw, floor)   # clamp to floor (no snap-to-0 → stays discrete)
-        end_val = floor
     else:
         raw = jnp.where(raw < eta, 0.0, raw)   # snap to 0 → JVP branch
-        end_val = 0.0
 
     alpha = jnp.where(step_f <= jnp.float32(warmup_end),    1.0, raw)
     alpha = jnp.where(step_f >= jnp.float32(transition_end), end_val, alpha)
@@ -90,6 +99,24 @@ def _adaptive_l2_loss(error, weight_scale=1.0, c: float = 1e-3):
     w = weight_scale / (sq_err + c)                         # p=1 (official)
     w = jax.lax.stop_gradient(w)
     return w * sq_err
+
+
+def _bounded_l2_loss(error, alpha, kappa: float = 1.0, eps: float = 1e-3):
+    """Bounded alpha^-1 reweighting from AlphaFlowTSE (2603.10701, Eq.18):
+
+        l_bnd(D; a) = sg[ kappa / (m(D) + a*kappa + eps) ] * m(D),   m(D)=mean(D^2)
+
+    vs the plain `_adaptive_l2_loss(weight_scale=alpha)` = alpha/(m+c)*m, which
+    SUPPRESSES the loss as alpha->0 (the small-alpha mean-velocity samples we
+    actually want to learn).  This bounded form instead AMPLIFIES informative
+    (small-alpha) samples — weight -> kappa/(m+eps) ≈ full FM strength as a->0 —
+    while the a*kappa term in the denominator caps the weight so it never blows
+    up.  alpha only modulates the saturation point, not a multiplicative gate.
+    """
+    m = jnp.mean(jnp.square(error), axis=-1)               # (...) = (B, ah)
+    w = kappa / (m + alpha * kappa + eps)
+    w = jax.lax.stop_gradient(w)
+    return w * m
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +167,18 @@ class Pi0AlphaFlow(Pi0):
         self._transition_end = int(config.transition_ratio * config.num_train_steps)
         self._alpha_gamma    = config.alpha_gamma
         self._alpha_min      = config.alpha_min
+        self._mf_loss_weight = config.mf_loss_weight
         self.sphere_latent   = config.sphere_latent
         self.time_sampler    = config.time_sampler
         self.use_jvp         = config.use_jvp
+        self.jvp_fp32        = config.jvp_fp32
+        self._mf_reweight    = config.mf_reweight
+        self._reweight_kappa = config.reweight_kappa
+        self._large_span_ratio = config.large_span_ratio
+        self._flow_ratio     = config.flow_ratio
+        self._lambda_fm      = config.lambda_fm
+        self._lambda_mf      = config.lambda_mf
+        self.delta_conditioning = config.delta_conditioning
 
         # Internal training-step counter (non-trainable nnx state, threaded
         # through jit/optimizer like BatchNorm stats).  Incremented once per
@@ -162,7 +198,12 @@ class Pi0AlphaFlow(Pi0):
         start (pretrained behaviour preserved) but has full capacity to learn.
         """
         tokens, mask, ar_mask, adarms_cond = self.embed_suffix(obs, noisy_actions, timestep)
-        r_emb = posemb_sincos(r, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        # delta_conditioning: embed the interval length Δ (AlphaFlowTSE) instead of
+        # r directly.  Under our t≥r convention the (non-negative) interval length
+        # is t-r, matching the paper's Δ=r-t≥0 (their t<r).  At init r_mlp_out is
+        # zero so both choices are identical; they diverge only as r_mlp learns.
+        r_in = (timestep - r) if self.delta_conditioning else r
+        r_emb = posemb_sincos(r_in, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
         r_emb = self.r_mlp_in(r_emb)
         r_emb = nnx.swish(r_emb)
         r_emb = self.r_mlp_out(r_emb)
@@ -246,11 +287,24 @@ class Pi0AlphaFlow(Pi0):
         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
         return full_attn, positions
 
-    def _action_velocity(self, kv_cache, prefix_mask, observation, noisy_actions, t, r):
-        """Velocity prediction for one action suffix, reusing the cached prefix KV."""
+    def _action_velocity(self, kv_cache, prefix_mask, observation, noisy_actions, t, r,
+                         compute_dtype=None):
+        """Velocity prediction for one action suffix, reusing the cached prefix KV.
+
+        compute_dtype: if set (e.g. jnp.float32), the suffix tokens + adaRMS cond
+            are cast to it so the WHOLE suffix forward runs in that precision
+            (gemma upcasts weights to the activation dtype).  Used by the JVP
+            branch: forward-mode AD (dudt) is far more precision-sensitive than a
+            plain forward eval, and the default bf16 makes the tangent noisy.
+            The cached prefix KV (bf16) is promoted at the attention concat.
+        """
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix_with_r(
             observation, noisy_actions, t, r
         )
+        if compute_dtype is not None:
+            suffix_tokens = suffix_tokens.astype(compute_dtype)
+            if adarms_cond is not None:
+                adarms_cond = adarms_cond.astype(compute_dtype)
         full_attn, positions = self._suffix_attn_and_positions(prefix_mask, suffix_mask, suffix_ar_mask)
         outs, _ = self.PaliGemma.llm(
             self._experts_action(suffix_tokens),
@@ -302,8 +356,12 @@ class Pi0AlphaFlow(Pi0):
 
         FM border samples (first n_fm): r = t  (pure TFM supervision).
         MF samples (rest):              r < t  (t = max, r = min).
+
+        large_span_ratio>0: force the LAST n_ls MF samples to span ~[0,1]
+        (t≥0.85, r≤0.15), so training sees the full-interval transport that
+        1-NFE inference (t=1, r=0) actually uses (AlphaFlowTSE).
         """
-        noise_rng, t_rng, r_rng = jax.random.split(rng, 3)
+        noise_rng, t_rng, r_rng, ls_rng = jax.random.split(rng, 4)
         b           = actions.shape[0]
         batch_shape = actions.shape[:-2]
         noise = self._sample_noise(noise_rng, actions.shape)
@@ -314,6 +372,15 @@ class Pi0AlphaFlow(Pi0):
         r_mf  = jnp.minimum(t1, t2)
         t     = t_all
         r     = jnp.concatenate([t_all[:n_fm], r_mf[n_fm:]], axis=0)
+
+        n_ls = int((b - n_fm) * self._large_span_ratio)
+        if n_ls > 0:
+            ls_t_rng, ls_r_rng = jax.random.split(ls_rng)
+            t_big = 0.85 + 0.15 * jax.random.uniform(ls_t_rng, batch_shape)   # [0.85, 1.0]
+            r_big = 0.15 * jax.random.uniform(ls_r_rng, batch_shape)          # [0.0, 0.15]
+            idx = b - n_ls                                                    # last n_ls are MF
+            t = t.at[idx:].set(t_big[idx:])
+            r = r.at[idx:].set(r_big[idx:])
         return noise, t, r, n_fm
 
     # ------------------------------------------------------------------
@@ -342,11 +409,23 @@ class Pi0AlphaFlow(Pi0):
             jnp.clip(alpha * v_t + (1.0 - alpha) * u_next, -utgt_clamp, utgt_clamp)
         )
         err = u_pred - u_tgt
-        loss_fm = _adaptive_l2_loss(err[:n_fm], weight_scale=1.0)
-        loss_mf = _adaptive_l2_loss(err[n_fm:], weight_scale=alpha)
+        # FM-border anchor: plain adaptive L2 (weight 1/(m+c)).
+        loss_fm = self._lambda_fm * _adaptive_l2_loss(err[:n_fm], weight_scale=1.0)
+        # MF-sample reweighting.
+        #   "bounded" (AlphaFlowTSE Eq.18): kappa/(m+alpha*kappa+eps) — does NOT
+        #       suppress small-alpha samples (the mean-velocity we want to learn).
+        #   "adaptive" (orig): alpha/(m+c), or a fixed mf_loss_weight to decouple
+        #       the loss weight from the schedule alpha.
+        if self._mf_reweight == "bounded":
+            loss_mf = _bounded_l2_loss(err[n_fm:], alpha, kappa=self._reweight_kappa)
+        else:
+            mf_w = alpha if self._mf_loss_weight is None else self._mf_loss_weight
+            loss_mf = _adaptive_l2_loss(err[n_fm:], weight_scale=mf_w)
+        loss_mf = self._lambda_mf * loss_mf
         loss = jnp.concatenate([loss_fm, loss_mf], axis=0)        # [b, ah]
         raw_l2 = jnp.mean(jnp.square(err), axis=-1)               # [b, ah]  plain MSE (FM-comparable)
-        return loss, raw_l2
+        # lax.cond requires both branches to return identical dtypes — pin to fp32.
+        return loss.astype(jnp.float32), raw_l2.astype(jnp.float32)
 
     def _jvp_branch(self, prefix_kv, observation, actions, noise, t, r, n_fm):
         """Exact MeanFlow target via JVP (alpha = 0 phase).  Returns [b, ah].
@@ -362,22 +441,29 @@ class Pi0AlphaFlow(Pi0):
         z_t = t_e * noise + (1.0 - t_e) * actions
         v_t = noise - actions
 
+        # Run the JVP suffix forward in fp32 (jvp_fp32): forward-mode AD is much
+        # more precision-sensitive than a plain forward eval, and the default
+        # bf16 makes the tangent dudt noisy enough to blow up the bootstrap.
+        cdt = jnp.float32 if self.jvp_fp32 else None
+
         def fn(z_val, t_val, r_val):
-            return self._action_velocity(kv, pm, observation, z_val, t_val, r_val)
+            return self._action_velocity(kv, pm, observation, z_val, t_val, r_val,
+                                         compute_dtype=cdt)
 
         u_pred, dudt = jax.jvp(fn, (z_t, t, r), (v_t, jnp.ones_like(t), jnp.zeros_like(r)))
         u_tgt = jax.lax.stop_gradient(v_t - (t_e - r_e) * dudt)
         err = u_pred - u_tgt
         loss   = _adaptive_l2_loss(err, weight_scale=1.0)         # [b, ah]
         raw_l2 = jnp.mean(jnp.square(err), axis=-1)               # [b, ah]  plain MSE
-        return loss, raw_l2
+        # lax.cond requires both branches to return identical dtypes — pin to fp32.
+        return loss.astype(jnp.float32), raw_l2.astype(jnp.float32)
 
     # ------------------------------------------------------------------
     # Alpha-flow loss with shared prefix (lax.cond picks discrete vs JVP)
     # ------------------------------------------------------------------
 
     def _alphaflow_loss_with_prefix(self, rng, observation, actions, prefix_kv, alpha,
-                                    *, flow_ratio: float = 0.25, utgt_clamp: float = 10.0):
+                                    *, flow_ratio: float | None = None, utgt_clamp: float = 10.0):
         """Returns (adaptive loss [b, ah], raw plain-MSE [b, ah]) given a prefix KV.
 
         The raw MSE (mean over action_dim of (u_pred - u_tgt)²) is on the same
@@ -387,6 +473,7 @@ class Pi0AlphaFlow(Pi0):
           alpha > 0  → discrete alpha-flow (no JVP cost)
           alpha == 0 → exact MeanFlow via JVP
         """
+        flow_ratio = self._flow_ratio if flow_ratio is None else flow_ratio
         noise, t, r, n_fm = self._sample_flow_inputs(rng, actions, flow_ratio)
         return jax.lax.cond(
             alpha > 0.0,
@@ -554,6 +641,43 @@ class Pi0AlphaFlowConfig(pi0_config.Pi0Config):
     # unstable: see docs/alphaflow_troubleshooting.md).  If False, alpha floors
     # at alpha_min → discrete-only MeanFlow (more stable, paper's recommendation).
     use_jvp:          bool  = True
+
+    # MF-sample loss weight.  None → weight = alpha (official curriculum
+    # down-weighting).  When alpha is constant (discrete-only / MeanFlow-from-
+    # start) the alpha weight permanently suppresses the mean-velocity gradient,
+    # so set this to 1.0 to decouple the loss weight from the schedule alpha and
+    # give the mean-velocity samples full gradient magnitude.
+    mf_loss_weight:   float | None = None
+
+    # Run the JVP suffix forward in fp32.  Forward-mode AD (the dudt tangent) is
+    # far more precision-sensitive than a plain forward eval; the default bf16
+    # backbone makes dudt noisy enough to destabilize the MeanFlow bootstrap.
+    # True = stable fp32 JVP (recommended).  False = bf16 (reproduces divergence).
+    jvp_fp32:         bool  = True
+
+    # --- AlphaFlowTSE (2603.10701) recipe knobs ---
+    # MF-sample reweighting:  "adaptive" = alpha/(m+c) via mf_loss_weight (orig),
+    # "bounded" = kappa/(m+alpha*kappa+eps) (Eq.18) — does NOT suppress small-alpha
+    # samples, the principled fix for the gradient-suppression problem.
+    mf_reweight:      str   = "adaptive"
+    reweight_kappa:   float = 1.0   # kappa in the bounded reweighting
+
+    # Fraction of MF samples drawn from the large-span subset (t≥0.85, r≤0.15) so
+    # training sees the full-interval transport that 1-NFE inference (t=1,r=0) uses.
+    large_span_ratio: float = 0.0
+
+    # FM-border fraction (r=t pure flow-matching anchor).  AlphaFlowTSE uses 0.5.
+    flow_ratio:       float = 0.25
+
+    # Per-branch loss weights (AlphaFlowTSE: lambda_fm=0.6, lambda_mf=0.4).
+    lambda_fm:        float = 1.0
+    lambda_mf:        float = 1.0
+
+    # Time conditioning:  False = embed r directly (emb(t)+emb(r)), True = embed
+    # the interval length emb(t)+emb(Δ), Δ=r-t (AlphaFlowTSE, default).  Safe to
+    # default on: r_mlp_out is zero-init so r vs Δ are identical at init and only
+    # diverge as r_mlp learns.
+    delta_conditioning: bool = True
 
     # Total training steps — used to convert schedule ratios → absolute steps.
     # The model tracks its own step counter internally so train.py needs no changes.

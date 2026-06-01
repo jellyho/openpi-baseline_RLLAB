@@ -816,6 +816,102 @@ _CONFIGS = [
         num_workers=32,
         save_interval=10_000,
     ),
+    # ── Ablation: MeanFlow from scratch (no alpha curriculum) ──
+    # warmup_ratio=0 & transition_ratio=0 → alpha is constant at end_val from
+    # step 0 (alpha_schedule's degenerate-curriculum path).  Trains the
+    # mean-velocity objective directly on the pretrained init, skipping the
+    # warmup(TFM)→transition curriculum.  Tests whether the curriculum is needed.
+    #
+    # Discrete-only variant (use_jvp=False): alpha == alpha_min from step 0, so
+    # it's the stable discrete bootstrap from the start.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_mf_from_start",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=False,
+            warmup_ratio=0.0,
+            transition_ratio=0.0,
+            mf_loss_weight=1.0,   # no curriculum → don't suppress MF gradient by alpha
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # JVP variant (use_jvp=True): alpha == 0 from step 0 → exact-derivative
+    # MeanFlow from scratch.  Expected to be the least stable (see O5).
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_mf_from_start_jvp",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=True,
+            warmup_ratio=0.0,
+            transition_ratio=0.0,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # ── AlphaFlowTSE (2603.10701) recipe — the consolidated JVP-free design ──
+    # See docs/alphaflow_troubleshooting.md O7.  Discrete-only (no JVP, bf16 OK)
+    # with the paper's stabilizers:
+    #   - bounded reweighting kappa/(m+alpha*kappa+eps): does NOT suppress the
+    #     small-alpha mean-velocity samples (our weight=alpha was killing them).
+    #   - alpha floors at 0.1 (stays well away from the JVP limit).
+    #   - 15% large-span samples (t≥0.85, r≤0.15) → matches 1-NFE full transport.
+    #   - 50/50 FM/MF split with lambda_fm=0.6, lambda_mf=0.4.
+    #   - delta_conditioning (emb(t)+emb(Δ)) is on by default now.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_paper",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=False,
+            alpha_min=0.1,
+            mf_reweight="bounded",
+            reweight_kappa=1.0,
+            large_span_ratio=0.15,
+            flow_ratio=0.5,
+            lambda_fm=0.6,
+            lambda_mf=0.4,
+            warmup_ratio=0.05,
+            transition_ratio=0.67,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
     # Alpha-flow + Critic (LPS-RFT): joint action + value training in one train.py.
     # Uses the _mc dataset (with mc_return column from scripts/compute_mc_returns.py)
     # and LeRobotTabletopDataConfig(include_mc_return=True).
