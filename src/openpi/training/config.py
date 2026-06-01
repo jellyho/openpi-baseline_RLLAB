@@ -746,6 +746,32 @@ _CONFIGS = [
     # Base = pi05_alphaflow_tabletop_rl_orig (H1: r_mlp conditioning, the default).
     # Each variant toggles ONE thing to isolate the cause of bad 1-NFE.
     #
+    # H5: discrete-only MeanFlow (no JVP).  alpha floors at alpha_min instead of
+    # snapping to 0, so training stays in the (stable) discrete branch the whole
+    # time — avoids the JVP divergence.  This mirrors the official alpha-flow
+    # `discrete_training` flag (floors the ratio at clamp_value instead of 0).
+    # alpha_min kept at the paper default.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_rl_orig_nojvp",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            use_jvp=False,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
     # H2: beta time sampler (pi05-matching) instead of min-max.
     TrainConfig(
         name="pi05_alphaflow_tabletop_rl_orig_beta",

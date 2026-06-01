@@ -50,12 +50,23 @@
 - **`loss/l2_raw`** (T2): warmup에서 pi05 FM처럼 줄면 base 학습 정상.
 - **`visualize_critic.sh`** 패턴으로 학습 없이 추론만 평가 가능.
 
+## O5. JVP 발산 — 코드 버그 아님, 원본도 JVP엔 clip 없음
+- JVP 구간(alpha=0) 진입 직후 l2_raw가 11로 치솟고 계속 오름 = **JVP MeanFlow 발산**.
+- 원본 대조: discrete(`_compute_mean_velocity_d`)엔 `clip(±clamp_utgt)` 있지만 **JVP(`_compute_mean_velocity_c`)엔 clip 없음.** 우리도 동일 → **JVP clip 누락은 버그/일탈 아님.**
+- discrete/JVP 두 branch 수식·tangent·grad 흐름을 원본과 정밀 대조 → **코드 버그 없음** (discrete target=alpha·v+(1-alpha)·u_next ✓, JVP tangent (v_t,dt=1,dr=0) & target v_t-(t-r)·dudt ✓).
+- 결론: 원본 JVP는 그들 regime(이미지 DiT, scratch)에선 안정적이나 **우리 2B VLA fine-tune regime에서 불안정**. 코드가 아니라 세팅 문제.
+- **불연속 메커니즘 3겹**: (1) alpha 스케줄이 eta 아래서 0으로 snap → discrete→JVP 급전환, (2) discrete loss가 alpha 스케일에 눌려 "수렴한 듯" 보였으나 실제 mean velocity 미학습(alpha≲0.03에서 adaptive eps c=1e-3가 gradient 억제), (3) JVP target clip 없음 → dudt 폭발 자기강화.
+- **수정 (H5)**: JVP를 안 쓰고 discrete-only. `use_jvp=False` → alpha가 alpha_min에서 floor(0으로 snap 안 함) → 항상 discrete branch.
+- **원본도 동일 옵션 보유**: `loss.py:421-425`의 `discrete_training` 플래그. 켜지면 `ratio<clamp_value`일 때 0이 아니라 **clamp_value로 floor** → 정확히 우리 use_jvp=False. 즉 우리 구현이 논문 구현과 일치.
+- alpha_min(=floor)은 논문 기본값(5e-3) 그대로. (이전에 0.05로 올렸던 건 철회 — 논문 구현 따름.)
+
 ## 실험 config (한 번에 하나씩 isolate)
-| config | H | time_sampler | sphere_latent | 상태 |
-|---|---|---|---|---|
-| `pi05_alphaflow_tabletop_rl_orig` | H1 (r_mlp) | minmax | True | **돌리는 중** |
-| `pi05_alphaflow_tabletop_rl_orig_beta` | H2 | **beta** | True | 대기 |
-| `pi05_alphaflow_tabletop_rl_orig_gaussian` | H3 | minmax | **False** | 대기 |
+| config | H | 변경 | 상태 |
+|---|---|---|---|
+| `pi05_alphaflow_tabletop_rl_orig` | H1 (r_mlp) | 기본 (minmax/sphere/jvp) | warmup OK, **JVP서 발산** |
+| `pi05_alphaflow_tabletop_rl_orig_nojvp` | **H5** | **use_jvp=False** (discrete-only, alpha_min 기본 5e-3) | **대기 (유력 후보)** |
+| `pi05_alphaflow_tabletop_rl_orig_beta` | H2 | beta time | 중단 (O2: 효과 없음) |
+| `pi05_alphaflow_tabletop_rl_orig_gaussian` | H3 | gaussian | 중단 (O2: sphere와 동일) |
 
 실행: `./train.sh <config> 1 32 30000`. 비교 지표: `loss/l2_raw`(pi05 FM scale), 학습 후 1-NFE vs 10-NFE.
 

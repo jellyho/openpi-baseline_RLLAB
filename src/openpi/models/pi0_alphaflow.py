@@ -32,18 +32,21 @@ from openpi.shared import array_typing as at
 # Alpha schedule
 # ---------------------------------------------------------------------------
 
-def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25.0, eta: float = 5e-3):
+def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25.0,
+                   eta: float = 5e-3, floor: float = 0.0):
     """
     Sigmoid curriculum schedule.  All operations are JAX-traceable (JIT-safe).
 
     Returns a JAX scalar alpha:
-        step <= warmup_end      → 1.0  (TFM warmup)
-        warmup_end … transition_end  → sigmoid 1 → 0
-        step >= transition_end  → 0.0  (exact MeanFlow JVP phase)
+        step <= warmup_end           → 1.0   (TFM warmup)
+        warmup_end … transition_end  → sigmoid 1 → end_val
+        step >= transition_end       → end_val
 
-    Values near boundaries are snapped:
-        raw > 1 - eta  → 1.0
-        raw < eta      → 0.0  (triggers JVP branch)
+    floor=0.0 (use_jvp=True):  alpha snaps to 0 below eta → triggers the JVP
+        MeanFlow branch at the end.  end_val = 0.
+    floor>0.0 (use_jvp=False): alpha is clamped to `floor` (never 0) → the
+        loss stays in the discrete branch forever (discrete-only MeanFlow, more
+        stable than JVP).  end_val = floor.  `floor` is a static Python value.
     """
     step_f = step.astype(jnp.float32)
     midpoint = jnp.float32((warmup_end + transition_end) / 2.0)
@@ -52,10 +55,15 @@ def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25
     x = gamma * (step_f - midpoint) / width
     raw = 1.0 - jax.nn.sigmoid(x)
     raw = jnp.where(raw > 1.0 - eta, 1.0, raw)
-    raw = jnp.where(raw < eta,       0.0, raw)
+    if floor > 0.0:
+        raw = jnp.maximum(raw, floor)   # clamp to floor (no snap-to-0 → stays discrete)
+        end_val = floor
+    else:
+        raw = jnp.where(raw < eta, 0.0, raw)   # snap to 0 → JVP branch
+        end_val = 0.0
 
     alpha = jnp.where(step_f <= jnp.float32(warmup_end),    1.0, raw)
-    alpha = jnp.where(step_f >= jnp.float32(transition_end), 0.0, alpha)
+    alpha = jnp.where(step_f >= jnp.float32(transition_end), end_val, alpha)
     return alpha
 
 
@@ -134,6 +142,7 @@ class Pi0AlphaFlow(Pi0):
         self._alpha_min      = config.alpha_min
         self.sphere_latent   = config.sphere_latent
         self.time_sampler    = config.time_sampler
+        self.use_jvp         = config.use_jvp
 
         # Internal training-step counter (non-trainable nnx state, threaded
         # through jit/optimizer like BatchNorm stats).  Incremented once per
@@ -258,11 +267,16 @@ class Pi0AlphaFlow(Pi0):
     # ------------------------------------------------------------------
 
     def _alpha_now(self):
-        """Current alpha (JAX scalar) from the internal training-step counter."""
+        """Current alpha (JAX scalar) from the internal training-step counter.
+
+        use_jvp=False → alpha floors at alpha_min (stays in the discrete branch).
+        use_jvp=True  → alpha snaps to 0 at the end (JVP MeanFlow branch).
+        """
+        floor = 0.0 if self.use_jvp else self._alpha_min
         return alpha_schedule(
             self.train_step.value,
             self._warmup_end, self._transition_end,
-            self._alpha_gamma, self._alpha_min,
+            self._alpha_gamma, self._alpha_min, floor,
         )
 
     # ------------------------------------------------------------------
@@ -535,6 +549,11 @@ class Pi0AlphaFlowConfig(pi0_config.Pi0Config):
     # Timestep marginal: "minmax" = sigmoid(normal-0.4) (official alpha-flow),
     # "beta" = beta(1.5,1) (matches pretrained pi05 FM training).  A/B test for H2.
     time_sampler:     str   = "minmax"
+
+    # If True, alpha snaps to 0 at the end → exact MeanFlow via JVP (can be
+    # unstable: see docs/alphaflow_troubleshooting.md).  If False, alpha floors
+    # at alpha_min → discrete-only MeanFlow (more stable, paper's recommendation).
+    use_jvp:          bool  = True
 
     # Total training steps — used to convert schedule ratios → absolute steps.
     # The model tracks its own step counter internally so train.py needs no changes.

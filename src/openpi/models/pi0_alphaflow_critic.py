@@ -235,6 +235,7 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self._alpha_min      = config.alpha_min
         self.sphere_latent   = config.sphere_latent
         self.time_sampler    = config.time_sampler
+        self.use_jvp         = config.use_jvp
         self.train_step      = nnx.Variable(jnp.array(0, dtype=jnp.int32))
 
         self.deterministic = True
