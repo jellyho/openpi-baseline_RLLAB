@@ -106,6 +106,17 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Critic training: Monte-Carlo return target (scalar per sample).
+    mc_return: at.Float[ArrayT, "*b"] | None = None
+
+    # Offline-RL (LPS-RFT) next-state fields, used for the chunked TD bootstrap.
+    # These are produced already model-ready (resized / normalized) by the data
+    # pipeline; preprocess_observation passes them through unchanged.
+    next_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
+    next_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
+    next_state: at.Float[ArrayT, "*b s"] | None = None
+    next_mc_return: at.Float[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +137,11 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            mc_return=data.get("mc_return"),
+            next_images=data.get("next_image"),
+            next_image_masks=data.get("next_image_mask"),
+            next_state=data.get("next_state"),
+            next_mc_return=data.get("next_mc_return"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +221,12 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        mc_return=observation.mc_return,
+        # Next-state fields pass through unchanged (already model-ready).
+        next_images=observation.next_images,
+        next_image_masks=observation.next_image_masks,
+        next_state=observation.next_state,
+        next_mc_return=observation.next_mc_return,
     )
 
 

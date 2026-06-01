@@ -111,6 +111,10 @@ class TabletopInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Pass through MC return for critic training (scalar per sample).
+        if "mc_return" in data:
+            inputs["mc_return"] = np.asarray(data["mc_return"])
+
         return inputs
 
 

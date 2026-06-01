@@ -30,6 +30,13 @@ class Checkpoint:
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
 
+    # Number of sampling steps (NFE) passed to model.sample_actions.
+    # Alpha-flow: 1 = 1-NFE MeanFlow (production), N>1 = N-step integration.
+    num_steps: int | None = None
+    # Alpha-flow integration mode: "mean" (MeanFlow, r=t_next) or "fm"
+    # (instantaneous velocity, r=t — for base-flow eval before MeanFlow training).
+    nfe_mode: str | None = None
+
 
 @dataclasses.dataclass
 class Default:
@@ -105,11 +112,17 @@ def create_policy(args: Args) -> _policy.Policy:
 
     match args.policy:
         case Checkpoint():
+            sample_kwargs = {}
+            if args.policy.num_steps is not None:
+                sample_kwargs["num_steps"] = args.policy.num_steps
+            if args.policy.nfe_mode is not None:
+                sample_kwargs["nfe_mode"] = args.policy.nfe_mode
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config),
                 args.policy.dir,
                 default_prompt=args.default_prompt,
                 norm_stats=norm_stats,
+                sample_kwargs=sample_kwargs or None,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

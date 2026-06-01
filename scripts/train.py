@@ -143,19 +143,26 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        out = model.compute_loss(rng, observation, actions, train=True)
+        # Models may return either just the per-token loss array, or a tuple
+        # (loss_array, aux_metrics_dict).  Handle both (pi0 returns just the array).
+        if isinstance(out, tuple):
+            chunked_loss, aux = out
+        else:
+            chunked_loss, aux = out, {}
+        return jnp.mean(chunked_loss), aux
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -187,6 +194,8 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        # Model-emitted metrics (e.g. alpha, alphaflow/critic loss split). Empty for pi0.
+        **aux,
     }
     return new_state, info
 
@@ -199,6 +208,14 @@ def main(config: _config.TrainConfig):
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
+
+    # Keep the model's alpha-flow schedule length in sync with the training budget
+    # (so CLI overrides of --num-train-steps propagate to the schedule).
+    if hasattr(config.model, "num_train_steps") and config.model.num_train_steps != config.num_train_steps:
+        config = dataclasses.replace(
+            config, model=dataclasses.replace(config.model, num_train_steps=config.num_train_steps)
+        )
+        logging.info(f"Synced model.num_train_steps -> {config.num_train_steps}")
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
@@ -247,6 +264,9 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    # LR schedule (for logging the current learning rate).
+    lr_schedule = config.lr_schedule.create()
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -263,6 +283,7 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            reduced_info["learning_rate"] = float(lr_schedule(step))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)

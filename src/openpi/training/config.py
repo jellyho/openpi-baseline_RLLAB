@@ -16,6 +16,8 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_alphaflow as pi0_alphaflow
+import openpi.models.pi0_alphaflow_critic as pi0_alphaflow_critic
+import openpi.models.pi0_lps_rft as pi0_lps_rft
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -537,30 +539,31 @@ class LeRobotTabletopDataConfig(DataConfigFactory):
     # Set to False when dataset already stores absolute joint positions (tabletop default).
     use_delta_joint_actions: bool = False
 
-    # Repack transform maps lerobot dataset keys to the inference observation keys.
-    repack_transforms: _transforms.Group = dataclasses.field(
-        default=_transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "images": {
-                            "cam_high": "observation.images.back",
-                            "cam_left_wrist": "observation.images.wrist_left",
-                            "cam_right_wrist": "observation.images.wrist_right",
-                        },
-                        "state": "observation.state",
-                        "actions": "action",
-                        "prompt": "task",
-                    }
-                )
-            ]
-        )
-    )
+    # If True, also load the 'mc_return' column (required for critic training).
+    # The dataset must contain an 'mc_return' column (see scripts/compute_mc_returns.py).
+    include_mc_return: bool = False
 
     action_sequence_keys: Sequence[str] = ("action",)
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Build repack mapping; optionally include mc_return for critic training.
+        repack_map = {
+            "images": {
+                "cam_high": "observation.images.back",
+                "cam_left_wrist": "observation.images.wrist_left",
+                "cam_right_wrist": "observation.images.wrist_right",
+            },
+            "state": "observation.state",
+            "actions": "action",
+            "prompt": "task",
+        }
+        if self.include_mc_return:
+            repack_map["mc_return"] = "mc_return"
+        repack_transforms = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_map)]
+        )
+
         data_transforms = _transforms.Group(
             inputs=[tabletop_policy.TabletopInputs(
                 model_type=model_config.model_type,
@@ -579,7 +582,7 @@ class LeRobotTabletopDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
@@ -684,15 +687,16 @@ class TrainConfig:
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
-    # Alpha-Flow fine-tuning configs  (use with scripts/train_alphaflow.py).
+    # Alpha-Flow fine-tuning configs (use the standard scripts/train.py).
     #
-    # AlphaFlowWeightLoader loads the pretrained Pi05 base checkpoint and keeps
-    # new params (r_proj) at zero-init.  When resuming, the alphaflow checkpoint
-    # is loaded instead (standard orbax restore).
+    # The full alpha-flow / critic objective lives in model.compute_loss, so the
+    # one train.py handles these like any other model.  AlphaFlowWeightLoader
+    # loads the pretrained Pi05 base checkpoint and keeps new params (r_proj,
+    # critic expert) at init.  When resuming, the checkpoint is loaded instead.
     #
     # Usage:
-    #   uv run scripts/train_alphaflow.py pi05_alphaflow_tabletop_bc_orig \
-    #       --exp-name <run_name>
+    #   ./train.sh pi05_alphaflow_tabletop_bc_orig
+    #   ./train.sh pi05_alphaflow_critic_tabletop --gpus 8 --batch-size 128
     #
     TrainConfig(
         name="pi05_alphaflow_tabletop_bc_orig",
@@ -708,6 +712,155 @@ _CONFIGS = [
             ),
             base_config=DataConfig(prompt_from_task=True),
             use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Pure AlphaFlow (no critic) trained on the _rl_orig_mc dataset.  Same model as
+    # pi05_alphaflow_tabletop_bc_orig, just a different data source (the RL dataset
+    # used for the critic runs).  mc_return is unused for plain BC training.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_rl_orig",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # ── Alpha-flow 1-NFE troubleshooting variants (see docs/alphaflow_troubleshooting.md) ──
+    # Base = pi05_alphaflow_tabletop_rl_orig (H1: r_mlp conditioning, the default).
+    # Each variant toggles ONE thing to isolate the cause of bad 1-NFE.
+    #
+    # H2: beta time sampler (pi05-matching) instead of min-max.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_rl_orig_beta",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            time_sampler="beta",
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # H3: Gaussian latent prior instead of sphere.
+    TrainConfig(
+        name="pi05_alphaflow_tabletop_rl_orig_gaussian",
+        model=pi0_alphaflow.Pi0AlphaFlowConfig(
+            pi05=True,
+            sphere_latent=False,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Alpha-flow + Critic (LPS-RFT): joint action + value training in one train.py.
+    # Uses the _mc dataset (with mc_return column from scripts/compute_mc_returns.py)
+    # and LeRobotTabletopDataConfig(include_mc_return=True).
+    TrainConfig(
+        name="pi05_alphaflow_critic_tabletop",
+        model=pi0_alphaflow_critic.Pi0WithCriticConfig(
+            pi05=True,
+            num_train_steps=30_000,   # keep in sync with TrainConfig.num_train_steps below
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # LPS-RFT: offline RL via Latent Policy Steering.  Loads a trained
+    # pi05_alphaflow_critic checkpoint (VLM + action + critic), adds a latent
+    # actor expert, freezes VLM + action expert, and trains critic + latent
+    # actor.  Update --checkpoint path to your critic run/step.
+    TrainConfig(
+        name="pi05_lps_rft_tabletop",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True,
+            num_train_steps=30_000,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
+        ),
+        # Load the trained critic checkpoint; the latent expert starts from init.
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "checkpoints/pi05_alphaflow_critic_tabletop/pi05_alphaflow_critic_tabletop/29999/params"
+        ),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Same as above but on the _orig_mc dataset.
+    TrainConfig(
+        name="pi05_alphaflow_critic_tabletop_orig",
+        model=pi0_alphaflow_critic.Pi0WithCriticConfig(
+            pi05=True,
+            num_train_steps=30_000,   # kept in sync with TrainConfig.num_train_steps
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig_mc",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,

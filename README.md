@@ -173,6 +173,36 @@ Key options:
 | `--args.use-benchmark-init` | `True` | Use reproducible initial states |
 | `--args.video-out-path` | `data/tabletop_sim/videos` | Where to save rollout videos |
 
+### Critic Visualization
+
+For critic models (`Pi0WithCritic`, e.g. `pi05_alphaflow_critic_tabletop`), render an
+mp4 of one trajectory with the camera view on the left and the critic's per-step
+predicted value `E[V]` (from the ground-truth action chunk) vs the ground-truth
+Monte-Carlo return on the right:
+
+```bash
+./visualize_critic.sh <config> <checkpoint_dir> <repo_id> [episode] [output]
+
+# Example
+./visualize_critic.sh \
+    pi05_alphaflow_critic_tabletop \
+    checkpoints/pi05_alphaflow_critic_tabletop/pi05_alphaflow_critic_tabletop/14999 \
+    jellyho/aloha_handover_box_joint_pos_rl_mc \
+    0
+```
+
+The dataset must contain an `mc_return` column (see `scripts/compute_mc_returns.py`).
+A well-trained critic's `E[V]` curve should track the GT MC return; a flat or
+mismatched curve indicates the critic did not learn the value well.
+
+| Arg | Default | Description |
+|---|---|---|
+| `config` | — | Train config name (must be a critic model) |
+| `checkpoint_dir` | — | Checkpoint dir containing `params/` and `assets/` |
+| `repo_id` | — | LeRobot dataset with the `mc_return` column |
+| `episode` | `0` | Episode index to visualize |
+| `output` | `data/critic_vis/<config>_ep<episode>.mp4` | Output mp4 path |
+
 ### Baseline Results
 
 Evaluated on `aloha_handover_box` with `benchmark_init`, 50 episodes, `replan_steps=25`.

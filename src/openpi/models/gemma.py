@@ -52,7 +52,7 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_100m", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -65,6 +65,18 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=16,
+        )
+    if variant == "gemma_100m":
+        # ~100M params: same depth as gemma_300m (required by the Gemma Module),
+        # but smaller width and mlp_dim.
+        # head_dim / num_heads / num_kv_heads must match all other experts.
+        return Config(
+            width=512,
+            depth=18,
+            mlp_dim=1024,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
         )
     if variant == "gemma_300m":
         # 311M params

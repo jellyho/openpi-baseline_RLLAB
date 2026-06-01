@@ -38,6 +38,7 @@ dependencies = [
     "rich>=14.0.0",
     "polars>=1.30.0",
     "tabletop-sim",
+    "pymupdf>=1.27.2.3",
 ]
 
 

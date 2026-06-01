@@ -36,6 +36,10 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+logs/
+
+.claude/
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -170,3 +174,11 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Stray HF / xet caches if HF_HOME is misconfigured (e.g. set to "")
+/hub/
+/datasets/
+/xet/
+/openpi-assets/
+/big_vision/
+/jellyho/

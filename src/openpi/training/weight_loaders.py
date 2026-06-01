@@ -75,13 +75,15 @@ class PaliGemmaWeightLoader(WeightLoader):
 
 @dataclasses.dataclass(frozen=True)
 class AlphaFlowWeightLoader(WeightLoader):
-    """Loads a Pi05 checkpoint into Pi0AlphaFlow.
+    """Loads a Pi05 checkpoint into Pi0AlphaFlow / Pi0WithCritic.
 
-    Behaves like CheckpointWeightLoader but handles new params in Pi0AlphaFlow
-    (e.g. r_proj) that are absent from the pretrained Pi05 checkpoint.
-    New params are kept at their initialised values (zeros for r_proj)
-    by returning a jax.ShapeDtypeStruct placeholder — the same pattern
-    used for LoRA weights in CheckpointWeightLoader.
+    Behaves like CheckpointWeightLoader but keeps ALL new params that are
+    absent from the pretrained Pi05 checkpoint at their initialised values:
+      - Pi0AlphaFlow: r_proj (zero-init)
+      - Pi0WithCritic: critic expert weights, critic_in_proj, critic_out_proj,
+        and the train_step counter.
+    Any param present in the checkpoint is loaded; anything missing falls back
+    to its init value (same pattern as PaliGemmaWeightLoader).
     """
 
     params_path: str
@@ -90,8 +92,8 @@ class AlphaFlowWeightLoader(WeightLoader):
         loaded_params = _model.restore_params(
             download.maybe_download(self.params_path), restore_type=np.ndarray
         )
-        # Keep all new Pi0AlphaFlow params (e.g. r_proj) at init values.
-        return _merge_params(loaded_params, params, missing_regex=".*r_proj.*")
+        # Load overlapping params; keep every other (new) param at init.
+        return _merge_params(loaded_params, params, missing_regex=".*")
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
