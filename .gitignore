@@ -38,6 +38,8 @@ MANIFEST
 
 logs/
 
+setup_env.sh
+
 .claude/
 
 # PyInstaller

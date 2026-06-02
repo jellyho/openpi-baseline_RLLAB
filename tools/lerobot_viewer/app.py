@@ -19,6 +19,7 @@ import argparse
 import functools
 import json
 import os
+import socket
 import threading
 from pathlib import Path
 
@@ -32,6 +33,8 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 # Populated in main().
 ROOT: Path = Path(".")
 CACHE_DIR: Path = Path(".")
+SERVER_IP: str = ""
+SERVER_PORT: int = 0
 
 # In-memory caches.
 _DATASETS: dict[str, Path] = {}          # ds_id -> dataset dir
@@ -170,6 +173,8 @@ def build_overview() -> dict:
 
         _OVERVIEW_CACHE = {
             "root": str(ROOT),
+            "server_ip": SERVER_IP,
+            "server_port": SERVER_PORT,
             "datasets": datasets,
             "groups": list(groups.values()),
             "totals": {
@@ -420,8 +425,23 @@ def api_video():
     return send_file(p, mimetype="video/mp4", conditional=True)
 
 
+def get_lan_ip() -> str:
+    """Best-effort primary (outbound) IP of this host, not 127.0.0.1."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))  # no packets are actually sent
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
 def main():
-    global ROOT, CACHE_DIR, _DATASETS
+    global ROOT, CACHE_DIR, _DATASETS, SERVER_IP, SERVER_PORT
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="/data5/jellyho/PFR_RSS/dataset/phase1",
                     help="directory containing LeRobot datasets")
@@ -438,12 +458,16 @@ def main():
     if not _DATASETS:
         raise SystemExit(f"No LeRobot datasets (meta/info.json) found under {ROOT}")
 
+    SERVER_IP = get_lan_ip()
+    SERVER_PORT = args.port
+    lan_ip = SERVER_IP
     print(f"[viewer] root = {ROOT}")
     print(f"[viewer] found {len(_DATASETS)} datasets:")
     for k in _DATASETS:
         print(f"          - {k}")
-    print(f"[viewer] open  http://localhost:{args.port}  "
-          f"(use SSH port-forward if remote)")
+    print(f"[viewer] serving on host {args.host}:{args.port}")
+    print(f"[viewer]   server IP : http://{lan_ip}:{args.port}")
+    print(f"[viewer]   localhost : http://localhost:{args.port}  (via SSH port-forward)")
     app.run(host=args.host, port=args.port, threaded=True)
 
 

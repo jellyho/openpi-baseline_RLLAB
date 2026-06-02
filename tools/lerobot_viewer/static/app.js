@@ -100,7 +100,9 @@ async function renderOverview() {
   try { ov = await getJSON("/api/overview"); }
   catch (e) { app.innerHTML = `<div class="err">${e.message}</div>`; return; }
 
-  $("#rootPath").textContent = ov.root;
+  const srv = ov.server_ip ? `http://${ov.server_ip}:${ov.server_port}` : "";
+  $("#rootPath").innerHTML = (srv ? `<span title="server address">🌐 ${srv}</span><br>` : "")
+    + `<span title="dataset root">${ov.root}</span>`;
   const t = ov.totals;
 
   let html = `
