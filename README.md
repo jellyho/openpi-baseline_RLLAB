@@ -178,7 +178,7 @@ All AlphaFlow configs use the **tuned recipe**: `flow_ratio=0.25` (25% FM-border
 | `pi05_alphaflow_critic_rl` | `..._rl_orig` (+mc) | Joint distill + critic on the RL dataset. |
 | `pi05_alphaflow_critic_bc` | `..._bc_orig` (+mc) | Same, on the success-only BC dataset. |
 
-**3. 2-stage RFT phase-1: rectify + critic warmup** (`Pi0WithCritic`, from a cat-1 FM checkpoint) — assumes a task-adapted FM policy already exists, so there is **no FM warmup** (`warmup_ratio=0`, starts straight at the alpha transition). The **VLM is frozen**; only the action expert (rectify FM → 1-NFE), its projections + r-conditioning, and the critic (warmup) train. Update the `weight_loader` path to your cat-1 run/step.
+**3. 2-stage RFT phase-1: rectify + critic warmup** (`Pi0WithCritic`, from a cat-1 FM checkpoint) — this is exactly the AlphaFlowTSE setting (rectifying an FM checkpoint), so it uses the **TSE alpha schedule** (`warmup_ratio=0.05` / `transition_ratio=0.667` / floor 0.333, `alpha_gamma=15`, `alpha_min=0.1`): a short FM warmup re-grounds the field in our data, then anneal + floor. The **VLM is frozen**; only the action expert (rectify FM → 1-NFE), its projections + r-conditioning, and the critic (warmup) train. Update the `weight_loader` path to your cat-1 run/step.
 
 | Config | Dataset | Init from |
 |---|---|---|
@@ -225,7 +225,8 @@ Run the evaluation script:
 uv run examples/tabletop_sim/main.py \
     --args.task-name aloha_handover_box \
     --args.num-episodes 50 \
-    --args.replan-steps 25
+    --args.replan-steps 25 \
+    --args.video_out_path data/tabletop_sim/pi05_tabletop_bc
 ```
 
 Key options:

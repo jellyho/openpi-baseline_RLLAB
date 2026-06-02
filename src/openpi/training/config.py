@@ -789,11 +789,13 @@ _CONFIGS = [
         save_interval=10_000,
     ),
     # --- 3. 2-stage RFT phase-1: rectify FM baseline + warm up critic -----------
-    # Init from a TASK-ADAPTED flow-matching checkpoint (cat 1).  Assumes the FM
-    # policy already exists, so there is NO FM warmup (warmup_ratio=0) — training
-    # starts straight at the alpha transition.  VLM is frozen (rectify only touches
-    # the action expert + r-conditioning; the critic warms up alongside).  Update
-    # the weight_loader path to your cat-1 run/step.
+    # Init from a TASK-ADAPTED flow-matching checkpoint (cat 1).  This is exactly
+    # the AlphaFlowTSE scenario (the paper also rectifies an FM checkpoint), so we
+    # use the **TSE alpha schedule** (warmup 0.05 / transition 0.667 / floor 0.333,
+    # alpha_gamma=15, alpha_min=0.1 = Pi0AlphaFlowConfig defaults): a short FM warmup
+    # re-grounds the field in our data before annealing, then transition + floor.
+    # VLM is frozen (rectify only touches the action expert + r-conditioning; the
+    # critic warms up alongside).  Update the weight_loader path to your cat-1 run/step.
     TrainConfig(
         name="pi05_rft_phase1_rl",
         model=pi0_alphaflow_critic.Pi0WithCriticConfig(
@@ -802,8 +804,8 @@ _CONFIGS = [
             flow_ratio=0.25,
             lambda_fm=0.5,
             lambda_mf=0.5,
-            warmup_ratio=0.0,        # FM already trained -> start at alpha transition
-            transition_ratio=0.75,
+            warmup_ratio=0.05,       # TSE schedule (short FM warmup re-grounds, then anneal)
+            transition_ratio=0.667,  # transition 5%->66.7%, floor 33.3%
         ),
         data=LeRobotTabletopDataConfig(
             repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig",
@@ -832,8 +834,8 @@ _CONFIGS = [
             flow_ratio=0.25,
             lambda_fm=0.5,
             lambda_mf=0.5,
-            warmup_ratio=0.0,
-            transition_ratio=0.75,
+            warmup_ratio=0.05,       # TSE schedule (short FM warmup re-grounds, then anneal)
+            transition_ratio=0.667,  # transition 5%->66.7%, floor 33.3%
         ),
         data=LeRobotTabletopDataConfig(
             repo_id="jellyho/aloha_handover_box_joint_pos_bc_orig",
