@@ -106,8 +106,14 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # Critic training: Monte-Carlo return target (scalar per sample).
+    # Critic training: Monte-Carlo return target (scalar per sample; CalQL anchor).
     mc_return: at.Float[ArrayT, "*b"] | None = None
+    # LPS-RFT reward window reward[t:t+H]  (failure penalty baked in, same
+    # normalized scale as mc_return).  Summed (discounted) into the chunk reward.
+    reward: at.Float[ArrayT, "*b ah"] | None = None
+    # done: whether the next state s_{t+H} is past the episode end → mask the
+    # bootstrap (use the MC anchor instead).
+    done: at.Bool[ArrayT, "*b"] | None = None
 
     # Offline-RL (LPS-RFT) next-state fields, used for the chunked TD bootstrap.
     # These are produced already model-ready (resized / normalized) by the data
@@ -124,11 +130,17 @@ class Observation(Generic[ArrayT]):
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        def _to_float_images(image_dict):
+            for key in image_dict:
+                if image_dict[key].dtype == np.uint8:
+                    image_dict[key] = image_dict[key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(image_dict[key], "dtype") and image_dict[key].dtype == torch.uint8:
+                    image_dict[key] = image_dict[key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+            return image_dict
+
+        _to_float_images(data["image"])
+        if data.get("next_image") is not None:  # LPS-RFT next observation (same conversion)
+            _to_float_images(data["next_image"])
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -138,6 +150,8 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             mc_return=data.get("mc_return"),
+            reward=data.get("reward"),
+            done=data.get("done"),
             next_images=data.get("next_image"),
             next_image_masks=data.get("next_image_mask"),
             next_state=data.get("next_state"),
@@ -222,6 +236,8 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         mc_return=observation.mc_return,
+        reward=observation.reward,
+        done=observation.done,
         # Next-state fields pass through unchanged (already model-ready).
         next_images=observation.next_images,
         next_image_masks=observation.next_image_masks,

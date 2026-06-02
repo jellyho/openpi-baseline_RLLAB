@@ -16,6 +16,7 @@ CONFIG=$1
 NUM_GPUS=${2:-4}
 BATCH_PER_GPU=${3:-32}
 NUM_STEPS=${4:-7500}
+NUM_WORKERS=${5:-64}
 
 if [ -z "$CONFIG" ]; then
     echo "Usage: $0 <config> <num_gpus> <batch_per_gpu> <num_steps>"
@@ -28,7 +29,7 @@ GLOBAL_BATCH=$((NUM_GPUS * BATCH_PER_GPU))
 if [ -z "$SLURM_JOB_ID" ]; then
     export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS - 1)))
 fi
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 
 mkdir -p logs
 LOG_FILE="logs/${CONFIG}_$(date +%Y%m%d-%H%M%S).log"
@@ -40,4 +41,5 @@ uv run scripts/train.py "$CONFIG" \
     --fsdp-devices="$NUM_GPUS" \
     --batch-size="$GLOBAL_BATCH" \
     --num-train-steps="$NUM_STEPS" \
+    --num-workers="$NUM_WORKERS" \
     --overwrite 2>&1 | tee -a "$LOG_FILE"

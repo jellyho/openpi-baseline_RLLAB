@@ -21,16 +21,15 @@ Inheritance
 ───────────
     Pi0AlphaFlow → Pi0WithCritic → Pi0LPSRFT
 
-Loss (v1: MC-anchored critic + latent actor)
-────────────────────────────────────────────
-    critic: HL-Gauss C51 cross-entropy vs the dataset Monte-Carlo return
-            (MC supervision anchors Q to true returns — no target network,
-             no bootstrap instability).
+Loss (chunked-TD critic + latent actor)
+───────────────────────────────────────
+    critic: HL-Gauss C51 cross-entropy vs a CalQL-anchored, done-masked chunked
+            TD target  y = done ? G_t : max(R_chunk + γ^H·Q(s', a'), G_t).
+            R_chunk = Σ_i γ^i·reward[t+i] (dataset reward window); Q(s', a') is
+            scored in the SAME batch (CrossQ, no target net) and stop-gradient'd;
+            mc_return G_t is used only as the CalQL anchor / terminal target.
     actor : maximize E[V](s, decode(s, z(s)))  →  steers the latent toward
-            high-value regions.
-
-(v2 — not yet implemented — will add a CrossQ-style chunked TD term using the
- next state s', bootstrapping in the same batch without a target network.)
+            high-value regions (critic params detached, DDPG-style).
 """
 
 import dataclasses
@@ -213,6 +212,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         self._mf_reweight    = config.mf_reweight
         self._reweight_kappa = config.reweight_kappa
         self._large_span_ratio = config.large_span_ratio
+        self._large_span_warmup_gate = config.large_span_warmup_gate
         self._flow_ratio     = config.flow_ratio
         self._lambda_fm      = config.lambda_fm
         self._lambda_mf      = config.lambda_mf
@@ -365,8 +365,9 @@ class Pi0LPSRFT(Pi0WithCritic):
                 detached, so only the latent actor moves toward high value.
         """
         preprocess_rng, _ = jax.random.split(rng)
-        mc_t   = observation.mc_return        # mc_return[t]
-        mc_tH  = observation.next_mc_return   # mc_return[t+H]
+        mc_t       = observation.mc_return    # mc_return[t]  (CalQL anchor only)
+        reward_win = observation.reward       # reward[t:t+H]  [b, H]
+        done       = observation.done.astype(jnp.float32)  # [b]  next state past episode end
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         next_observation = self._next_observation(observation)
         b = actions.shape[0]
@@ -391,11 +392,17 @@ class Pi0LPSRFT(Pi0WithCritic):
         )                                                               # [b, ah]  (per-token)
         v_next = jnp.mean(v_next, axis=-1)                              # [b]  Q(s', a')
 
-        # ── Chunked TD target, MC-anchored (CalQL) ────────────────────────────
-        # R_chunk = mc[t] - γ^H · mc[t+H]   (identity from the MC return def).
-        r_chunk = mc_t - gammaH * mc_tH                                 # [b]
-        y_td    = r_chunk + gammaH * v_next                            # [b]
-        y       = jnp.maximum(y_td, mc_t)                              # [b]  MC anchor
+        # ── Chunked TD target, MC-anchored (CalQL), done-masked ───────────────
+        # R_chunk = Σ_{i=0}^{H-1} γ^i · reward[t+i]  (discounted dataset reward over
+        # the chunk; the failure penalty is baked into `reward`).  mc_return is used
+        # ONLY as the CalQL anchor (not to build R_chunk).
+        discounts = self.gamma ** jnp.arange(H, dtype=jnp.float32)      # [H]
+        r_chunk = jnp.sum(reward_win * discounts, axis=-1)             # [b]
+        y_td    = r_chunk + gammaH * v_next                           # [b]
+        y_boot  = jnp.maximum(y_td, mc_t)                            # CalQL MC anchor
+        # done (s_{t+H} past the episode end): no valid bootstrap → use the MC
+        # return G_t directly (= truncated chunk return, terminal reward included).
+        y       = jnp.where(done > 0.0, mc_t, y_boot)               # [b]
         y       = jax.lax.stop_gradient(jnp.clip(y, self.v_min, self.v_max))
         y_exp   = jnp.broadcast_to(y[:, None], (b, H))                 # [b, ah]
         critic_loss = critic_loss_hl_gauss(
@@ -423,6 +430,7 @@ class Pi0LPSRFT(Pi0WithCritic):
             "td/r_chunk":          jnp.mean(r_chunk),
             "td/q_next":           jnp.mean(v_next),
             "td/mc_anchor_frac":   jnp.mean((mc_t >= y_td).astype(jnp.float32)),
+            "td/done_frac":        jnp.mean(done),
             "critic/value_data":   jnp.mean(pred_value_data),
             "critic/value_mae":    jnp.mean(jnp.abs(pred_value_data - mc_exp)),
             "actor/value_steered": jnp.mean(value_actor),

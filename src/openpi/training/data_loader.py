@@ -138,12 +138,19 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.local_files_path)
+    fps = dataset_meta.fps
+    delta_timestamps = {
+        key: [t / fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    if data_config.load_rl_windows:
+        # reward window r[t:t+H]  +  next observation s_{t+H} (current 0 and next H).
+        delta_timestamps["reward"] = [t / fps for t in range(action_horizon)]
+        for key in data_config.rl_obs_keys:
+            delta_timestamps[key] = [0.0, action_horizon / fps]
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-        root=data_config.local_files_path
+        delta_timestamps=delta_timestamps,
+        root=data_config.local_files_path,
     )
 
     if data_config.prompt_from_task:
@@ -180,6 +187,10 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
         norm_stats = data_config.norm_stats
+
+    # LPS-RFT next state is normalized with the same stats as the current state.
+    if data_config.load_rl_windows and "state" in norm_stats and "next_state" not in norm_stats:
+        norm_stats = {**norm_stats, "next_state": norm_stats["state"]}
 
     return TransformedDataset(
         dataset,

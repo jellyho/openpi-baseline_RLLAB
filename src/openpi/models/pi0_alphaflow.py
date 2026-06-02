@@ -35,23 +35,27 @@ from openpi.shared import array_typing as at
 def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25.0,
                    eta: float = 5e-3, floor: float = 0.0):
     """
-    Sigmoid curriculum schedule.  All operations are JAX-traceable (JIT-safe).
+    Scaled-sigmoid curriculum schedule (AlphaFlow / AlphaFlowTSE).  JIT-safe.
 
-    Returns a JAX scalar alpha:
-        step <= warmup_end           → 1.0   (TFM warmup)
-        warmup_end … transition_end  → sigmoid 1 → end_val
-        step >= transition_end       → end_val
+    Three phases, defined by step fractions so they map to clean % of training:
+        step <  warmup_end                  → 1.0          (FM warmup)
+        warmup_end ≤ step < transition_end  → 1 → end_val  (smooth transition)
+        step ≥ transition_end               → end_val      (floor)
 
-    floor=0.0 (use_jvp=True):  alpha snaps to 0 below eta → triggers the JVP
-        MeanFlow branch at the end.  end_val = 0.
-    floor>0.0 (use_jvp=False): alpha is clamped to `floor` (never 0) → the
-        loss stays in the discrete branch forever (discrete-only MeanFlow, more
-        stable than JVP).  end_val = floor.  `floor` is a static Python value.
+    The transition uses the *scaled* sigmoid  α = 1 + (end_val-1)·σ(γ·progress),
+    progress = (step-mid)/width ∈ [-0.5, 0.5].  This reaches end_val *exactly* at
+    transition_end (unlike a 1→0 sigmoid hard-clamped at the floor, which would
+    hit the floor early and plateau).  So the % of steps spent in each phase is
+    exactly: warmup_ratio FM, (transition_ratio-warmup_ratio) transition,
+    (1-transition_ratio) floor.
 
-    Degenerate curriculum (transition_end <= warmup_end, e.g. both 0):  no
-        warmup / no transition → alpha == end_val from step 0.  This is the
-        "MeanFlow from scratch" ablation (train the mean-velocity objective
-        directly on the pretrained init, skipping the alpha curriculum).
+    floor=0.0 (use_jvp=True):  end_val=0 and the near-zero tail snaps to exactly
+        0 (below eta) so the JVP MeanFlow branch triggers at the end.
+    floor>0.0 (use_jvp=False): end_val=floor; α descends to the floor and stays
+        there (discrete-only MeanFlow — stable, the paper's recommendation).
+
+    Degenerate (transition_end ≤ warmup_end, e.g. both 0): no curriculum →
+        α == end_val from step 0 ("MeanFlow from scratch" ablation).
     """
     end_val = float(floor) if floor > 0.0 else 0.0
     step_f = step.astype(jnp.float32)
@@ -63,15 +67,12 @@ def alpha_schedule(step, warmup_end: int, transition_end: int, gamma: float = 25
     midpoint = jnp.float32((warmup_end + transition_end) / 2.0)
     width    = jnp.float32(float(transition_end - warmup_end))
 
-    x = gamma * (step_f - midpoint) / width
-    raw = 1.0 - jax.nn.sigmoid(x)
-    raw = jnp.where(raw > 1.0 - eta, 1.0, raw)
-    if floor > 0.0:
-        raw = jnp.maximum(raw, floor)   # clamp to floor (no snap-to-0 → stays discrete)
-    else:
-        raw = jnp.where(raw < eta, 0.0, raw)   # snap to 0 → JVP branch
+    progress = (step_f - midpoint) / width                       # [-0.5, 0.5]
+    raw = 1.0 + (end_val - 1.0) * jax.nn.sigmoid(gamma * progress)  # 1 → end_val
+    if floor <= 0.0:
+        raw = jnp.where(raw < eta, 0.0, raw)   # snap near-zero tail to 0 → JVP branch
 
-    alpha = jnp.where(step_f <= jnp.float32(warmup_end),    1.0, raw)
+    alpha = jnp.where(step_f <  jnp.float32(warmup_end),     1.0, raw)
     alpha = jnp.where(step_f >= jnp.float32(transition_end), end_val, alpha)
     return alpha
 
@@ -176,6 +177,7 @@ class Pi0AlphaFlow(Pi0):
         self._mf_reweight    = config.mf_reweight
         self._reweight_kappa = config.reweight_kappa
         self._large_span_ratio = config.large_span_ratio
+        self._large_span_warmup_gate = config.large_span_warmup_gate
         self._flow_ratio     = config.flow_ratio
         self._lambda_fm      = config.lambda_fm
         self._lambda_mf      = config.lambda_mf
@@ -352,7 +354,7 @@ class Pi0AlphaFlow(Pi0):
             t2 = jax.nn.sigmoid(jax.random.normal(r_rng, batch_shape) * 1.0 - 0.4)
         return t1, t2
 
-    def _sample_flow_inputs(self, rng, actions, flow_ratio: float):
+    def _sample_flow_inputs(self, rng, actions, flow_ratio: float, alpha=None):
         """Sample (noise, t, r, n_fm) for the alpha-flow objective.
 
         FM border samples (first n_fm): r = t  (pure TFM supervision).
@@ -361,6 +363,11 @@ class Pi0AlphaFlow(Pi0):
         large_span_ratio>0: force the LAST n_ls MF samples to span ~[0,1]
         (t≥0.85, r≤0.15), so training sees the full-interval transport that
         1-NFE inference (t=1, r=0) actually uses (AlphaFlowTSE).
+
+        large_span_warmup_gate (with alpha given): skip the large-span overwrite
+        while alpha==1 (FM warmup) — there the target is v (r-independent), so
+        large-span samples teach nothing about the interval.  They turn on once
+        alpha<1 (transition + floor).
         """
         noise_rng, t_rng, r_rng, ls_rng = jax.random.split(rng, 4)
         b           = actions.shape[0]
@@ -380,8 +387,16 @@ class Pi0AlphaFlow(Pi0):
             t_big = 0.85 + 0.15 * jax.random.uniform(ls_t_rng, batch_shape)   # [0.85, 1.0]
             r_big = 0.15 * jax.random.uniform(ls_r_rng, batch_shape)          # [0.0, 0.15]
             idx = b - n_ls                                                    # last n_ls are MF
-            t = t.at[idx:].set(t_big[idx:])
-            r = r.at[idx:].set(r_big[idx:])
+            if self._large_span_warmup_gate and alpha is not None:
+                # JIT-safe phase gate: apply large-span only past FM warmup
+                # (alpha<1).  ls_pos is a static [b] mask of the last n_ls slots.
+                ls_pos = jnp.arange(b) >= idx
+                gate   = ls_pos & (alpha < 1.0)                               # [b]
+                t = jnp.where(gate, t_big, t)
+                r = jnp.where(gate, r_big, r)
+            else:
+                t = t.at[idx:].set(t_big[idx:])
+                r = r.at[idx:].set(r_big[idx:])
         return noise, t, r, n_fm
 
     # ------------------------------------------------------------------
@@ -481,7 +496,7 @@ class Pi0AlphaFlow(Pi0):
           alpha == 0 → exact MeanFlow via JVP
         """
         flow_ratio = self._flow_ratio if flow_ratio is None else flow_ratio
-        noise, t, r, n_fm = self._sample_flow_inputs(rng, actions, flow_ratio)
+        noise, t, r, n_fm = self._sample_flow_inputs(rng, actions, flow_ratio, alpha=alpha)
         return jax.lax.cond(
             alpha > 0.0,
             lambda: self._discrete_branch(prefix_kv, observation, actions, noise, t, r, n_fm, alpha, utgt_clamp),
@@ -618,80 +633,67 @@ class Pi0AlphaFlow(Pi0):
 @dataclasses.dataclass(frozen=True)
 class Pi0AlphaFlowConfig(pi0_config.Pi0Config):
     """
-    Config for Pi0AlphaFlow.
+    Config for Pi0AlphaFlow.  Inherits all Pi0Config fields.  Set pi05=True.
 
-    Inherits all Pi0Config fields.  Set pi05=True (required).
+    Defaults = the AlphaFlowTSE (2603.10701) recipe (the validated JVP-free
+    design — see docs/alphaflow_troubleshooting.md O7).  Everything below is a
+    knob, but the defaults are the base recipe; a plain `Pi0AlphaFlowConfig(
+    pi05=True)` already gives it.  Deviations (e.g. use_jvp=True) are A/B toggles.
 
-    Schedule is defined as fractions of num_train_steps so it adapts
-    automatically when you change the training budget:
-
-        [0,           warmup_ratio)       → alpha = 1.0  (TFM warmup)
-        [warmup_ratio, transition_ratio)  → alpha sigmoid 1 → 0
-        [transition_ratio, 1.0]           → alpha = 0.0  (JVP MeanFlow)
+    Alpha schedule (fractions of num_train_steps), scaled-sigmoid 1 → alpha_min:
+        [0,            warmup_ratio)      → alpha = 1.0       (FM warmup)
+        [warmup_ratio, transition_ratio) → alpha 1 → end_val (transition)
+        [transition_ratio, 1.0]          → alpha = end_val    (floor)
+    end_val = alpha_min (use_jvp=False, discrete) or 0 (use_jvp=True, JVP).
     """
 
-    # --- alpha-flow schedule (fractions of num_train_steps) ---
-    warmup_ratio:     float = 0.3   # fraction at which alpha starts decreasing
-    transition_ratio: float = 0.7   # fraction at which alpha reaches 0 (JVP starts)
-    alpha_gamma:      float = 25.0  # sigmoid temperature (sharpness of transition)
-    # alpha_min is the DISCRETE FLOOR (use_jvp=False): alpha never goes below this
-    # (AlphaFlowTSE uses 0.1).  It is NOT the boundary-snap threshold — see alpha_eta.
-    alpha_min:        float = 5e-3
-    # alpha_eta is the boundary-snap threshold (paper's eta): raw alpha above 1-eta
-    # snaps to 1, and (use_jvp=True) below eta snaps to 0 → JVP.  Must stay SMALL and
-    # is decoupled from alpha_min, so raising the floor (e.g. 0.1) does not distort
-    # the top of the curriculum / extend the warmup.
+    # --- alpha schedule (fractions of num_train_steps) ---
+    warmup_ratio:     float = 0.05   # FM (alpha=1) phase
+    transition_ratio: float = 0.667  # end of the 1→alpha_min sigmoid (then floor)
+    alpha_gamma:      float = 15.0   # sigmoid steepness (paper k=15)
+    # alpha_min = the DISCRETE FLOOR (use_jvp=False): alpha never goes below this
+    # (AlphaFlowTSE: 0.1, well away from the JVP limit).  NOT the snap threshold.
+    alpha_min:        float = 0.1
+    # alpha_eta = boundary-snap threshold (paper's eta): raw alpha above 1-eta
+    # snaps to 1, and (use_jvp=True) below eta snaps to 0 → JVP.  Stays SMALL,
+    # decoupled from alpha_min so raising the floor doesn't distort the warmup.
     alpha_eta:        float = 5e-3
 
-    # Latent prior: True = hypersphere (LPS), False = standard Gaussian (pi05).
-    # Toggle to A/B test whether the sphere prior hurts the alpha-flow fine-tune.
-    sphere_latent:    bool  = True
+    # --- MeanFlow estimator ---
+    # use_jvp=False (default): discrete teacher-student bootstrap (stable, bf16 OK).
+    # use_jvp=True:  exact MeanFlow via JVP at alpha=0 (precision-sensitive — runs
+    #   in fp32 when jvp_fp32; see O6).  Set transition_ratio<1 to carve a JVP phase.
+    use_jvp:          bool  = False
+    jvp_fp32:         bool  = True   # run the JVP suffix forward in fp32 (O6)
 
-    # Timestep marginal: "minmax" = sigmoid(normal-0.4) (official alpha-flow),
-    # "beta" = beta(1.5,1) (matches pretrained pi05 FM training).  A/B test for H2.
+    # --- loss reweighting ---
+    # "bounded" (default, AlphaFlowTSE Eq.18): kappa/(m+alpha*kappa+eps) — does NOT
+    #   suppress the small-alpha mean-velocity samples (the real fix).
+    # "adaptive": alpha/(m+c), or a fixed mf_loss_weight to decouple from alpha.
+    mf_reweight:      str   = "bounded"
+    reweight_kappa:   float = 1.0
+    mf_loss_weight:   float | None = None  # only used when mf_reweight="adaptive"
+    lambda_fm:        float = 0.6   # FM-branch loss weight  (AlphaFlowTSE)
+    lambda_mf:        float = 0.4   # MF-branch loss weight  (AlphaFlowTSE)
+
+    # --- time-pair sampling ---
+    flow_ratio:       float = 0.5   # FM-border fraction (r=t pure flow-matching)
+    # Fraction of MF samples from the large-span subset (t≥0.85, r≤0.15) so training
+    # sees the full-interval transport that 1-NFE inference (t=1, r=0) uses.
+    large_span_ratio: float = 0.15
+    # Gate large-span sampling to the post-warmup phase (alpha<1).  During FM
+    # warmup (alpha=1) the target is v (r-independent), so forced large-span
+    # samples teach nothing about the interval — skip them and only oversample
+    # the full span once mean-velocity learning has begun (transition + floor).
+    large_span_warmup_gate: bool = True
+    # "minmax" = sigmoid(normal-0.4) (official); "beta" = beta(1.5,1) (pi05). A/B.
     time_sampler:     str   = "minmax"
 
-    # If True, alpha snaps to 0 at the end → exact MeanFlow via JVP (can be
-    # unstable: see docs/alphaflow_troubleshooting.md).  If False, alpha floors
-    # at alpha_min → discrete-only MeanFlow (more stable, paper's recommendation).
-    use_jvp:          bool  = True
-
-    # MF-sample loss weight.  None → weight = alpha (official curriculum
-    # down-weighting).  When alpha is constant (discrete-only / MeanFlow-from-
-    # start) the alpha weight permanently suppresses the mean-velocity gradient,
-    # so set this to 1.0 to decouple the loss weight from the schedule alpha and
-    # give the mean-velocity samples full gradient magnitude.
-    mf_loss_weight:   float | None = None
-
-    # Run the JVP suffix forward in fp32.  Forward-mode AD (the dudt tangent) is
-    # far more precision-sensitive than a plain forward eval; the default bf16
-    # backbone makes dudt noisy enough to destabilize the MeanFlow bootstrap.
-    # True = stable fp32 JVP (recommended).  False = bf16 (reproduces divergence).
-    jvp_fp32:         bool  = True
-
-    # --- AlphaFlowTSE (2603.10701) recipe knobs ---
-    # MF-sample reweighting:  "adaptive" = alpha/(m+c) via mf_loss_weight (orig),
-    # "bounded" = kappa/(m+alpha*kappa+eps) (Eq.18) — does NOT suppress small-alpha
-    # samples, the principled fix for the gradient-suppression problem.
-    mf_reweight:      str   = "adaptive"
-    reweight_kappa:   float = 1.0   # kappa in the bounded reweighting
-
-    # Fraction of MF samples drawn from the large-span subset (t≥0.85, r≤0.15) so
-    # training sees the full-interval transport that 1-NFE inference (t=1,r=0) uses.
-    large_span_ratio: float = 0.0
-
-    # FM-border fraction (r=t pure flow-matching anchor).  AlphaFlowTSE uses 0.5.
-    flow_ratio:       float = 0.25
-
-    # Per-branch loss weights (AlphaFlowTSE: lambda_fm=0.6, lambda_mf=0.4).
-    lambda_fm:        float = 1.0
-    lambda_mf:        float = 1.0
-
-    # Time conditioning:  False = embed r directly (emb(t)+emb(r)), True = embed
-    # the interval length emb(t)+emb(Δ), Δ=r-t (AlphaFlowTSE, default).  Safe to
-    # default on: r_mlp_out is zero-init so r vs Δ are identical at init and only
-    # diverge as r_mlp learns.
+    # --- conditioning / prior ---
+    # emb(t)+emb(Δ), Δ=t-r (AlphaFlowTSE) when True; emb(t)+emb(r) when False.
     delta_conditioning: bool = True
+    # Latent prior: True = hypersphere (LPS), False = standard Gaussian (pi05).
+    sphere_latent:    bool  = True
 
     # Total training steps — used to convert schedule ratios → absolute steps.
     # The model tracks its own step counter internally so train.py needs no changes.

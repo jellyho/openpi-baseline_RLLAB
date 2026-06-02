@@ -46,6 +46,7 @@ from openpi.models.pi0 import make_attn_mask, posemb_sincos
 from openpi.models.pi0_alphaflow import Pi0AlphaFlow, Pi0AlphaFlowConfig
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
+import openpi.shared.nnx_utils as nnx_utils
 from openpi.shared import array_typing as at
 
 
@@ -139,6 +140,31 @@ class Pi0WithCriticConfig(Pi0AlphaFlowConfig):
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0WithCritic":
         return Pi0WithCritic(self, rngs=nnx.Rngs(rng))
+
+    def get_rectify_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Freeze the VLM (SigLIP + PaliGemma prefix expert); train everything else
+        — the action expert (`_1`) + r-conditioning + action/state projections, and
+        the critic expert (`_2`) + critic projections.
+
+        For 2-stage RFT phase-1 ("rectify"): init from a task-adapted flow-matching
+        checkpoint, distill it to a 1-NFE mean-velocity policy (action expert) while
+        warming up the critic, without disturbing the frozen perception backbone.
+        Mirrors Pi0LPSRFTConfig.get_freeze_filter but keeps the action expert trainable.
+        """
+        # NB: qualify the expert selectors with ".*llm.*" — a bare ".*_1.*" also
+        # matches SigLIP submodules (LayerNorm_1, Dense_1) and would leak the
+        # vision tower into the trainable set.  ".*llm.*_1.*" is the same selector
+        # pi0_config.py uses for the action expert.
+        trainable = nnx.Any(
+            nnx_utils.PathRegex(".*llm.*_1.*"),     # action expert (gemma suffix _1)
+            nnx_utils.PathRegex(".*llm.*_2.*"),     # critic expert (gemma suffix _2)
+            nnx_utils.PathRegex(".*critic_.*"),     # critic_in_proj / critic_out_proj
+            nnx_utils.PathRegex(".*r_mlp.*"),       # r-conditioning (alpha-flow)
+            nnx_utils.PathRegex(".*action_.*"),     # action_in_proj / action_out_proj
+            nnx_utils.PathRegex(".*time_mlp.*"),    # time embedding MLP
+            nnx_utils.PathRegex(".*state_proj.*"),  # robot-state projection
+        )
+        return nnx.Not(trainable)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +268,7 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self._mf_reweight    = config.mf_reweight
         self._reweight_kappa = config.reweight_kappa
         self._large_span_ratio = config.large_span_ratio
+        self._large_span_warmup_gate = config.large_span_warmup_gate
         self._flow_ratio     = config.flow_ratio
         self._lambda_fm      = config.lambda_fm
         self._lambda_mf      = config.lambda_mf

@@ -139,8 +139,8 @@ The `pi05_tabletop', 'pi05_tabletop_bc' configs in [`src/openpi/training/config.
 Norm stats are loaded directly from the pi05 base checkpoint (`asset_id=trossen`), so **no separate norm stats computation is needed**.
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 srun --gres=gpu:1 --nodelist node200 -c 32 uv run scripts/train.py pi05_alphaflow_tabletop_bc_orig \
-    --exp-name alphaflow_orig --overwrite
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 srun --gres=gpu:1 --nodelist node200 -c 32 uv run scripts/train.py pi05_alphaflow_critic_rl \
+    --exp-name critic_rl --overwrite
 ```
 
 ### Available Training Configs
@@ -149,45 +149,52 @@ All configs live in [`src/openpi/training/config.py`](src/openpi/training/config
 
 For the `H#` / `O#` / `A#` references and the full debugging history of the alpha-flow 1-NFE work, see [`docs/alphaflow_troubleshooting.md`](docs/alphaflow_troubleshooting.md).
 
-**Standard flow-matching baselines** (`Pi0` / `Pi0Config`, multi-step sampling)
+#### The RFT pipeline (4 categories)
 
-| Config | Model | Dataset | Description |
-|---|---|---|---|
-| `pi05_tabletop` | Pi05 FM | `..._rl` | Standard Pi05 flow-matching fine-tune on the RL dataset (incl. failures). |
-| `pi05_tabletop_bc` | Pi05 FM | `..._bc` | Same, on the success-only BC dataset. |
-| `pi0_tabletop` | Pi0 FM | `..._rl` | Pi0 (not Pi05) flow-matching fine-tune on the RL dataset. |
+The tabletop work is organised as a 4-stage **RFT (Reinforced Fine-Tuning)** pipeline. Two independent routes produce a *1-NFE policy + critic* checkpoint — the **joint** route (cat 2) and the **2-stage** route (cat 1 → cat 3) — and both feed the final LPS-RFT step (cat 4):
 
-**Alpha-Flow 1-NFE distillation** (`Pi0AlphaFlow`) — fine-tunes Pi05 into a 1-step policy via the alpha-flow / MeanFlow curriculum. ⭐ = recommended.
+```
+            ┌─ 2. pi05_alphaflow_critic_{rl,bc}   (joint: distill + critic, from pi05_base) ─┐
+pi05_base ──┤                                                                                ├─→ 4. pi05_rft_phase2_rl
+            └─ 1. pi05_tabletop{,_bc} (FM) ─→ 3. pi05_rft_phase1_{rl,bc} (rectify + critic) ──┘      (LPS-RFT)
+```
 
-| Config | Dataset | Key knobs | Description |
-|---|---|---|---|
-| `pi05_alphaflow_tabletop_bc_orig` | `..._bc_orig` | defaults | Alpha-flow on the BC dataset. Defaults: JVP on, curriculum 0.3/0.7, adaptive reweight. |
-| `pi05_alphaflow_tabletop_rl_orig` | `..._rl_orig_mc` | defaults | Baseline alpha-flow on the RL dataset. **JVP diverges** at the end (see O5/O6). |
-| `pi05_alphaflow_tabletop_rl_orig_nojvp` | `..._rl_orig_mc` | `use_jvp=False` | H5: discrete-only MeanFlow (alpha floors at `alpha_min`, no JVP). Stable minimal-change control. |
-| `pi05_alphaflow_tabletop_rl_orig_beta` | `..._rl_orig_mc` | `time_sampler="beta"` | H2: pi05-matching beta time sampler instead of min-max. (O2: no effect — superseded.) |
-| `pi05_alphaflow_tabletop_rl_orig_gaussian` | `..._rl_orig_mc` | `sphere_latent=False` | H3: Gaussian latent prior instead of the sphere prior. (O2: ≈ identical — superseded.) |
-| `pi05_alphaflow_tabletop_mf_from_start` | `..._rl_orig_mc` | `warmup=0, transition=0, mf_loss_weight=1` | A1 ablation: MeanFlow from scratch, no curriculum (discrete). |
-| `pi05_alphaflow_tabletop_mf_from_start_jvp` | `..._rl_orig_mc` | `warmup=0, transition=0, use_jvp=True` | A1 ablation: MeanFlow from scratch with JVP (least stable, expected to diverge). |
-| ⭐ `pi05_alphaflow_tabletop_paper` | `..._rl_orig_mc` | TSE recipe | **AlphaFlowTSE (2603.10701) consolidated recipe** (O7): no JVP, bounded reweight, `alpha_min=0.1`, 15% large-span, 50/50 FM/MF split, λ 0.6/0.4. |
-| ⭐ `pi05_alphaflow_tabletop_paper_rl` | `..._rl_mc` | TSE recipe | Same TSE recipe, on the plain (non-"orig") RL dataset — same data as the critic runs. |
-| ⭐ `pi05_alphaflow_tabletop_paper_bc` | `..._bc_orig` | TSE recipe | Same TSE recipe, on the success-only BC dataset. |
-| `pi05_alphaflow_tabletop_paper_jvp` | `..._rl_orig_mc` | TSE recipe + JVP | Faithful JVP MeanFlow with the alpha=0 blow-up fixes: `use_jvp=True`, bounded reweight (learns mean-velocity during transition), clamped JVP target, `alpha_min=5e-3`, last ~20% is the exact-MeanFlow JVP phase. |
-| `pi05_alphaflow_insert-mouse-battery` | challenge | defaults | Alpha-flow on the `insert-mouse-battery` challenge task (DualYam data). |
-| `pi05_alphaflow_seal-water-bottle-cap` | challenge | defaults | Alpha-flow on the `seal-water-bottle-cap` challenge task (DualYam data). |
+All AlphaFlow configs use the **tuned recipe**: `flow_ratio=0.25` (25% FM-border / 75% MeanFlow samples), `lambda_fm=lambda_mf=0.5`, discrete-only (`use_jvp=False`), `alpha_min=0.1`, and `large_span_warmup_gate=True` (full-span oversampling is gated to the post-warmup phase). The full design history is in [`docs/alphaflow_troubleshooting.md`](docs/alphaflow_troubleshooting.md).
 
-**Alpha-Flow + Critic** (`Pi0WithCritic`) — adds a 3rd Gemma expert: a distributional C51/HL-Gauss value head trained jointly with the action expert (requires an `_mc` dataset).
-
-| Config | Dataset | Key knobs | Description |
-|---|---|---|---|
-| `pi05_alphaflow_critic_tabletop` | `..._rl_mc` | defaults | Joint alpha-flow + critic. **Uses the old (default) recipe → JVP diverges.** |
-| `pi05_alphaflow_critic_tabletop_orig` | `..._rl_orig_mc` | defaults | Same, on the orig dataset. Same JVP caveat. |
-| ⭐ `pi05_alphaflow_critic_tabletop_paper` | `..._rl_mc` | TSE recipe + critic | Critic + the validated AlphaFlowTSE recipe (no JVP, bounded reweight, etc.). **Use this to train a with-critic model.** |
-
-**LPS-RFT — offline RL via Latent Policy Steering** (`Pi0LPSRFT`) — loads a trained critic checkpoint, adds a latent-actor expert, freezes the VLM + action decoder, and steers the frozen 1-NFE policy toward high-value actions (CrossQ chunked-TD critic + DDPG actor).
+**1. Flow-matching baseline** (`Pi0Config`, multi-step) — the task-adapted FM policy that cat-3 rectifies. *(defined in the "Fine-tuning Tabletop-Sim" section of config.py.)*
 
 | Config | Dataset | Description |
 |---|---|---|
-| `pi05_lps_rft_tabletop` | `..._rl_mc` | Offline RL fine-tune. Init from a `pi05_alphaflow_critic_tabletop` checkpoint (update the `weight_loader` path to your run/step). |
+| `pi05_tabletop` | `..._rl_orig` | Pi05 flow-matching baseline on the RL dataset. cat-3 `_rl` init. |
+| `pi05_tabletop_bc` | `..._bc_orig` | Same, on the success-only BC dataset. cat-3 `_bc` init. |
+| `pi0_tabletop` | `..._rl` | Pi0 (not Pi05) flow-matching baseline. |
+
+**2. AlphaFlow + critic baseline** (`Pi0WithCritic`, joint, from `pi05_base`) — single-stage: alpha-flow 1-NFE distillation + a distributional C51/HL-Gauss critic trained together. Init is `pi05_base` (NOT task-adapted), so it keeps the **25% FM warmup** (schedule 25/50/25). Requires an `_mc` dataset.
+
+| Config | Dataset | Description |
+|---|---|---|
+| `pi05_alphaflow_critic_rl` | `..._rl_orig` (+mc) | Joint distill + critic on the RL dataset. |
+| `pi05_alphaflow_critic_bc` | `..._bc_orig` (+mc) | Same, on the success-only BC dataset. |
+
+**3. 2-stage RFT phase-1: rectify + critic warmup** (`Pi0WithCritic`, from a cat-1 FM checkpoint) — assumes a task-adapted FM policy already exists, so there is **no FM warmup** (`warmup_ratio=0`, starts straight at the alpha transition). The **VLM is frozen**; only the action expert (rectify FM → 1-NFE), its projections + r-conditioning, and the critic (warmup) train. Update the `weight_loader` path to your cat-1 run/step.
+
+| Config | Dataset | Init from |
+|---|---|---|
+| `pi05_rft_phase1_rl` | `..._rl_orig` (+mc) | `pi05_tabletop` checkpoint |
+| `pi05_rft_phase1_bc` | `..._bc_orig` (+mc) | `pi05_tabletop_bc` checkpoint |
+
+**4. LPS-RFT phase-2 — offline RL via Latent Policy Steering** (`Pi0LPSRFT`) — loads a **cat-2 OR cat-3** checkpoint (VLM + action + critic), adds a latent-actor expert, freezes the VLM + action decoder, and steers the frozen 1-NFE policy toward high-value actions (CrossQ chunked-TD critic + DDPG actor). Update the `weight_loader` path to your cat-2/cat-3 run/step.
+
+| Config | Dataset | Description |
+|---|---|---|
+| `pi05_rft_phase2_rl` | `..._rl_orig` (+mc, +next_obs) | Final offline-RL fine-tune; common to both routes. |
+
+**Alpha-Flow challenge tasks** (`Pi0AlphaFlow`, DualYam data) — plain 1-NFE distillation on the challenge tasks.
+
+| Config | Task |
+|---|---|
+| `pi05_alphaflow_insert-mouse-battery` | `insert-mouse-battery` |
+| `pi05_alphaflow_seal-water-bottle-cap` | `seal-water-bottle-cap` |
 
 **Challenge-phase baselines** (standard Pi05 FM, 200k steps, DualYam data)
 

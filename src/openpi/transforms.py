@@ -188,6 +188,11 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        # LPS-RFT next observation (if present): resize identically to the current.
+        if "next_image" in data:
+            data["next_image"] = {
+                k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["next_image"].items()
+            }
         return data
 
 
@@ -334,6 +339,8 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        if "next_state" in data:  # LPS-RFT next observation
+            data["next_state"] = pad_to_dim(data["next_state"], self.model_action_dim, axis=-1)
         return data
 
 

@@ -54,6 +54,9 @@ class TabletopInputs(transforms.DataTransformFn):
     """
 
     model_type: _model.ModelType = _model.ModelType.PI0
+    # If True, the images/state come as [current, next] windows (LPS-RFT chunked
+    # TD); split them into the current obs + a model-ready next obs (+ `done`).
+    load_next_obs: bool = False
 
     EXPECTED_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
@@ -71,9 +74,7 @@ class TabletopInputs(transforms.DataTransformFn):
                 img = einops.rearrange(img, "c h w -> h w c")
             return img
 
-        base_image = to_hwc_uint8(in_images["cam_high"])
-
-        # Map camera names to model image slots.
+        # Camera-name → model image slot mapping.
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
                 extra_slots = {
@@ -88,22 +89,43 @@ class TabletopInputs(transforms.DataTransformFn):
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
 
-        images = {"base_0_rgb": base_image}
-        image_masks = {"base_0_rgb": np.True_}
+        def build_image_dict(cam_imgs: dict) -> tuple[dict, dict]:
+            base = to_hwc_uint8(cam_imgs["cam_high"])
+            imgs = {"base_0_rgb": base}
+            masks = {"base_0_rgb": np.True_}
+            for dest, source in extra_slots.items():
+                if source in cam_imgs:
+                    imgs[dest] = to_hwc_uint8(cam_imgs[source])
+                    masks[dest] = np.True_
+                else:
+                    imgs[dest] = np.zeros_like(base)
+                    masks[dest] = np.False_
+            return imgs, masks
 
-        for dest, source in extra_slots.items():
-            if source in in_images:
-                images[dest] = to_hwc_uint8(in_images[source])
-                image_masks[dest] = np.True_
-            else:
-                images[dest] = np.zeros_like(base_image)
-                image_masks[dest] = np.False_
-
-        inputs = {
-            "image": images,
-            "image_mask": image_masks,
-            "state": np.asarray(data["state"]),
-        }
+        if self.load_next_obs:
+            # images[cam] = [current, next] (2, C, H, W); state = [current, next] (2, S).
+            cur_imgs  = {k: np.asarray(v)[0] for k, v in in_images.items()}
+            next_imgs = {k: np.asarray(v)[1] for k, v in in_images.items()}
+            images, image_masks = build_image_dict(cur_imgs)
+            next_image, next_image_mask = build_image_dict(next_imgs)
+            state_window = np.asarray(data["state"])             # (2, S)
+            inputs = {
+                "image": images,
+                "image_mask": image_masks,
+                "state": state_window[0],
+                "next_image": next_image,
+                "next_image_mask": next_image_mask,
+                "next_state": state_window[1],
+                # done: next frame (offset H) is past the episode end → no bootstrap.
+                "done": np.asarray(data["next_is_pad"])[1],
+            }
+        else:
+            images, image_masks = build_image_dict(dict(in_images))
+            inputs = {
+                "image": images,
+                "image_mask": image_masks,
+                "state": np.asarray(data["state"]),
+            }
 
         if "actions" in data:
             inputs["actions"] = np.asarray(data["actions"])
@@ -111,9 +133,11 @@ class TabletopInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
-        # Pass through MC return for critic training (scalar per sample).
+        # MC return (scalar, CalQL anchor) + reward window [H] (chunked-TD target).
         if "mc_return" in data:
             inputs["mc_return"] = np.asarray(data["mc_return"])
+        if "reward" in data:
+            inputs["reward"] = np.asarray(data["reward"])
 
         return inputs
 

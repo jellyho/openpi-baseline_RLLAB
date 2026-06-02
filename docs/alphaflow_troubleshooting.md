@@ -21,37 +21,39 @@
 > **JVP를 쓰지 마라**(bf16서 발산; 쓸 거면 fp32). 그리고 **MF loss를 α로 곱하지 마라**(small-α 억제) — bounded reweighting을 써라. 나머지(α_min=0.1, large-span, split)는 1-NFE 품질 보강.
 
 ### 제어 축 (config 플래그)
-| 축 | 플래그 | 기본 / 대안 | 의미 |
-|---|---|---|---|
-| Curriculum | `warmup_ratio`/`transition_ratio` | `0.3/0.7` · `0/0` | α 스케줄 (0/0=from-start) |
-| 추정기 | `use_jvp` | `True` / `False` | JVP(exact) vs discrete bootstrap |
-| JVP 정밀도 | `jvp_fp32` | `True` / `False` | fp32 JVP vs bf16(발산 재현) |
-| α floor | `alpha_min` | `5e-3` · `0.1`(논문) | discrete floor / JVP 극한 거리 |
-| **MF 가중** | `mf_reweight` | `adaptive` / **`bounded`** | **small-α 억제 vs 해소(O7 핵심)** |
-| | `reweight_kappa` | `1.0` | bounded κ |
-| MF 가중(adaptive) | `mf_loss_weight` | `None`(=α) / `1.0` | α 곱 vs 고정 |
-| large-span | `large_span_ratio` | `0.0` · `0.15`(논문) | full-span 오버샘플 (t≥0.85,r≤0.15) |
-| FM/MF split | `flow_ratio` | `0.25` · `0.5`(논문) | FM-border 비율 |
-| branch 가중 | `lambda_fm`/`lambda_mf` | `1.0/1.0` · `0.6/0.4`(논문) | λ |
-| 시간 cond | `delta_conditioning` | **`True`**(전역) / `False` | emb(t)+emb(Δ) vs emb(t)+emb(r) |
-| 시간 샘플러 | `time_sampler` | `minmax` / `beta` | (O2: 효과 없음) |
-| Latent prior | `sphere_latent` | `True` / `False` | (O2: 동일) |
+> **⭐ 2026-06-02 정리:** AlphaFlowTSE 레시피를 `Pi0AlphaFlowConfig` **기본값**으로 승격. 탐색용 ablation config(nojvp/beta/gaussian/mf_from_start/paper*)는 전부 삭제. 변경점은 전부 flag로 남아 configurable. JVP 코드+`jvp_fp32` 옵션은 코드에 보존.
 
-### 등록된 config (6개)
-| config | use_jvp | α_min | mf_reweight | large_span | flow_ratio | curriculum | 목적 / 상태 |
-|---|---|---|---|---|---|---|---|
-| `…rl_orig` | T | 5e-3 | adaptive | 0 | 0.25 | ✓ | baseline. JVP서 발산(이제 fp32 JVP 기본) |
-| `…rl_orig_nojvp` | **F** | 5e-3 | adaptive | 0 | 0.25 | ✓ | discrete-only (H5). 최소변경 대조군 |
-| `…mf_from_start` | F | 5e-3 | adaptive(mf_w=1) | 0 | 0.25 | ✗ | curriculum 불필요성 (A1) |
-| `…mf_from_start_jvp` | T | 0 | adaptive | 0 | 0.25 | ✗ | JVP from-scratch (발산 예상) |
-| **`…paper`** | **F** | **0.1** | **bounded** | **0.15** | **0.5** | ✓(0.05/0.67) | **⭐ AlphaFlowTSE 종합 (λ 0.6/0.4)** |
-| `…beta` / `…gaussian` | T | 5e-3 | adaptive | 0 | 0.25 | ✓ | H2/H3 (O2: 중단) |
-> 전 config 공통: `jvp_fp32=True`, `delta_conditioning=True`.
+### TSE 기본값 (Pi0AlphaFlowConfig defaults)
+| 플래그 | 기본값 | 의미 / 대안 |
+|---|---|---|
+| `warmup_ratio`/`transition_ratio` | `0.05` / `0.667` | FM 5% / transition 61.7% / floor 33.3% |
+| `alpha_gamma` | `15.0` | sigmoid steepness (paper k) |
+| `alpha_min` | `0.1` | discrete floor (JVP 극한과 거리) |
+| `alpha_eta` | `5e-3` | boundary-snap threshold (floor와 분리) |
+| `use_jvp` / `jvp_fp32` | `False` / `True` | discrete-only; JVP 쓸 땐 fp32 (O6) |
+| `mf_reweight` / `reweight_kappa` | `bounded` / `1.0` | κ/(m+ακ+ε), small-α 억제 해소 (O7 핵심) |
+| `lambda_fm` / `lambda_mf` | `0.6` / `0.4` | branch 가중 |
+| `flow_ratio` | `0.5` | FM/MF 50:50 |
+| `large_span_ratio` | `0.15` | full-span(t≥0.85,r≤0.15) 오버샘플 |
+| `delta_conditioning` | `True` | emb(t)+emb(Δ) |
+| `mf_loss_weight` | `None` | adaptive 모드 전용 (α 곱 우회) |
+| `time_sampler`/`sphere_latent` | `minmax`/`True` | (O2: 둘 다 영향 없음) |
+
+### 등록된 config (9개, 전부 TSE 기본)
+| config | 데이터 / 차이 |
+|---|---|
+| `pi05_alphaflow_tabletop_bc_orig` | bc_orig (성공 데이터) |
+| `pi05_alphaflow_tabletop_rl_orig` | rl_orig_mc |
+| `pi05_alphaflow_tabletop_rl` | rl_mc |
+| `pi05_alphaflow_tabletop_jvp` | rl_orig_mc, **use_jvp=True**(transition 0.8, 마지막 20% JVP) — JVP 레퍼런스 |
+| `pi05_alphaflow_critic_tabletop` | rl_mc + C51 critic |
+| `pi05_alphaflow_critic_tabletop_orig` | rl_orig_mc + critic |
+| `pi05_lps_rft_tabletop` | LPS-RFT (critic 체크포인트 로드) |
+| `pi05_alphaflow_insert-mouse-battery` / `…seal-water-bottle-cap` | 실제 태스크 |
 
 ### 권장 실험 순서
-1. **`pi05_alphaflow_tabletop_paper`** — 종합 레시피. 1순위.
-2. `…rl_orig_nojvp` — 최소변경 discrete-only 대조군 (paper의 어느 요소가 효과인지 분리).
-3. (선택) `…rl_orig` — fp32 JVP가 발산 잡는지(O6 확정).
+1. **`pi05_alphaflow_tabletop_rl_orig`** (또는 bc_orig) — TSE 기본 레시피. 1순위.
+2. `pi05_alphaflow_tabletop_jvp` — fp32 JVP가 발산 잡는지(O6 확정), discrete와 비교.
 - 실행 `./train.sh <config> 1 32 30000`. 비교: `loss/l2_raw`(pi05 FM scale) + 학습 후 **1-NFE vs 10-NFE** 품질.
 - ⚠️ batch 32에선 large-span 샘플이 스텝당 ~2개 → 필요시 batch↑ 또는 large_span_ratio↑.
 
@@ -139,6 +141,15 @@
 - `delta_conditioning`은 **기본 True** (전 config 적용). r_mlp_out zero-init이라 init 시점엔 r-cond와 동일 → 안전. emb(t)+emb(Δ=t-r).
 - 기존 config 전부 기본값 유지(mf_reweight="adaptive", flow_ratio=0.25, large_span=0) → 영향 없음.
 - 실행: `./train.sh pi05_alphaflow_tabletop_paper 1 32 30000`.
+
+### 스케줄: scaled-sigmoid로 phase 비율 정확화
+- 기존 `alpha_schedule`은 `1-σ`를 floor에 **hard-clamp** → α가 floor에 **일찍 도달**해 평탄화 (transition window의 절반이 이미 floor).
+- 수정: **scaled sigmoid** `α = 1 + (end_val-1)·σ(γ·progress)` → floor를 **transition_end에서 정확히** 도달. 이제 phase가 step 비율과 1:1.
+  - FM (α=1)        : `[0, warmup_ratio)`
+  - transition (1→α_min): `[warmup_ratio, transition_ratio)`
+  - floor (α=α_min) : `[transition_ratio, 1.0]`
+- 논문 매핑: epochs 5/100 of 150 → FM 3.3%(우린 5%), transition ~62%, floor 33%. γ=k=15.
+- adaptive loss는 논문 그대로: **FM=Eq.14(γ=0) `1/(m+ε)·m`** (=원본 AlphaFlow p=1), **MF=Eq.18 `κ/(m+ακ+ε)·m`** (bounded). 둘 다 일치.
 
 ## 실험 config (한 번에 하나씩 isolate)
 | config | H | 변경 | 상태 |
