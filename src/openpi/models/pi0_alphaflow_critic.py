@@ -137,6 +137,13 @@ class Pi0WithCriticConfig(Pi0AlphaFlowConfig):
     # Weight of the critic loss relative to the alpha-flow loss in compute_loss.
     critic_loss_weight: float = 1.0
 
+    # Multi-horizon value heads.  Under causal masking, critic token (h-1) sees
+    # actions a_{0:h}, so it is Q(s, a_{0:h}).  We read these horizons and project
+    # each to a C51 distribution → [b, K, n_bins].  In warmup ALL horizons are
+    # supervised by the same chunk MC return G_t (telescopes), so they pre-position
+    # the heads; differentiation by horizon happens in LPS-RFT (chunked-TD, TBD).
+    critic_horizons: tuple[int, ...] = (5, 10, 25, 50)
+
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0WithCritic":
         return Pi0WithCritic(self, rngs=nnx.Rngs(rng))
@@ -252,6 +259,11 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self.v_max              = config.v_max
         self.hl_gauss_sigma     = config.hl_gauss_sigma
         self.critic_loss_weight = config.critic_loss_weight
+        # Multi-horizon critic token indices: clamp each horizon to [1, ah], take
+        # the 0-based token index (h-1), dedupe + sort.  Static Python tuple.
+        self._critic_token_idx  = tuple(sorted({
+            min(max(int(h), 1), self.action_horizon) - 1 for h in config.critic_horizons
+        }))
 
         # Alpha schedule + step counter (we bypassed Pi0AlphaFlow.__init__, so
         # replicate its schedule setup here).
@@ -297,13 +309,13 @@ class Pi0WithCritic(Pi0AlphaFlow):
     # ------------------------------------------------------------------
 
     def _critic_logits(self, kv_cache, prefix_mask, actions):
-        """Single chunk-level C51 logits [b, n_bins], reusing the shared prefix KV.
+        """Multi-horizon C51 logits [b, K, n_bins], reusing the shared prefix KV.
 
-        The critic tokens are causally masked (token i sees a_{0..i}), so the LAST
-        token has attended to the entire action chunk — its output is Q(s, a_{0:H}),
-        the value of the whole chunk.  We read that token and project it to one C51
-        distribution.  (Per-timestep / multi-horizon value heads — 5/10/25/50 — are
-        a planned extension; for now there is a single Q per (state, chunk).)
+        The critic tokens are causally masked (token i sees a_{0..i}), so token
+        (h-1) is Q(s, a_{0:h}) — the value of committing the first h actions.  We
+        read the K horizons in `_critic_token_idx` (e.g. 5/10/25/50 → tokens
+        4/9/24/49) and project each to a C51 distribution.  Per horizon's target is
+        decided by the caller (warmup: all = chunk MC return G_t).
 
         The prefix KV is **stop-gradient'd**: the randomly-initialised critic
         head must not backprop into the shared PaliGemma backbone, otherwise its
@@ -323,8 +335,9 @@ class Pi0WithCritic(Pi0AlphaFlow):
             kv_cache=kv_cache,
             adarms_cond=[None, None, None],
         )
-        critic_out = outs[2][:, -1]                      # [b, critic_w]  last token = whole chunk
-        return self.critic_out_proj(critic_out)          # [b, n_bins]
+        idx = jnp.asarray(self._critic_token_idx)
+        critic_out = outs[2][:, idx]                     # [b, K, critic_w]  K horizon tokens
+        return self.critic_out_proj(critic_out)          # [b, K, n_bins]
 
     # ------------------------------------------------------------------
     # compute_loss: alpha-flow (reused from parent) + critic, shared prefix KV
@@ -360,19 +373,22 @@ class Pi0WithCritic(Pi0AlphaFlow):
         alpha   = self._alpha_now()
         af_loss, af_raw_l2 = self._alphaflow_loss_with_prefix(flow_rng, observation, actions, prefix_kv, alpha)
 
-        # Critic expert: single chunk-level C51 loss (reuses the same prefix KV).
-        logits      = self._critic_logits(kv_cache, prefix_mask, actions)  # [b, n_bins]
+        # Critic expert: multi-horizon C51 loss (reuses the same prefix KV).  All
+        # K horizons share the chunk MC return G_t as target (telescopes under MC).
+        logits      = self._critic_logits(kv_cache, prefix_mask, actions)  # [b, K, n_bins]
+        K           = logits.shape[1]
+        mc_exp      = jnp.broadcast_to(mc_returns[:, None], (mc_returns.shape[0], K))  # [b, K]
         critic_loss = critic_loss_hl_gauss(
-            logits, mc_returns, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
-        )                                                                 # [b]
+            logits, mc_exp, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
+        ).mean(axis=-1)                                                   # [b]  (mean over horizons)
 
         # Advance the shared alpha schedule once per train step.
         self.train_step.value = self.train_step.value + 1
 
-        # Critic diagnostics: predicted E[V] vs MC return.
+        # Critic diagnostics: predicted E[V] vs MC return (averaged over horizons).
         probs       = jax.nn.softmax(jax.lax.stop_gradient(logits), axis=-1)
-        pred_value  = expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b]
-        value_mae   = jnp.mean(jnp.abs(pred_value - mc_returns))
+        pred_value  = expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b, K]
+        value_mae   = jnp.mean(jnp.abs(pred_value - mc_exp))
 
         phase = jnp.where(alpha >= 1.0, 1.0, jnp.where(alpha <= 0.0, 0.0, 0.5))
         aux = {
@@ -429,17 +445,14 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self,
         observation: _model.Observation,
         actions:     _model.Actions,
-    ) -> at.Float[at.Array, "b n_bins"]:
+    ) -> at.Float[at.Array, "b k n_bins"]:
         """
-        Compute the single chunk-level C51 logits for Q(obs, a_{0:H}).
+        Compute the multi-horizon C51 logits for Q(obs, a_{0:h}), h in critic_horizons.
 
-        The critic tokens are causally masked, so the last token has seen the whole
-        chunk; its C51 distribution over [v_min, v_max] is the chunk value.
-
-        Returns: [b, n_bins] logits (before softmax).
+        Returns: [b, K, n_bins] logits (before softmax), one C51 head per horizon.
         """
         kv_cache, prefix_mask = self._embed_prefix_kv(observation)
-        return self._critic_logits(kv_cache, prefix_mask, actions)   # [b, n_bins]
+        return self._critic_logits(kv_cache, prefix_mask, actions)   # [b, K, n_bins]
 
     # ------------------------------------------------------------------
     # Critic loss (supervised by MC returns)
@@ -453,22 +466,24 @@ class Pi0WithCritic(Pi0AlphaFlow):
         mc_returns:  at.Float[at.Array, " b"],
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, " b"]:
+    ) -> at.Float[at.Array, "b k"]:
         """
-        HL-Gauss C51 cross-entropy loss for the single chunk-level value.
+        HL-Gauss C51 cross-entropy loss for the multi-horizon values.
 
-        mc_returns: [b] scalar G_t for each sample.
-        Returns:    [b] per-sample CE loss.
+        mc_returns: [b] scalar G_t for each sample — shared across all K horizons.
+        Returns:    [b, K] per-horizon CE loss.
         """
         preprocess_rng, _ = jax.random.split(rng)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        logits = self.compute_critic_logits(observation, actions)  # [b, n_bins]
+        logits = self.compute_critic_logits(observation, actions)  # [b, K, n_bins]
+        K      = logits.shape[1]
+        mc_exp = jnp.broadcast_to(mc_returns[:, None], (mc_returns.shape[0], K))  # [b, K]
 
         return critic_loss_hl_gauss(
-            logits, mc_returns,
+            logits, mc_exp,
             self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma,
-        )                                                           # [b]
+        )                                                           # [b, K]
 
     # ------------------------------------------------------------------
     # Value inference
@@ -478,12 +493,12 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self,
         observation: _model.Observation,
         actions:     _model.Actions,
-    ) -> at.Float[at.Array, " b"]:
+    ) -> at.Float[at.Array, "b k"]:
         """
-        Return the chunk-level E[V] = Q(s, a_{0:H}) from the C51 distribution.
+        Return the multi-horizon E[V] = Q(s, a_{0:h}) from the C51 distributions.
 
-        Returns [b] — one expected value per sample (the whole action chunk).
+        Returns [b, K] — one expected value per horizon (critic_horizons order).
         """
-        logits = self.compute_critic_logits(observation, actions)  # [b, n_bins]
+        logits = self.compute_critic_logits(observation, actions)  # [b, K, n_bins]
         probs  = jax.nn.softmax(logits, axis=-1)
-        return expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b]
+        return expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b, K]

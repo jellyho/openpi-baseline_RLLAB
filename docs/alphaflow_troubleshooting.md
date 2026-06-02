@@ -22,6 +22,10 @@
 
 ### 제어 축 (config 플래그)
 > **⭐ 2026-06-02 정리:** AlphaFlowTSE 레시피를 `Pi0AlphaFlowConfig` **기본값**으로 승격. 탐색용 ablation config(nojvp/beta/gaussian/mf_from_start/paper*)는 전부 삭제. 변경점은 전부 flag로 남아 configurable. JVP 코드+`jvp_fp32` 옵션은 코드에 보존.
+>
+> **⭐ 2026-06-02 (2차):** config을 **4-카테고리 RFT 파이프라인**으로 재편 (README 참고) — (1) FM baseline `pi05_tabletop{,_bc}`, (2) `pi05_alphaflow_critic_{rl,bc}` (joint, from base, warmup 25/50/25), (3) `pi05_rft_phase1_{rl,bc}` (rectify + critic warmup, FM ckpt에서 init, **VLM freeze** `get_rectify_freeze_filter`, warmup=0), (4) `pi05_rft_phase2_rl` (LPS). 튜닝 레시피 = `flow_ratio=0.25` + `lambda_fm=lambda_mf=0.5` + `large_span_warmup_gate=True`(warmup엔 large-span off). 나머지 tabletop ablation(fm25/fmext/rl_orig/rl/jvp 등)은 삭제 → 아래 "등록된 config" 표는 **stale**.
+>
+> **⭐ Critic = multi-horizon value (warmup) / single-Q (LPS).** causal mask라 token `h-1` = `Q(s,a₀:h)`. **warmup**(cat-2/cat-3): `critic_horizons`(기본 `(5,10,25,50)`) 토큰을 읽어 `[b,K,n_bins]` C51 head K개, **전부 chunk MC return `G_t`로 supervise**. (MC에선 telescoping이라 horizon별 타겟이 전부 `G_t` 동일 → warmup은 head를 MC 스케일에 예열만; horizon 차별화는 LPS chunked-TD에서.) **LPS phase2**: 지금은 full-chunk head 1개만 single-Q로 사용 — multi-horizon을 RL TD에서 어떻게 쓸지는 TBD. `critic_horizons` 플래그. 옛 per-token(ah개) broadcast는 폐기. checkpoint 호환(`critic_out_proj` 그대로).
 
 ### TSE 기본값 (Pi0AlphaFlowConfig defaults)
 | 플래그 | 기본값 | 의미 / 대안 |

@@ -161,6 +161,8 @@ pi05_base ──┤                                                             
 
 All AlphaFlow configs use the **tuned recipe**: `flow_ratio=0.25` (25% FM-border / 75% MeanFlow samples), `lambda_fm=lambda_mf=0.5`, discrete-only (`use_jvp=False`), `alpha_min=0.1`, and `large_span_warmup_gate=True` (full-span oversampling is gated to the post-warmup phase). The full design history is in [`docs/alphaflow_troubleshooting.md`](docs/alphaflow_troubleshooting.md).
 
+> **Critic head — multi-horizon value (warmup) / single-Q (LPS).** The critic tokens are causally masked, so token `h-1` is `Q(s, a₀:h)`. In **warmup** (cat-2/cat-3) the critic reads `critic_horizons` (default `(5,10,25,50)`) → `[b, K, n_bins]` C51 heads, **all supervised by the chunk MC return** `G_t`. (Under MC the target telescopes to the same `G_t` for every horizon, so warmup just pre-positions the heads at MC scale; per-horizon differentiation is deferred to LPS chunked-TD.) **LPS phase-2** currently reads only the full-chunk head as a single `Q` — how to exploit the multiple horizons in the RL TD target is TBD. Set via `critic_horizons`.
+
 **1. Flow-matching baseline** (`Pi0Config`, multi-step) — the task-adapted FM policy that cat-3 rectifies. *(defined in the "Fine-tuning Tabletop-Sim" section of config.py.)*
 
 | Config | Dataset | Description |
@@ -169,7 +171,7 @@ All AlphaFlow configs use the **tuned recipe**: `flow_ratio=0.25` (25% FM-border
 | `pi05_tabletop_bc` | `..._bc_orig` | Same, on the success-only BC dataset. cat-3 `_bc` init. |
 | `pi0_tabletop` | `..._rl` | Pi0 (not Pi05) flow-matching baseline. |
 
-**2. AlphaFlow + critic baseline** (`Pi0WithCritic`, joint, from `pi05_base`) — single-stage: alpha-flow 1-NFE distillation + a distributional C51/HL-Gauss critic trained together. Init is `pi05_base` (NOT task-adapted), so it keeps the **25% FM warmup** (schedule 25/50/25). Requires an `_mc` dataset.
+**2. AlphaFlow + critic baseline** (`Pi0WithCritic`, joint, from `pi05_base`) — single-stage: alpha-flow 1-NFE distillation + a multi-horizon C51/HL-Gauss critic trained together. Init is `pi05_base` (NOT task-adapted), so it keeps the **25% FM warmup** (schedule 25/50/25). Requires an `_mc` dataset.
 
 | Config | Dataset | Description |
 |---|---|---|
