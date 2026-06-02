@@ -94,7 +94,7 @@ def main():
     print(f"Episode {args.episode}: {n_frames} frames")
 
     # ── Iterate frames, compute E[V] and collect camera images ─────────────────
-    value_fn = nnx_utils.module_jit(model.predict_value)   # (obs, actions) -> [b, H]
+    value_fn = nnx_utils.module_jit(model.predict_value)   # (obs, actions) -> [b]  chunk value
 
     pred_values, gt_returns, cam_frames = [], [], []
     buf_obs, buf_act = [], []
@@ -104,7 +104,7 @@ def main():
             return
         obs = jax.tree.map(lambda *xs: jnp.stack(xs, 0), *buf_obs)   # batched Observation
         act = jnp.stack(buf_act, 0)                                 # [b, H, ad]
-        v = np.asarray(value_fn(obs, act)).mean(axis=-1)            # mean over horizon → [b]
+        v = np.asarray(value_fn(obs, act))                          # [b]  single chunk value
         pred_values.extend(v.tolist())
         buf_obs.clear(); buf_act.clear()
 

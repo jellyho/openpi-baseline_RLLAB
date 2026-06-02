@@ -237,7 +237,7 @@ class Pi0LPSRFT(Pi0WithCritic):
     # _action_out_index() == 1 (inherited)
 
     def _critic_logits(self, kv_cache, prefix_mask, actions):
-        """Per-token C51 logits [b, ah, n_bins] (4-expert critic token list)."""
+        """Single chunk-level C51 logits [b, n_bins] (last critic token = whole chunk)."""
         kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)   # critic ⊥ frozen backbone
         critic_tokens, critic_mask, critic_ar = self.embed_critic_suffix(actions)
         full_attn, positions = self._suffix_attn_and_positions(prefix_mask, critic_mask, critic_ar)
@@ -246,7 +246,7 @@ class Pi0LPSRFT(Pi0WithCritic):
             mask=full_attn, positions=positions, kv_cache=kv_cache,
             adarms_cond=[None, None, None, None],
         )
-        return self.critic_out_proj(outs[2])      # [b, ah, n_bins]
+        return self.critic_out_proj(outs[2][:, -1])      # [b, n_bins]
 
     def _critic_value_detached(self, kv_cache, prefix_mask, actions):
         """E[V](s, a) with critic PARAMETERS detached (DDPG actor term).
@@ -261,7 +261,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         logits = model_sg._critic_logits(kv_cache, prefix_mask, actions)
         return expected_value(
             jax.nn.softmax(logits, axis=-1), self.v_min, self.v_max, self.n_bins
-        )                                          # [b, ah]
+        )                                          # [b]  chunk value
 
     # ------------------------------------------------------------------
     # Latent actor
@@ -355,7 +355,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         *,
         train: bool = False,
     ):
-        """Returns (per-token combined loss [*b, ah], aux dict).
+        """Returns (per-sample combined loss [b], aux dict).
 
         Critic: chunked TD target  y = max(R_chunk + γ^H·Q(s', a'),  mc_return)
                 (CalQL MC anchor; no target network).  The next-state value
@@ -385,12 +385,11 @@ class Pi0LPSRFT(Pi0WithCritic):
         # ── Critic forwards: Q(s,a_data) [grad] and Q(s',a') [stop-grad] ──────
         # (CrossQ: both pairs scored by the same critic; the next pair is the
         #  bootstrap target and is detached.)
-        logits_data = self._critic_logits(kv,  pm,  actions)            # [b, ah, n_bins]
+        logits_data = self._critic_logits(kv,  pm,  actions)            # [b, n_bins]
         logits_next = jax.lax.stop_gradient(self._critic_logits(kvn, pmn, a_next))
         v_next = expected_value(
             jax.nn.softmax(logits_next, axis=-1), self.v_min, self.v_max, self.n_bins
-        )                                                               # [b, ah]  (per-token)
-        v_next = jnp.mean(v_next, axis=-1)                              # [b]  Q(s', a')
+        )                                                               # [b]  Q(s', a')  chunk value
 
         # ── Chunked TD target, MC-anchored (CalQL), done-masked ───────────────
         # R_chunk = Σ_{i=0}^{H-1} γ^i · reward[t+i]  (discounted dataset reward over
@@ -403,17 +402,16 @@ class Pi0LPSRFT(Pi0WithCritic):
         # done (s_{t+H} past the episode end): no valid bootstrap → use the MC
         # return G_t directly (= truncated chunk return, terminal reward included).
         y       = jnp.where(done > 0.0, mc_t, y_boot)               # [b]
-        y       = jax.lax.stop_gradient(jnp.clip(y, self.v_min, self.v_max))
-        y_exp   = jnp.broadcast_to(y[:, None], (b, H))                 # [b, ah]
+        y       = jax.lax.stop_gradient(jnp.clip(y, self.v_min, self.v_max))  # [b]
         critic_loss = critic_loss_hl_gauss(
-            logits_data, y_exp, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
-        )                                                               # [b, ah]
+            logits_data, y, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
+        )                                                               # [b]
 
         # ── Actor (DDPG): maximize value, critic params detached ──────────────
         z_cur   = self._latent_action(kv, pm, b)
         a_actor = self._decode(kv, pm, observation, z_cur)             # frozen decoder
-        value_actor = self._critic_value_detached(kv, pm, a_actor)     # [b, ah], critic θ const
-        actor_loss  = -value_actor
+        value_actor = self._critic_value_detached(kv, pm, a_actor)     # [b], critic θ const
+        actor_loss  = -value_actor                                     # [b]
 
         total = self.critic_loss_weight * critic_loss + self.actor_loss_weight * actor_loss
 
@@ -422,7 +420,6 @@ class Pi0LPSRFT(Pi0WithCritic):
             jax.nn.softmax(jax.lax.stop_gradient(logits_data), axis=-1),
             self.v_min, self.v_max, self.n_bins,
         )
-        mc_exp = jnp.broadcast_to(mc_t[:, None], (b, H))
         aux = {
             "loss/critic":         jnp.mean(critic_loss),
             "loss/actor":          jnp.mean(actor_loss),
@@ -432,7 +429,7 @@ class Pi0LPSRFT(Pi0WithCritic):
             "td/mc_anchor_frac":   jnp.mean((mc_t >= y_td).astype(jnp.float32)),
             "td/done_frac":        jnp.mean(done),
             "critic/value_data":   jnp.mean(pred_value_data),
-            "critic/value_mae":    jnp.mean(jnp.abs(pred_value_data - mc_exp)),
+            "critic/value_mae":    jnp.mean(jnp.abs(pred_value_data - mc_t)),
             "actor/value_steered": jnp.mean(value_actor),
             "actor/advantage":     jnp.mean(value_actor) - jnp.mean(pred_value_data),
         }

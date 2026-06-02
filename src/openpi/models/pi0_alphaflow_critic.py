@@ -297,7 +297,13 @@ class Pi0WithCritic(Pi0AlphaFlow):
     # ------------------------------------------------------------------
 
     def _critic_logits(self, kv_cache, prefix_mask, actions):
-        """Per-token C51 logits [b, ah, n_bins], reusing the shared prefix KV.
+        """Single chunk-level C51 logits [b, n_bins], reusing the shared prefix KV.
+
+        The critic tokens are causally masked (token i sees a_{0..i}), so the LAST
+        token has attended to the entire action chunk — its output is Q(s, a_{0:H}),
+        the value of the whole chunk.  We read that token and project it to one C51
+        distribution.  (Per-timestep / multi-horizon value heads — 5/10/25/50 — are
+        a planned extension; for now there is a single Q per (state, chunk).)
 
         The prefix KV is **stop-gradient'd**: the randomly-initialised critic
         head must not backprop into the shared PaliGemma backbone, otherwise its
@@ -317,8 +323,8 @@ class Pi0WithCritic(Pi0AlphaFlow):
             kv_cache=kv_cache,
             adarms_cond=[None, None, None],
         )
-        critic_out = outs[2]                              # [b, ah, critic_w]
-        return self.critic_out_proj(critic_out)          # [b, ah, n_bins]
+        critic_out = outs[2][:, -1]                      # [b, critic_w]  last token = whole chunk
+        return self.critic_out_proj(critic_out)          # [b, n_bins]
 
     # ------------------------------------------------------------------
     # compute_loss: alpha-flow (reused from parent) + critic, shared prefix KV
@@ -354,21 +360,19 @@ class Pi0WithCritic(Pi0AlphaFlow):
         alpha   = self._alpha_now()
         af_loss, af_raw_l2 = self._alphaflow_loss_with_prefix(flow_rng, observation, actions, prefix_kv, alpha)
 
-        # Critic expert: per-token C51 loss (reuses the same prefix KV).
-        logits     = self._critic_logits(kv_cache, prefix_mask, actions)  # [b, ah, n_bins]
-        b          = actions.shape[0]
-        mc_exp     = jnp.broadcast_to(mc_returns[:, None], (b, self.action_horizon))
+        # Critic expert: single chunk-level C51 loss (reuses the same prefix KV).
+        logits      = self._critic_logits(kv_cache, prefix_mask, actions)  # [b, n_bins]
         critic_loss = critic_loss_hl_gauss(
-            logits, mc_exp, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
-        )                                                                 # [b, ah]
+            logits, mc_returns, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
+        )                                                                 # [b]
 
         # Advance the shared alpha schedule once per train step.
         self.train_step.value = self.train_step.value + 1
 
         # Critic diagnostics: predicted E[V] vs MC return.
         probs       = jax.nn.softmax(jax.lax.stop_gradient(logits), axis=-1)
-        pred_value  = expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b, ah]
-        value_mae   = jnp.mean(jnp.abs(pred_value - mc_exp))
+        pred_value  = expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b]
+        value_mae   = jnp.mean(jnp.abs(pred_value - mc_returns))
 
         phase = jnp.where(alpha >= 1.0, 1.0, jnp.where(alpha <= 0.0, 0.0, 0.5))
         aux = {
@@ -381,7 +385,9 @@ class Pi0WithCritic(Pi0AlphaFlow):
             "critic/value_mae":   value_mae,
             "critic/mc_return_mean": jnp.mean(mc_returns),
         }
-        return af_loss + self.critic_loss_weight * critic_loss, aux
+        # af_loss is per action token [b, ah]; broadcast the scalar chunk critic
+        # loss [b] across tokens so jnp.mean weights it as one term per sample.
+        return af_loss + self.critic_loss_weight * critic_loss[:, None], aux
 
     # ------------------------------------------------------------------
     # Override: alpha-flow sampling.
@@ -423,17 +429,17 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self,
         observation: _model.Observation,
         actions:     _model.Actions,
-    ) -> at.Float[at.Array, "b ah n_bins"]:
+    ) -> at.Float[at.Array, "b n_bins"]:
         """
-        Compute per-token C51 logits for Q(obs, actions).
+        Compute the single chunk-level C51 logits for Q(obs, a_{0:H}).
 
-        With causal masking, token i sees prefix + a_{0..i} and outputs
-        Q(s, a_{0:i}) as a C51 distribution over [v_min, v_max].
+        The critic tokens are causally masked, so the last token has seen the whole
+        chunk; its C51 distribution over [v_min, v_max] is the chunk value.
 
-        Returns: [b, action_horizon, n_bins] logits (before softmax).
+        Returns: [b, n_bins] logits (before softmax).
         """
         kv_cache, prefix_mask = self._embed_prefix_kv(observation)
-        return self._critic_logits(kv_cache, prefix_mask, actions)   # [b, ah, n_bins]
+        return self._critic_logits(kv_cache, prefix_mask, actions)   # [b, n_bins]
 
     # ------------------------------------------------------------------
     # Critic loss (supervised by MC returns)
@@ -447,28 +453,22 @@ class Pi0WithCritic(Pi0AlphaFlow):
         mc_returns:  at.Float[at.Array, " b"],
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "b ah"]:
+    ) -> at.Float[at.Array, " b"]:
         """
-        HL-Gauss C51 cross-entropy loss, per action token.
+        HL-Gauss C51 cross-entropy loss for the single chunk-level value.
 
-        mc_returns: [b] scalar G_t for each sample — broadcast to all
-                    action_horizon tokens (same target for each prefix length).
-        Returns:    [b, ah] per-token CE loss.
+        mc_returns: [b] scalar G_t for each sample.
+        Returns:    [b] per-sample CE loss.
         """
         preprocess_rng, _ = jax.random.split(rng)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        logits = self.compute_critic_logits(observation, actions)  # [b, ah, n_bins]
-
-        # Broadcast scalar return to every token position
-        mc_returns_expanded = jnp.broadcast_to(
-            mc_returns[:, None], (mc_returns.shape[0], self.action_horizon)
-        )                                                           # [b, ah]
+        logits = self.compute_critic_logits(observation, actions)  # [b, n_bins]
 
         return critic_loss_hl_gauss(
-            logits, mc_returns_expanded,
+            logits, mc_returns,
             self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma,
-        )                                                           # [b, ah]
+        )                                                           # [b]
 
     # ------------------------------------------------------------------
     # Value inference
@@ -478,13 +478,12 @@ class Pi0WithCritic(Pi0AlphaFlow):
         self,
         observation: _model.Observation,
         actions:     _model.Actions,
-    ) -> at.Float[at.Array, "b ah"]:
+    ) -> at.Float[at.Array, " b"]:
         """
-        Return per-token E[V] from the C51 distribution.
+        Return the chunk-level E[V] = Q(s, a_{0:H}) from the C51 distribution.
 
-        Returns [b, ah] — one expected value per action-horizon step.
-        Use .mean(axis=-1) for a single scalar per sample.
+        Returns [b] — one expected value per sample (the whole action chunk).
         """
-        logits = self.compute_critic_logits(observation, actions)  # [b, ah, n_bins]
+        logits = self.compute_critic_logits(observation, actions)  # [b, n_bins]
         probs  = jax.nn.softmax(logits, axis=-1)
-        return expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b, ah]
+        return expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b]
