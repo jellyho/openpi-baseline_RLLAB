@@ -157,7 +157,13 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        # Normalize tasks to {task_index: task}. lerobot v2.1 already returns that
+        # dict; v3.0 returns a pandas DataFrame indexed by the task string with a
+        # `task_index` column, which PromptFromLeRobotTask can't index by int.
+        tasks_meta = dataset_meta.tasks
+        if hasattr(tasks_meta, "to_dict") and "task_index" in getattr(tasks_meta, "columns", []):
+            tasks_meta = {int(idx): task for task, idx in tasks_meta["task_index"].items()}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks_meta)])
 
     return dataset
 

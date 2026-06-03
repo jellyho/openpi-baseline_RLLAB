@@ -89,8 +89,8 @@ class Pi0LPSRFTConfig(Pi0WithCriticConfig):
     # ── RL ablation toggles (config-isolatable) ───────────────────────────────
     # CrossQ joint batch: process current s and next s' in ONE forward (concat →
     # split).  Mathematically identical to two separate forwards (no BatchNorm),
-    # but ~2x cheaper to compile/run.  False = separate forwards (baseline).
-    crossq_joint_batch:   bool = True
+    # but ~2x cheaper to compile/run.  Default False = separate forwards (baseline).
+    crossq_joint_batch:   bool = False
     # Normalize the DDPG actor loss by its own (detached) magnitude → scale ±1,
     # decoupling the actor step from the absolute Q-value scale.  False = raw -Q.
     normalize_actor_loss: bool = True

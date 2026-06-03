@@ -78,45 +78,28 @@ class YamInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     model_type: _model.ModelType = _model.ModelType.PI0
 
+    # LPS-RFT chunked TD: images/state come as [current, next] windows; split into
+    # the current obs + a model-ready next obs s_{t+H} (+ `done`).
+    load_next_obs: bool = False
+
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
 
-    def __call__(self, data: dict) -> dict:
-        data = _decode_yam(data, adapt_to_pi=self.adapt_to_pi)
-
-        # Get the state. We are padding from 14 to the model action dim.
-        state = transforms.pad_to_dim(data["state"], self.action_dim)
-
-        in_images = data["images"]
+    def _image_dict(self, in_images: dict) -> tuple[dict, dict]:
+        """Map decoded cameras (hwc uint8) to model image slots + masks."""
         if set(in_images) - set(self.EXPECTED_CAMERAS):
             raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
-
-        # Assume that base image always exists.
         base_image = in_images["cam_high"]
-
-        # Map images based on model type
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
-                images = {"base_0_rgb": base_image}
-                image_masks = {"base_0_rgb": np.True_}
-                # Add the extra images for PI0
-                extra_image_names = {
-                    "left_wrist_0_rgb": "cam_left_wrist",
-                    "right_wrist_0_rgb": "cam_right_wrist",
-                }
+                extra_image_names = {"left_wrist_0_rgb": "cam_left_wrist", "right_wrist_0_rgb": "cam_right_wrist"}
             case _model.ModelType.PI0_FAST:
-                images = {"base_0_rgb": base_image}
-                image_masks = {"base_0_rgb": np.True_}
-                # Add the extra images for PI0_FAST
-                extra_image_names = {
-                    "base_1_rgb": "cam_left_wrist",
-                    "wrist_0_rgb": "cam_right_wrist",
-                }
+                extra_image_names = {"base_1_rgb": "cam_left_wrist", "wrist_0_rgb": "cam_right_wrist"}
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")
-
-        # Add the extra images.
+        images = {"base_0_rgb": base_image}
+        image_masks = {"base_0_rgb": np.True_}
         for dest, source in extra_image_names.items():
             if source in in_images:
                 images[dest] = in_images[source]
@@ -124,21 +107,54 @@ class YamInputs(transforms.DataTransformFn):
             else:
                 images[dest] = np.zeros_like(base_image)
                 image_masks[dest] = np.False_
+        return images, image_masks
 
-        inputs = {
-            "image": images,
-            "image_mask": image_masks,
-            "state": state,
-        }
+    def _decode_obs(self, state: np.ndarray, images: dict) -> tuple[np.ndarray, dict]:
+        """Decode one observation: yam state (joint flips / gripper) + images (hwc uint8)."""
+        d = _decode_yam({"state": state, "images": images}, adapt_to_pi=self.adapt_to_pi)
+        return d["state"], d["images"]
+
+    def __call__(self, data: dict) -> dict:
+        if self.load_next_obs:
+            # state = [current, next] (2, 14); images[cam] = [current, next] (2, C, H, W).
+            state_win = np.asarray(data["state"])
+            imgs = {k: np.asarray(v) for k, v in data["images"].items()}
+            cur_state, cur_imgs = self._decode_obs(state_win[0], {k: v[0] for k, v in imgs.items()})
+            nxt_state, nxt_imgs = self._decode_obs(state_win[1], {k: v[1] for k, v in imgs.items()})
+            images, image_masks = self._image_dict(cur_imgs)
+            next_image, next_image_mask = self._image_dict(nxt_imgs)
+            inputs = {
+                "image": images,
+                "image_mask": image_masks,
+                "state": transforms.pad_to_dim(cur_state, self.action_dim),
+                "next_image": next_image,
+                "next_image_mask": next_image_mask,
+                "next_state": transforms.pad_to_dim(nxt_state, self.action_dim),
+                # done: next frame (offset H) is past the episode end → no bootstrap.
+                "done": np.asarray(data["next_is_pad"])[1],
+            }
+        else:
+            state, in_images = self._decode_obs(np.asarray(data["state"]), data["images"])
+            images, image_masks = self._image_dict(in_images)
+            inputs = {
+                "image": images,
+                "image_mask": image_masks,
+                "state": transforms.pad_to_dim(state, self.action_dim),
+            }
 
         # Actions are only available during training.
         if "actions" in data:
-            actions = np.asarray(data["actions"])
-            actions = _encode_yam_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
+            actions = _encode_yam_actions_inv(np.asarray(data["actions"]), adapt_to_pi=self.adapt_to_pi)
             inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # MC return (scalar, CalQL anchor) + reward window [H] (chunked-TD target).
+        if "mc_return" in data:
+            inputs["mc_return"] = np.asarray(data["mc_return"])
+        if "reward" in data:
+            inputs["reward"] = np.asarray(data["reward"])
 
         return inputs
 

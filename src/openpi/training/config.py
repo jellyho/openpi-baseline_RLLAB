@@ -306,35 +306,45 @@ class DualYamDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
-
-    # Repack transforms.
-    repack_transforms: _transforms.Group = dataclasses.field(
-        default=_transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "images": {
-                            "cam_high": "observation.images.cam_high",
-                            "cam_left_wrist": "observation.images.cam_left_wrist",
-                            "cam_right_wrist": "observation.images.cam_right_wrist",
-                        },
-                        "state": "observation.state",
-                        "actions": "action",
-                        "prompt": "task",
-                    }
-                )
-            ]
-        )
-    )
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
 
+    # RFT data: load mc_return (critic CalQL anchor); and the reward window + next
+    # observation s_{t+H} + done (LPS-RFT chunked-TD target).  Requires the dataset
+    # to have `mc_return` / `reward` columns (see scripts/compute_mc_returns.py).
+    include_mc_return: bool = False
+    include_next_obs: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # Prepare data for policy training
-        # Convert images to uint8 numpy arrays, add masks
+        # Repack raw LeRobot columns into the common format; add RFT columns on demand.
+        repack_map = {
+            "images": {
+                "cam_high": "observation.images.cam_high",
+                "cam_left_wrist": "observation.images.cam_left_wrist",
+                "cam_right_wrist": "observation.images.cam_right_wrist",
+            },
+            "state": "observation.state",
+            "actions": "action",
+            "prompt": "task",
+        }
+        if self.include_mc_return:
+            repack_map["mc_return"] = "mc_return"
+        if self.include_next_obs:
+            # reward[t:t+H] window; observation.state_is_pad marks whether the next
+            # frame (offset H) is past the episode end → `done`.
+            repack_map["reward"] = "reward"
+            repack_map["next_is_pad"] = "observation.state_is_pad"
+        repack_transforms = _transforms.Group(inputs=[_transforms.RepackTransform(repack_map)])
+
+        # Prepare data for policy training (uint8 images + masks; next-obs split for RFT).
         data_transforms = _transforms.Group(
-            inputs=[yam_policy.YamInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi, model_type=model_config.model_type)],
+            inputs=[yam_policy.YamInputs(
+                action_dim=model_config.action_dim,
+                adapt_to_pi=self.adapt_to_pi,
+                model_type=model_config.model_type,
+                load_next_obs=self.include_next_obs,
+            )],
             outputs=[yam_policy.YamOutputs(adapt_to_pi=self.adapt_to_pi)],
         )
         if self.use_delta_joint_actions:
@@ -349,10 +359,18 @@ class DualYamDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            load_rl_windows=self.include_next_obs,
+            rl_obs_keys=(
+                "observation.state",
+                "observation.images.cam_high",
+                "observation.images.cam_left_wrist",
+                "observation.images.cam_right_wrist",
+            ) if self.include_next_obs else (),
+            rl_obs_offsets=(0, model_config.action_horizon) if self.include_next_obs else (),
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -669,7 +687,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 32
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -756,8 +774,12 @@ def _critic_model(*, warmup_ratio, transition_ratio, **kw):
     )
 
 
-def _dualyam_data(task):
-    """DualYamDataConfig for a Challenge expert-data task (pi-adapted, delta actions)."""
+def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
+    """DualYamDataConfig for a Challenge expert-data task (pi-adapted, delta actions).
+
+    include_mc_return / include_next_obs add the RFT columns (critic CalQL anchor /
+    LPS-RFT chunked-TD windows); the dataset must then carry mc_return / reward.
+    """
     return DualYamDataConfig(
         repo_id=f"{task}/expert-data",
         base_config=DataConfig(
@@ -766,19 +788,71 @@ def _dualyam_data(task):
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
+        include_mc_return=include_mc_return,
+        include_next_obs=include_next_obs,
     )
+
+
+def _challenge_rft(task):
+    """RFT stage-1 (alphaflow+critic) and stage-2 (LPS-RFT) configs for a Challenge task.
+
+    Mirrors the tabletop phase-1/phase-2 pipeline on DualYam data.  Requires the
+    task's dataset to carry mc_return / reward columns (run scripts/compute_mc_returns.py).
+    Stage-2's weight_loader points at stage-1's output — update the step if needed.
+    """
+    return [
+        TrainConfig(
+            name=f"pi05_rft_phase1_{task}",
+            model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75),
+            data=_dualyam_data(task, include_mc_return=True),
+            weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+            lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+            num_train_steps=100_000,
+            batch_size=256,
+            num_workers=64,
+            save_interval=25_000,
+        ),
+        TrainConfig(
+            name=f"pi05_rft_phase2_{task}",
+            model=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True),   # crossq default False
+            data=_dualyam_data(task, include_mc_return=True, include_next_obs=True),
+            weight_loader=weight_loaders.AlphaFlowWeightLoader(
+                f"checkpoints/pi05_rft_phase1_{task}/pi05_rft_phase1_{task}/99999/params"
+            ),
+            freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+            lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+            num_train_steps=200_000,
+            batch_size=1024,
+            num_workers=64,
+            save_interval=25_000,
+        ),
+        TrainConfig(
+            name=f"pi05_rft_phase2_{task}_mh",
+            model=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True, td_horizons=(5, 10, 25, 50)),
+            data=_dualyam_data(task, include_mc_return=True, include_next_obs=True),
+            weight_loader=weight_loaders.AlphaFlowWeightLoader(
+                f"checkpoints/pi05_rft_phase1_{task}/pi05_rft_phase1_{task}/99999/params"
+            ),
+            freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+            lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+            num_train_steps=200_000,
+            batch_size=1024,
+            num_workers=64,
+            save_interval=25_000,
+        ),
+    ]
 
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     # ============================================================================
-    # Tabletop RFT pipeline (LPS-RFT) — four categories, all on scripts/train.py.
-    #   1. Flow-matching baseline    pi05_tabletop / pi05_tabletop_bc (Pi0Config, FM;
+    # Tabletop RFT pipeline (LPS-RFT) — two stages, all on scripts/train.py.
+    #   0. Flow-matching baseline    pi05_tabletop / pi05_tabletop_bc (Pi0Config, FM;
     #                                in the Tabletop-Sim section below)
-    #   2. AlphaFlow+critic baseline pi05_alphaflow_critic_{rl,bc}  (from pi05_base)
-    #   3. 2-stage RFT phase-1       pi05_rft_phase1_{rl,bc}        (FM ckpt -> rectify
-    #                                + critic warmup; VLM frozen, no FM warmup)
-    #   4. LPS-RFT phase-2           pi05_rft_phase2_rl             (from cat-2 OR cat-3)
+    #   1. Phase 1 (alphaflow+critic) pi05_rft_phase1_{rl,rl_mh,bc}  (from pi05_base:
+    #                                alpha-flow distillation + C51 critic)
+    #   2. Phase 2 (LPS-RFT)         pi05_rft_phase2_rl*             (from phase-1:
+    #                                freeze VLM+action, train critic + latent actor)
     #
     # AlphaFlowWeightLoader loads a base/parent checkpoint and keeps new params
     # (r_mlp, critic/latent experts) at init.  AlphaFlow recipe = tuned
@@ -791,116 +865,62 @@ _CONFIGS = [
     #   pi05_tabletop      (rl_orig)  <- cat-1 rl: the task-adapted FM policy that
     #   pi05_tabletop_bc   (bc_orig)     cat-3 phase-1 rectifies.
     #
-    # --- 2. AlphaFlow + critic baseline (joint, from pi05_base) ------------------
-    # Single-stage: alpha-flow action distillation + C51 critic together.  Starts
-    # from pi05_base (NOT task-adapted), so it KEEPS the 25/50/25 FM warmup.
-    # AlphaFlow + critic baseline (from pi05_base): single-stage alpha-flow
-    # distillation + C51 critic.  critic_rl = single full-chunk head (50);
-    # critic_rl_mh = multi-horizon {5,10,25,50}.  Per-horizon Q is logged as
-    # critic/q_h{k}_mean (+ value_mae_h{k}).  critic_bc keeps the default horizons.
-    TrainConfig(
-        name="pi05_alphaflow_critic_rl",
-        model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75, critic_horizons=(50,)),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_orig", include_mc_return=True),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
-    ),
-    TrainConfig(
-        name="pi05_alphaflow_critic_rl_mh",
-        model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75, critic_horizons=(5, 10, 25, 50)),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_orig", include_mc_return=True),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
-    ),
-    TrainConfig(
-        name="pi05_alphaflow_critic_bc",
-        model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc_orig", include_mc_return=True),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
-    ),
-    # --- 3. 2-stage RFT phase-1: rectify FM baseline + warm up critic -----------
-    # Init from a TASK-ADAPTED flow-matching checkpoint (cat 1).  This is exactly
-    # the AlphaFlowTSE scenario (the paper also rectifies an FM checkpoint), so we
-    # use the **TSE alpha schedule** (warmup 0.05 / transition 0.667 / floor 0.333,
-    # alpha_gamma=15, alpha_min=0.1 = Pi0AlphaFlowConfig defaults): a short FM warmup
-    # re-grounds the field in our data before annealing, then transition + floor.
-    # VLM is frozen (rectify only touches the action expert + r-conditioning; the
-    # critic warms up alongside).  Update the weight_loader path to your cat-1 run/step.
+    # --- Phase 1: AlphaFlow distillation + C51 critic (joint, from pi05_base) ----
+    # Single-stage: alpha-flow action distillation + critic together, from pi05_base
+    # (NOT task-adapted → keeps the 25/50/25 FM warmup).  This is the phase-1
+    # checkpoint that LPS-RFT phase-2 loads.  rl = single full-chunk head (50);
+    # rl_mh = multi-horizon {5,10,25,50} (per-horizon Q logged as critic/q_h{k}_mean
+    # + value_mae_h{k}); bc keeps the default horizons.
     TrainConfig(
         name="pi05_rft_phase1_rl",
-        # TSE alpha schedule: short FM warmup re-grounds, then anneal (5%->66.7%, floor 33.3%).
-        model=_critic_model(warmup_ratio=0.05, transition_ratio=0.667),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_orig", include_mc_return=True),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "checkpoints/pi05_tabletop/pi05_tabletop/29999/params"   # cat-1 FM ckpt (rl)
-        ),
-        freeze_filter=pi0_alphaflow_critic.Pi0WithCriticConfig(pi05=True).get_rectify_freeze_filter(),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
+        model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75, critic_horizons=(50,)),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=7500,
+        batch_size=128,
+        num_workers=64,
+        save_interval=10000,
+    ),
+    TrainConfig(
+        name="pi05_rft_phase1_rl_mh",
+        model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75, critic_horizons=(5, 10, 25, 50)),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=7500,
+        batch_size=128,
+        num_workers=64,
+        save_interval=10000,
     ),
     TrainConfig(
         name="pi05_rft_phase1_bc",
-        model=_critic_model(warmup_ratio=0.05, transition_ratio=0.667),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc_orig", include_mc_return=True),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "checkpoints/pi05_tabletop_bc/pi05_tabletop_bc/29999/params"   # cat-1 FM ckpt
-        ),
-        freeze_filter=pi0_alphaflow_critic.Pi0WithCriticConfig(pi05=True).get_rectify_freeze_filter(),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
+        model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc_224", include_mc_return=True),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=7500,
+        batch_size=128,
+        num_workers=64,
+        save_interval=10000,
     ),
-    # --- 4. LPS-RFT phase-2: offline RL via Latent Policy Steering --------------
-    # Loads a cat-2 (alphaflow_critic) OR cat-3 (phase-1) checkpoint — VLM + action
-    # + critic — adds a latent actor, freezes VLM + action expert, trains critic +
-    # latent actor.  Update the weight_loader path to your cat-2/cat-3 run/step.
-    # CrossQ ON: current s and next s' processed in ONE joint forward (~2x faster).
+    # --- Phase 2: LPS-RFT — offline RL via Latent Policy Steering ---------------
+    # Loads a phase-1 (alphaflow+critic) checkpoint — VLM + action + critic — adds a
+    # latent actor, freezes VLM + action expert, trains critic + latent actor.
+    # Update the weight_loader path to your phase-1 run/step.
     TrainConfig(
         name="pi05_rft_phase2_rl",
-        model=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True, crossq_joint_batch=True, num_train_steps=30_000),
+        model=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True),
         data=_tabletop_data(
-            "jellyho/aloha_handover_box_joint_pos_rl_orig", include_mc_return=True, include_next_obs=True
-        ),
-        # TEST: base pi05 (critic+latent fresh-init); for REAL LPS point weight_loader
-        # at a trained phase1/critic checkpoint.
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
-        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
-        # RL: constant LR (value scale shifts during training → no decay).
-        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
-    ),
-    # CrossQ OFF (baseline): separate forwards for s and s'.  Identical results to
-    # the ON config (no BatchNorm) — use this to A/B the joint-batch speedup and
-    # to verify bit-for-bit equivalence.
-    TrainConfig(
-        name="pi05_rft_phase2_rl_sep",
-        model=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True, crossq_joint_batch=False, num_train_steps=30_000),
-        data=_tabletop_data(
-            "jellyho/aloha_handover_box_joint_pos_rl_orig", include_mc_return=True, include_next_obs=True
+            "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
         freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
-        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=100_000,
+        batch_size=1024,
+        num_workers=64,
+        save_interval=25_000,
     ),
     # Multi-horizon Q-chunking: PREDICTION at chunk lengths {5,10,25,50} (per-horizon
     # head), single-state BACKUP from s_{t+H} broadcast to all heads.  Same data as
@@ -908,124 +928,62 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_rft_phase2_rl_mh",
         model=pi0_lps_rft.Pi0LPSRFTConfig(
-            pi05=True, crossq_joint_batch=True, td_horizons=(5, 10, 25, 50), num_train_steps=30_000
-        ),
-        data=_tabletop_data(
-            "jellyho/aloha_handover_box_joint_pos_rl_orig", include_mc_return=True, include_next_obs=True
-        ),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
-        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(
             pi05=True, td_horizons=(5, 10, 25, 50)
-        ).get_freeze_filter(),
-        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
-    ),
-    # LPS-RFT phase-2 (non-mh, single chunk-Q) CONTINUED from a trained
-    # alpha-flow+critic checkpoint (pi05_alphaflow_critic_rl).  The loader pulls
-    # paligemma / action expert / critic (+critic_in/out_proj) from that
-    # checkpoint and fresh-inits ONLY the latent expert (4th).  The critic — which
-    # was trained on the MC return G_t at heads {5,10,25,50}, incl. the full-chunk
-    # head used here — is now refined with the chunked-TD target.
-    TrainConfig(
-        name="pi05_rft_phase2_rl_from_critic",
-        model=pi0_lps_rft.Pi0LPSRFTConfig(
-            pi05=True,
-            crossq_joint_batch=False,   # separate current/next prefix forwards
-            # td_horizons=() → single chunk-level Q (non-mh); reads the full-chunk
-            # critic head (token H-1), which the loaded critic already trained.
-            num_train_steps=30_000,
         ),
         data=_tabletop_data(
             "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
         ),
-        # Trained alpha-flow+critic checkpoint (params/ holds paligemma+action+critic).
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/data5/jellyho/PFR_RSS/checkpoints/lps-rft/pi05_alphaflow_critic_rl/params"
+            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_alphaflow_critic_rl_mh/pi05_alphaflow_critic_rl_mh/7499/params"
         ),
         freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
-        # RL: constant LR (value scale shifts during training → no decay).
-        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=32,
-        save_interval=10_000,
-    ),
-    TrainConfig(
-        name="pi05_alphaflow_insert-mouse-battery",
-        model=pi0_alphaflow.Pi0AlphaFlowConfig(
-            pi05=True,   # AlphaFlowTSE recipe = the Pi0AlphaFlowConfig defaults
-        ),
-        data=_dualyam_data("insert-mouse-battery"),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=100_000,
+        batch_size=1024,
         num_workers=64,
-        save_interval=10_000,
+        save_interval=25_000,
     ),
-    TrainConfig(
-        name="pi05_alphaflow_seal-water-bottle-cap",
-        model=pi0_alphaflow.Pi0AlphaFlowConfig(
-            pi05=True,   # AlphaFlowTSE recipe = the Pi0AlphaFlowConfig defaults
-        ),
-        data=_dualyam_data("seal-water-bottle-cap"),
-        weight_loader=weight_loaders.AlphaFlowWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=64,
-        save_interval=10_000,
-    ),
+    # --- Challenge RFT: phase-1 (alphaflow+critic) + phase-2 (LPS) per task ------
+    # Same 2-stage pipeline as tabletop, on DualYam data.  Each task's dataset must
+    # carry mc_return / reward columns (run scripts/compute_mc_returns.py).
+    *_challenge_rft("insert-mouse-battery"),
+    *_challenge_rft("seal-water-bottle-cap"),
+    *_challenge_rft("tower-of-hanoi-game"),
     # Challenge Baseline Examples
     TrainConfig(
-        name="pi05_insert-mouse-battery",
+        name="pi05_insert-mouse-battery_bc",
         model=pi0_config.Pi0Config(pi05=True),
         data=_dualyam_data("insert-mouse-battery"),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=200_000, # 200k is about 3 epochs.
-        batch_size=32,
-        num_workers=64,
+        batch_size=64,
+        num_workers=32,
         save_interval=40_000
     ),
     TrainConfig(
-        name="pi05_seal-water-bottle-cap",
+        name="pi05_seal-water-bottle-cap_bc",
         model=pi0_config.Pi0Config(pi05=True),
         data=_dualyam_data("seal-water-bottle-cap"),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=200_000,
-        batch_size=32,
-        num_workers=64,
+        batch_size=64,
+        num_workers=32,
         save_interval=40_000
     ),
     TrainConfig(
-        name="pi05_tower-of-hanoi-game",
+        name="pi05_tower-of-hanoi-game_bc",
         model=pi0_config.Pi0Config(pi05=True),
         data=_dualyam_data("tower-of-hanoi-game"),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=200_000,
-        batch_size=32,
-        num_workers=64,
+        batch_size=64,
+        num_workers=32,
         save_interval=40_000
-    ),
-    #
-    # Fine-tuning Tabletop-Sim configs.
-    #
-    # Replace `repo_id` with your own LeRobot dataset and set `local_files_path` if needed.
-    TrainConfig(
-        name="pi05_tabletop",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_orig"),
-        weight_loader=weight_loaders.CheckpointWeightLoader(_PI05_BASE_PARAMS),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=16,
-        save_interval=10_000,
     ),
     TrainConfig(
         name="pi05_tabletop_bc",
         model=pi0_config.Pi0Config(pi05=True),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc_orig"),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc"),
         weight_loader=weight_loaders.CheckpointWeightLoader(_PI05_BASE_PARAMS),
         num_train_steps=30_000,
         batch_size=32,

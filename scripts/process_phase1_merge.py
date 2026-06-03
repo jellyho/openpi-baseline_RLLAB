@@ -170,10 +170,11 @@ def build_plan(args) -> tuple[list[EpPlan], dict]:
             for ep in eps:
                 p = sdir / info["data_path"].format(episode_chunk=ep // chunks, episode_index=ep)
                 L = _filtered_length(pq, p)
-                if L <= 0:
-                    # Degenerate episode (entirely restore/drop-state) → no task
-                    # data; skip so episode_index stays contiguous.
-                    print(f"[plan] SKIP {task}/{subset} ep{ep}: empty after restore-trim")
+                if L < args.min_frames:
+                    # Degenerate episode (entirely/almost-entirely restore) → no
+                    # usable task data.  Skip so episode_index stays contiguous AND
+                    # so v3.0 video concatenation doesn't choke on a 1-frame clip.
+                    print(f"[plan] SKIP {task}/{subset} ep{ep}: only {L} frames after restore-trim (< {args.min_frames})")
                     continue
                 lengths[ep] = L
                 kept.append(ep)
@@ -441,6 +442,8 @@ def main():
     ap.add_argument("--subsets", nargs="+", default=SUBSETS_DEFAULT)
     ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--cfail-frac", type=float, default=0.5)
+    ap.add_argument("--min-frames", type=int, default=2,
+                    help="drop episodes shorter than this after restore-trim (degenerate)")
     ap.add_argument("--size", type=int, default=224)
     ap.add_argument("--vcodec", default="libsvtav1",
                     choices=["libsvtav1", "libx264", "h264", "hevc"])
