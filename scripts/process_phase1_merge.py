@@ -166,10 +166,18 @@ def build_plan(args) -> tuple[list[EpPlan], dict]:
                 eps = eps[: args.limit]
             lengths = {}
             chunks = info["chunks_size"]
+            kept = []
             for ep in eps:
                 p = sdir / info["data_path"].format(episode_chunk=ep // chunks, episode_index=ep)
-                lengths[ep] = _filtered_length(pq, p)
-            per_subset[subset] = (eps, lengths)
+                L = _filtered_length(pq, p)
+                if L <= 0:
+                    # Degenerate episode (entirely restore/drop-state) → no task
+                    # data; skip so episode_index stays contiguous.
+                    print(f"[plan] SKIP {task}/{subset} ep{ep}: empty after restore-trim")
+                    continue
+                lengths[ep] = L
+                kept.append(ep)
+            per_subset[subset] = (kept, lengths)
             all_lengths.extend(lengths.values())
 
         if not all_lengths:
