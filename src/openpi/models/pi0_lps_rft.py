@@ -235,16 +235,17 @@ class Pi0LPSRFT(Pi0WithCritic):
                 f"last td_horizon must equal action_horizon ({config.action_horizon}), "
                 f"got {self.td_horizons}"
             )
-            self._horizon_idx = jnp.array([k - 1 for k in self.td_horizons], dtype=jnp.int32)
+            # Stored as plain int tuples (NOT jnp/np arrays): nnx rejects raw array
+            # leaves on a Module ("Arrays leaves are not supported"); wrap with
+            # jnp.asarray(...) at the use sites instead.
+            self._horizon_idx = tuple(k - 1 for k in self.td_horizons)
             # Heads the actor maximizes.  Default = full chunk (last horizon).
             self.actor_horizons = tuple(config.actor_horizons) or (config.action_horizon,)
             assert all(h in self.td_horizons for h in self.actor_horizons), (
                 f"actor_horizons {self.actor_horizons} must all be in td_horizons {self.td_horizons}"
             )
-            self._actor_horizon_idx = jnp.array(   # critic token index (k-1)
-                [h - 1 for h in self.actor_horizons], dtype=jnp.int32)
-            self._actor_td_pos = jnp.array(        # position within td_horizons (for q_data [b, n_h])
-                [self.td_horizons.index(h) for h in self.actor_horizons], dtype=jnp.int32)
+            self._actor_horizon_idx = tuple(h - 1 for h in self.actor_horizons)   # critic token index (k-1)
+            self._actor_td_pos = tuple(self.td_horizons.index(h) for h in self.actor_horizons)  # pos within td_horizons
 
         # alpha schedule + step counter (unused for LPS loss but kept for parity).
         self._warmup_end     = int(config.warmup_ratio     * config.num_train_steps)
@@ -471,7 +472,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         y       = jax.lax.stop_gradient(jnp.clip(y, self.v_min, self.v_max))  # [b]  single target
 
         # Prediction: per-horizon data Q  Q_k(s, a_data_{0:k}).
-        logits_data = self._critic_logits(kv, pm, actions, self._horizon_idx)        # [b, n_h, n_bins]
+        logits_data = self._critic_logits(kv, pm, actions, jnp.asarray(self._horizon_idx))        # [b, n_h, n_bins]
         # Broadcast the SAME target y to every horizon head.
         critic_loss = critic_loss_hl_gauss(
             logits_data.reshape(b * n_h, self.n_bins), jnp.repeat(y, n_h),
@@ -481,7 +482,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         # ── Actor (DDPG): maximize the mean Q over the configured actor_horizons ──
         z_cur   = self._latent_action(kv, pm, b)
         a_actor = self._decode(kv, pm, observation, z_cur)
-        q_actor = self._critic_value_detached(kv, pm, a_actor, self._actor_horizon_idx)  # [b, n_a]
+        q_actor = self._critic_value_detached(kv, pm, a_actor, jnp.asarray(self._actor_horizon_idx))  # [b, n_a]
         value_actor = jnp.mean(q_actor, axis=-1)                   # [b]  mean over actor heads
         actor_loss  = -value_actor
         if self.normalize_actor_loss:
@@ -496,7 +497,7 @@ class Pi0LPSRFT(Pi0WithCritic):
             self.v_min, self.v_max, self.n_bins,
         )                                                          # [b, n_h]  Q_k(s, a_data)
         # advantage vs the dataset Q at the SAME head(s) the actor optimizes.
-        q_data_actor = jnp.mean(q_data[:, self._actor_td_pos], axis=-1)   # [b]
+        q_data_actor = jnp.mean(q_data[:, jnp.asarray(self._actor_td_pos)], axis=-1)   # [b]
         advantage = value_actor - q_data_actor                     # steered − data (actor heads)
         z_flat = z_cur.reshape(b, -1)
 
