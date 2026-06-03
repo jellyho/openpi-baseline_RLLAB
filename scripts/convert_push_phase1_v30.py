@@ -27,8 +27,34 @@ from huggingface_hub import HfApi
 import lerobot.datasets.video_utils as video_utils
 import lerobot.datasets.v30.convert_dataset_v21_to_v30 as conv
 
-STAGE = "/data5/jellyho/PFR_RSS/dataset/v30_stage"
+# The dataset must live at HF_LEROBOT_HOME/<repo_id> because convert_dataset's
+# final push step does LeRobotDataset(repo_id).push_to_hub() which loads from
+# HF_LEROBOT_HOME (it ignores the conversion `root`).  We symlink the merged v2.1
+# datasets there; conversion replaces the symlink with the real v3.0 dir.
+HF_HOME = Path("/data5/jellyho/.cache/huggingface/lerobot/jellyho")
+MERGED = Path("/data5/jellyho/PFR_RSS/dataset/phase1_merged")
 TASKS = ["insert-mouse-battery", "tower-of-hanoi-game", "seal-water-bottle-cap"]
+
+
+def _rm(p: Path):
+    if p.is_symlink():
+        p.unlink()
+        return
+    if p.is_dir():
+        # NFS-robust: `rm -rf` (not shutil.rmtree) + retry, because NFS leaves
+        # `.nfsXXXX` silly-rename files for any still-open handle, which makes
+        # shutil.rmtree raise "Directory not empty". Retrying clears them once
+        # the holding process releases the handle.
+        import subprocess
+        import time as _t
+        for _ in range(8):
+            subprocess.run(["rm", "-rf", str(p)], check=False)
+            if not p.exists():
+                return
+            _t.sleep(2)
+        return
+    if p.exists():
+        p.unlink()
 
 
 def concatenate_video_files_dts_safe(input_video_paths, output_video_path, overwrite: bool = True):
@@ -88,13 +114,37 @@ conv.concatenate_video_files = concatenate_video_files_dts_safe
 
 def main():
     api = HfApi()
+    HF_HOME.mkdir(parents=True, exist_ok=True)
     for task in TASKS:
-        repo = f"jellyho/{task}_rl_224"
+        name = f"{task}_rl_224"
+        repo = f"jellyho/{name}"
         print(f"\n==================== convert+push {repo} ====================", flush=True)
-        conv.convert_dataset(repo_id=repo, root=STAGE, push_to_hub=True, force_conversion=True)
+        # Idempotent: skip if already fully uploaded as v3.0 (tag + real data).
+        try:
+            fs = api.list_repo_files(repo, repo_type="dataset")
+            tags = [t.name for t in api.list_repo_refs(repo, repo_type="dataset").tags]
+            if "v3.0" in tags and "meta/info.json" in fs and any("file-" in f for f in fs):
+                print(f"SKIP {repo}: already v3.0 on hub", flush=True)
+                continue
+        except Exception:
+            pass
+        # The converter's push does delete_files(...) which 404s if the repo
+        # doesn't exist yet — create it first.
+        api.create_repo(repo, repo_type="dataset", private=False, exist_ok=True)
+        # Fresh symlink of the merged v2.1 dataset at HF_LEROBOT_HOME/<repo_id>;
+        # clear any leftovers from a previous (failed) run.
+        for suffix in ("", "_old", "_v30"):
+            _rm(HF_HOME / f"{name}{suffix}")
+        (HF_HOME / name).symlink_to(MERGED / task)
+
+        # root=None → converter uses HF_LEROBOT_HOME/<repo_id>; force skips the
+        # "download existing v3.0" shortcut.  Self-heals a half-pushed repo
+        # (delete_tag → delete_files → create_tag → push).
+        conv.convert_dataset(repo_id=repo, root=None, push_to_hub=True, force_conversion=True)
+
         api.update_repo_settings(repo_id=repo, repo_type="dataset", private=False)
         print(f"PUBLIC {repo}", flush=True)
-        shutil.rmtree(Path(STAGE) / "jellyho" / f"{task}_rl_224_v30", ignore_errors=True)
+        _rm(HF_HOME / f"{name}_old")   # dangling symlink left by the converter
         print(f"DONE {repo} -> https://huggingface.co/datasets/{repo}", flush=True)
     print("\nALL PHASE1 V30 CONVERT+PUSH DONE", flush=True)
 

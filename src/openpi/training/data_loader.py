@@ -150,11 +150,22 @@ def create_torch_dataset(
         delta_timestamps["reward"] = [t / fps for t in range(action_horizon)]
         for key in data_config.rl_obs_keys:
             delta_timestamps[key] = [o / fps for o in offsets]
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps=delta_timestamps,
-        root=data_config.local_files_path,
-    )
+    # OPENPI_PRELOAD_FRAMES=1: decode all frames once into a /dev/shm memmap and
+    # serve them from RAM (no per-step video decode / NFS).  Built once in the main
+    # process; workers mmap it.  No-op otherwise.
+    import openpi.training.preload_dataset as _preload
+    if _preload.maybe_build_cache(data_config.repo_id, data_config.local_files_path):
+        dataset = _preload.PreloadedLeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps=delta_timestamps,
+            root=data_config.local_files_path,
+        )
+    else:
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps=delta_timestamps,
+            root=data_config.local_files_path,
+        )
 
     if data_config.prompt_from_task:
         # Normalize tasks to {task_index: task}. lerobot v2.1 already returns that

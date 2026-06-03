@@ -939,7 +939,7 @@ _CONFIGS = [
         freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
         lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
         num_train_steps=100_000,
-        batch_size=1024,
+        batch_size=128,
         num_workers=64,
         save_interval=25_000,
     ),

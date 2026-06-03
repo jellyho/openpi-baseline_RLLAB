@@ -1,7 +1,9 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -309,9 +311,14 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    _prof = os.environ.get("OPENPI_PROFILE_STEPS", "0") == "1"
     for step in pbar:
+        _t0 = time.time()
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        if _prof:
+            jax.block_until_ready((train_state.params, info))  # force compute to finish
+            _t_compute = time.time() - _t0
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
@@ -321,7 +328,11 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+        _td0 = time.time()
         batch = next(data_iter)
+        if _prof:
+            logging.info("[profile] step %d compute=%.3fs data_fetch=%.3fs"
+                         % (step, _t_compute, time.time() - _td0))
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
