@@ -397,10 +397,17 @@ class Pi0WithCritic(Pi0AlphaFlow):
             "loss/alphaflow":     jnp.mean(af_loss),
             "loss/l2_raw":        jnp.mean(af_raw_l2),   # plain MSE — same scale as pi05 FM
             "loss/critic":        jnp.mean(critic_loss),
-            "critic/value_mean":  jnp.mean(pred_value),
+            "critic/value_mean":  jnp.mean(pred_value),       # averaged over horizons
             "critic/value_mae":   value_mae,
             "critic/mc_return_mean": jnp.mean(mc_returns),
         }
+        # Per-horizon Q diagnostics: E[V](s, a_{0:k}) and its MAE vs G_t for each
+        # critic_horizon k (token index k-1; pred_value column order matches
+        # self._critic_token_idx).
+        for i, tok in enumerate(self._critic_token_idx):
+            k = int(tok) + 1
+            aux[f"critic/q_h{k}_mean"]   = jnp.mean(pred_value[:, i])
+            aux[f"critic/value_mae_h{k}"] = jnp.mean(jnp.abs(pred_value[:, i] - mc_returns))
         # af_loss is per action token [b, ah]; broadcast the scalar chunk critic
         # loss [b] across tokens so jnp.mean weights it as one term per sample.
         return af_loss + self.critic_loss_weight * critic_loss[:, None], aux

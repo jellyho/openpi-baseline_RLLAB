@@ -381,12 +381,13 @@ def write_meta(task: str, args, tmeta: dict, results: list[dict]):
         feats.pop(c, None)
     feats["reward"] = {"dtype": "float32", "shape": [1], "names": None}
     feats["mc_return"] = {"dtype": "float32", "shape": [1], "names": None}
+    codec_name = {"libsvtav1": "av1", "libx264": "h264", "h264": "h264", "hevc": "hevc"}[args.vcodec]
     for c in cams:
         feats[c]["shape"] = [args.size, args.size, 3]
         vinfo = feats[c].setdefault("info", {})
         vinfo["video.height"] = args.size
         vinfo["video.width"] = args.size
-        vinfo["video.codec"] = "av1" if args.vcodec == "libsvtav1" else args.vcodec
+        vinfo["video.codec"] = codec_name
         vinfo["video.pix_fmt"] = args.pix_fmt
     info.update({
         "total_episodes": n_eps, "total_frames": total_frames,
@@ -433,7 +434,8 @@ def main():
     ap.add_argument("--gamma", type=float, default=0.995)
     ap.add_argument("--cfail-frac", type=float, default=0.5)
     ap.add_argument("--size", type=int, default=224)
-    ap.add_argument("--vcodec", default="libsvtav1", choices=["libsvtav1", "h264", "hevc"])
+    ap.add_argument("--vcodec", default="libsvtav1",
+                    choices=["libsvtav1", "libx264", "h264", "hevc"])
     ap.add_argument("--pix-fmt", default="yuv420p")
     ap.add_argument("--crf", type=int, default=30)
     ap.add_argument("--gop", type=int, default=2)
