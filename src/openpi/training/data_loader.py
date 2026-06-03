@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import openpi.shared.lerobot_compat as lerobot_dataset  # v2.1/v3.0-tolerant import
 import numpy as np
 import torch
 

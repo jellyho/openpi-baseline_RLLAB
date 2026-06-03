@@ -22,14 +22,26 @@ import pandas as pd
 import numpy as np
 
 # --- lerobot imports (must be available in env) ---
+# v3.0 moved lerobot.common.datasets.* -> lerobot.datasets.*; try both layouts.
+# NOTE: this script WRITES v2.1-format datasets — under a v3.0 lerobot the
+# create/save paths may need rework; the import is just kept version-tolerant.
 try:
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.common.datasets.utils import (
-        load_info,
-        load_episodes,
-        load_episodes_stats,
-        load_tasks,
-    )
+    try:  # lerobot >= ~0.2 (dataset format v3.0)
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.datasets.utils import (
+            load_info,
+            load_episodes,
+            load_episodes_stats,
+            load_tasks,
+        )
+    except ImportError:  # lerobot v2.1 (legacy lerobot.common.datasets.* layout)
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+        from lerobot.common.datasets.utils import (
+            load_info,
+            load_episodes,
+            load_episodes_stats,
+            load_tasks,
+        )
 except Exception as e:
     raise RuntimeError("lerobot package import failed. Activate environment where lerobot is installed.") from e
 

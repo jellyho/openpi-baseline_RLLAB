@@ -29,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import imageio
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from openpi.shared.lerobot_compat import LeRobotDataset  # v2.1/v3.0-tolerant import
 
 import openpi.models.model as _model
 import openpi.shared.nnx_utils as nnx_utils
