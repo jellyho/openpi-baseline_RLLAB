@@ -458,6 +458,9 @@ class TorchDataLoader:
             worker_init_fn=_worker_init_fn,
             drop_last=True,
             generator=generator,
+            # Prefetch several batches per worker so video decoding overlaps the
+            # GPU step instead of stalling it (only valid when num_workers > 0).
+            prefetch_factor=4 if num_workers > 0 else None,
         )
 
     @property

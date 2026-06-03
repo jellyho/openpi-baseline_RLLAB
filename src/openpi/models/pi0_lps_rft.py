@@ -447,8 +447,9 @@ class Pi0LPSRFT(Pi0WithCritic):
             # uses the single full-chunk token.
             joint_obs = self._cat_obs(observation, next_observation)
             kvj, pmj  = self._embed_prefix_kv(joint_obs)
-            kv  = jax.tree.map(lambda x: x[:b], kvj)
-            kvn = jax.tree.map(lambda x: x[b:], kvj)
+            # kv_cache layout is [l, b, t, k, h] → the batch axis is 1, NOT 0.
+            kv  = jax.tree.map(lambda x: x[:, :b], kvj)
+            kvn = jax.tree.map(lambda x: x[:, b:], kvj)
             pm, pmn = pmj[:b], pmj[b:]
         else:
             kv,  pm  = self._embed_prefix_kv(observation)
@@ -570,8 +571,9 @@ class Pi0LPSRFT(Pi0WithCritic):
             # identical to the separate-forward path, just ~2x cheaper.
             joint_obs = self._cat_obs(observation, next_observation)
             kvj, pmj  = self._embed_prefix_kv(joint_obs)                 # prefix forward ×1 (2b)
-            kv  = jax.tree.map(lambda x: x[:b], kvj)
-            kvn = jax.tree.map(lambda x: x[b:], kvj)
+            # kv_cache layout is [l, b, t, k, h] → the batch axis is 1, NOT 0.
+            kv  = jax.tree.map(lambda x: x[:, :b], kvj)
+            kvn = jax.tree.map(lambda x: x[:, b:], kvj)
             pm, pmn = pmj[:b], pmj[b:]
 
             z_next = self._latent_action(kvn, pmn, b)

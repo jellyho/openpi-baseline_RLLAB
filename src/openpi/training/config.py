@@ -979,7 +979,7 @@ _CONFIGS = [
         name="pi05_rft_phase2_rl_from_critic",
         model=pi0_lps_rft.Pi0LPSRFTConfig(
             pi05=True,
-            crossq_joint_batch=True,
+            crossq_joint_batch=False,   # separate current/next prefix forwards
             # td_horizons=() → single chunk-level Q (non-mh); reads the full-chunk
             # critic head (token H-1), which the loaded critic already trained.
             num_train_steps=30_000,
