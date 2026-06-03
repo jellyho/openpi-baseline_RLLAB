@@ -143,10 +143,13 @@ def create_torch_dataset(
         key: [t / fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
     }
     if data_config.load_rl_windows:
-        # reward window r[t:t+H]  +  next observation s_{t+H} (current 0 and next H).
+        # reward window r[t:t+H]  +  obs at the bootstrap offsets (index 0 = current
+        # state, the rest = next states).  Single chunk-TD: (0, H).  Multi-horizon
+        # Q-chunking: (0,)+td_horizons → one next state per designated horizon k.
+        offsets = data_config.rl_obs_offsets or (0, action_horizon)
         delta_timestamps["reward"] = [t / fps for t in range(action_horizon)]
         for key in data_config.rl_obs_keys:
-            delta_timestamps[key] = [0.0, action_horizon / fps]
+            delta_timestamps[key] = [o / fps for o in offsets]
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,

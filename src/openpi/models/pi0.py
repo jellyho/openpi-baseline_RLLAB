@@ -38,7 +38,14 @@ def make_attn_mask(input_mask, mask_ar):
         it and false where it shares the same attention mask as the previous token.
     """
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
-    cumsum = jnp.cumsum(mask_ar, axis=1)
+    # Block ids per token.  Equivalent to jnp.cumsum(mask_ar, axis=1) but via a
+    # lower-triangular matmul: jnp.cumsum lowers to an O(N^2) reduce_window that
+    # XLA constant-folds extremely slowly (mask_ar is a compile-time constant),
+    # which dominated LPS-RFT compile time.  A matmul folds/runs efficiently and
+    # makes compile time essentially batch-independent.  (Verified bit-identical.)
+    n = input_mask.shape[-1]
+    tri = jnp.tril(jnp.ones((n, n), dtype=jnp.int32))                  # tri[i,j]=1 iff j<=i
+    cumsum = jnp.einsum("bj,ij->bi", mask_ar.astype(jnp.int32), tri)   # block id per token
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
     return jnp.logical_and(attn_mask, valid_mask)

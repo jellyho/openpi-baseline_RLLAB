@@ -52,7 +52,7 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_100m", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_30m", "gemma_50m", "gemma_100m", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -65,6 +65,27 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=16,
+        )
+    if variant == "gemma_30m":
+        # ~28M params.  Smaller expert (e.g. LPS latent actor).  depth / num_heads
+        # / num_kv_heads / head_dim must match the other experts (shared attention).
+        return Config(
+            width=256,
+            depth=18,
+            mlp_dim=512,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+        )
+    if variant == "gemma_50m":
+        # ~48M params (a bit smaller than gemma_100m) for lightweight experts.
+        return Config(
+            width=384,
+            depth=18,
+            mlp_dim=768,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
         )
     if variant == "gemma_100m":
         # ~100M params: same depth as gemma_300m (required by the Gemma Module),

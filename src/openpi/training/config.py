@@ -100,6 +100,11 @@ class DataConfig:
     # `rl_obs_keys` are the RAW LeRobot column names loaded at offsets [0, H].
     load_rl_windows: bool = False
     rl_obs_keys: Sequence[str] = ()
+    # Step offsets (in env steps) at which to load the obs window for the TD
+    # bootstrap.  Index 0 is the current state; the rest are next states.  Single
+    # chunk-TD uses (0, H); multi-horizon Q-chunking uses (0,)+td_horizons so the
+    # critic can bootstrap V(s_{t+k}) at each designated horizon k.  Empty → (0, H).
+    rl_obs_offsets: Sequence[int] = ()
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -559,6 +564,10 @@ class LeRobotTabletopDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Bootstrap obs offsets: a single next state at the full-chunk end (0, H).
+        # Multi-horizon Q-chunking does multi-horizon PREDICTION but a single-state
+        # BACKUP (same target broadcast to all heads), so it needs only s_{t+H}.
+        rl_obs_offsets = (0, model_config.action_horizon) if self.include_next_obs else ()
         # Build repack mapping; optionally include mc_return for critic training.
         repack_map = {
             "images": {
@@ -611,6 +620,7 @@ class LeRobotTabletopDataConfig(DataConfigFactory):
                 "observation.images.wrist_left",
                 "observation.images.wrist_right",
             ) if self.include_next_obs else (),
+            rl_obs_offsets=rl_obs_offsets,
             prompt_from_task=True,
         )
 
@@ -860,10 +870,12 @@ _CONFIGS = [
     # Loads a cat-2 (alphaflow_critic) OR cat-3 (phase-1) checkpoint — VLM + action
     # + critic — adds a latent actor, freezes VLM + action expert, trains critic +
     # latent actor.  Update the weight_loader path to your cat-2/cat-3 run/step.
+    # CrossQ ON: current s and next s' processed in ONE joint forward (~2x faster).
     TrainConfig(
         name="pi05_rft_phase2_rl",
         model=pi0_lps_rft.Pi0LPSRFTConfig(
             pi05=True,
+            crossq_joint_batch=True,
             num_train_steps=30_000,
         ),
         data=LeRobotTabletopDataConfig(
@@ -877,11 +889,119 @@ _CONFIGS = [
             include_mc_return=True,
             include_next_obs=True,   # chunked-TD: reward window + next obs + done
         ),
-        # Load the cat-2 or cat-3 checkpoint; the latent expert starts from init.
+        # TEST: base pi05 (paligemma+action loaded; critic+latent fresh-init) so
+        # LPS-RFT runs without a trained critic — fine for batch-size/does-it-run.
+        # For REAL LPS, point at a trained phase1/critic checkpoint, e.g.
+        # "checkpoints/pi05_rft_phase1_rl/pi05_rft_phase1_rl/29999/params".
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "checkpoints/pi05_rft_phase1_rl/pi05_rft_phase1_rl/29999/params"  # cat-2 OR cat-3 ckpt
+            "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
         freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        # RL: constant LR (value scale shifts during training → no decay).
+        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # CrossQ OFF (baseline): separate forwards for s and s'.  Identical results to
+    # the ON config (no BatchNorm) — use this to A/B the joint-batch speedup and
+    # to verify bit-for-bit equivalence.
+    TrainConfig(
+        name="pi05_rft_phase2_rl_sep",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True,
+            crossq_joint_batch=False,
+            num_train_steps=30_000,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
+            include_next_obs=True,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # Multi-horizon Q-chunking: per-horizon n-step TD at chunk lengths {5,10,25,50}.
+    # The loader fetches a next state at EACH horizon (obs window [0,5,10,25,50]),
+    # so the critic bootstraps V(s_{t+k}) per horizon.  Heavier data than single-Q.
+    TrainConfig(
+        name="pi05_rft_phase2_rl_mh",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True,
+            crossq_joint_batch=True,
+            td_horizons=(5, 10, 25, 50),
+            num_train_steps=30_000,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
+            include_next_obs=True,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50)
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=32,
+        save_interval=10_000,
+    ),
+    # LPS-RFT phase-2 (non-mh, single chunk-Q) CONTINUED from a trained
+    # alpha-flow+critic checkpoint (pi05_alphaflow_critic_rl).  The loader pulls
+    # paligemma / action expert / critic (+critic_in/out_proj) from that
+    # checkpoint and fresh-inits ONLY the latent expert (4th).  The critic — which
+    # was trained on the MC return G_t at heads {5,10,25,50}, incl. the full-chunk
+    # head used here — is now refined with the chunked-TD target.
+    TrainConfig(
+        name="pi05_rft_phase2_rl_from_critic",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True,
+            crossq_joint_batch=True,
+            # td_horizons=() → single chunk-level Q (non-mh); reads the full-chunk
+            # critic head (token H-1), which the loaded critic already trained.
+            num_train_steps=30_000,
+        ),
+        data=LeRobotTabletopDataConfig(
+            repo_id="jellyho/aloha_handover_box_joint_pos_rl_orig",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            include_mc_return=True,
+            include_next_obs=True,   # chunked-TD: reward window + next obs + done
+        ),
+        # Trained alpha-flow+critic checkpoint (params/ holds paligemma+action+critic).
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "/data5/jellyho/PFR_RSS/checkpoints/lps-rft/pi05_alphaflow_critic_rl/params"
+        ),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        # RL: constant LR (value scale shifts during training → no decay).
+        lr_schedule=_optimizer.ConstantSchedule(lr=2.5e-5),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=32,

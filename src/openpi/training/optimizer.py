@@ -32,6 +32,34 @@ class CosineDecaySchedule(LRScheduleConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class ConstantSchedule(LRScheduleConfig):
+    """Constant learning rate (optionally with a short linear warmup).
+
+    Useful for RL fine-tuning (e.g. LPS-RFT) where the value scale shifts during
+    training and a decaying LR is undesirable.
+    """
+
+    lr: float = 2.5e-5
+    warmup_steps: int = 0
+
+    def create(self) -> optax.Schedule:
+        const = optax.constant_schedule(self.lr)
+        if self.warmup_steps <= 0:
+            return const
+        return optax.join_schedules(
+            [
+                optax.linear_schedule(
+                    init_value=self.lr / (self.warmup_steps + 1),
+                    end_value=self.lr,
+                    transition_steps=self.warmup_steps,
+                ),
+                const,
+            ],
+            [self.warmup_steps],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RsqrtDecaySchedule(LRScheduleConfig):
     """Inverse square root decay schedule with warmup."""
 

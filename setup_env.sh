@@ -10,7 +10,14 @@ export HF_HOME="${HF_HOME:-$CACHE_DIR/.cache/huggingface}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-$HF_HOME/lerobot}"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-$CACHE_DIR/.cache/openpi}"
 
+# Persistent XLA compilation cache — avoids recompiling the (slow) train step on
+# every run.  Keyed by (graph, shapes, flags, jax/xla version); change batch/model
+# → new entry compiled once, then reused.
+export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$CACHE_DIR/.cache/jax_compile}"
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
+
 echo "Environment variables set:"
 echo "  HF_HOME:          $HF_HOME"
 echo "  HF_LEROBOT_HOME:  $HF_LEROBOT_HOME"
 echo "  OPENPI_DATA_HOME: $OPENPI_DATA_HOME"
+echo "  JAX_COMPILATION_CACHE_DIR: $JAX_COMPILATION_CACHE_DIR"

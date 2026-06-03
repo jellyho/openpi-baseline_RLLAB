@@ -56,6 +56,8 @@ class TabletopInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
     # If True, the images/state come as [current, next] windows (LPS-RFT chunked
     # TD); split them into the current obs + a model-ready next obs (+ `done`).
+    # The next state is s_{t+H} (full-chunk end) — also used as the single backup
+    # for multi-horizon Q-chunking (multi-horizon prediction, single-state backup).
     load_next_obs: bool = False
 
     EXPECTED_CAMERAS = ("cam_high", "cam_left_wrist", "cam_right_wrist")
