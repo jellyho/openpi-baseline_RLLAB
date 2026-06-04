@@ -215,7 +215,7 @@ Start the policy server (in a separate terminal):
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
     --policy.config=pi05_tabletop \
-    --policy.dir=checkpoints/pi05_tabletop/my_run/30000
+    --policy.dir=/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_rft_phase2_rl_mh/pi05_rft_phase2_rl_mh/25000
 ```
 
 Run the evaluation script:
@@ -238,6 +238,45 @@ Key options:
 | `--args.replan-steps` | `25` | Steps to execute per action chunk (= action_horizon / 2) |
 | `--args.use-benchmark-init` | `True` | Use reproducible initial states |
 | `--args.video-out-path` | `data/tabletop_sim/videos` | Where to save rollout videos |
+| `--args.value-plot` | `False` | Overlay the critic `E[V]` curve next to the camera (critic models only) |
+| `--args.action-overlay` | `False` | Project predicted gripper paths onto the camera: base samples vs steered chunk (LPS-RFT only) |
+
+### Action / Value Overlays (LPS-RFT steering debug)
+
+To debug whether latent steering pushes the action chunk off-distribution, the server
+can also return **N base-policy action samples** (random sphere latents) alongside the
+steered chunk, and the eval client projects the predicted **gripper paths** onto the
+camera via forward kinematics + the `teleoperator_pov` camera matrix.
+
+Start the server with `--num-action-samples N` (LPS-RFT checkpoints only — needs
+`sample_random_actions`):
+
+```bash
+CUDA_VISIBLE_DEVICES=2 XLA_FLAGS="--xla_gpu_autotune_level=0" \
+uv run scripts/serve_policy.py \
+    --num-action-samples 16 \
+    policy:checkpoint \
+    --policy.config=pi05_rft_phase2_rl_mh_ens \
+    --policy.dir=/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/lps-rft/<run>/<step>
+```
+
+Run the client with `--args.action-overlay` (add `--args.value-plot` for the E[V] video too):
+
+```bash
+MUJOCO_GL=egl uv run examples/tabletop_sim/main.py \
+    --args.task-name aloha_handover_box \
+    --args.num-episodes 5 \
+    --args.replan-steps 25 \
+    --args.action-overlay \
+    --args.video-out-path data/tabletop_sim/lps_action_overlay
+```
+
+This writes `<task>_ep<NNN>_<success|failure>_actions.mp4`: the camera with the **base
+samples** (faint, left arm light-blue / right arm light-orange) and the **latent-steered
+chunk** (bold blue / orange), a dot marking the current step. If the steered path stays
+inside the faint cloud, steering is in-distribution; if it shoots out of frame, the
+latent actor is producing off-distribution (exploding) actions. Base samples need
+`--num-action-samples > 0` on the server; without it only the steered path is drawn.
 
 ### Critic Visualization
 

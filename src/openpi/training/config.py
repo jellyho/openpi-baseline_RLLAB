@@ -893,6 +893,55 @@ _CONFIGS = [
         num_workers=64,
         save_interval=10000,
     ),
+    # Phase-1 WITH the learned KV-compression bottleneck ("middle transformer"):
+    # the compressor + action expert + critic co-train (phase-1 is full FT) so the
+    # action expert learns to decode from the N=compress_tokens compressed prefix.
+    # This is the alignment stage; LPS-RFT phase-2 then freezes (compressor + action)
+    # and trains only critic + latent.  (global batch 64, 15k steps.)
+    TrainConfig(
+        name="pi05_rft_phase1_compressed",
+        model=pi0_alphaflow_critic.Pi0WithCriticCompressedConfig(
+            pi05=True,
+            num_train_steps=30_000,
+            flow_ratio=0.25,
+            lambda_fm=0.5,
+            lambda_mf=0.5,
+            warmup_ratio=0.25,
+            transition_ratio=0.75,
+            critic_horizons=(5, 10, 25, 50),
+            compress_tokens=4,
+        ),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=30_000,
+        batch_size=64,
+        num_workers=16,
+        save_interval=5_000,
+    ),
+    # Same as pi05_rft_phase1_compressed but N=2 tokens and global batch 32
+    # (fair-comparison variant).
+    TrainConfig(
+        name="pi05_rft_phase1_compressed_n2",
+        model=pi0_alphaflow_critic.Pi0WithCriticCompressedConfig(
+            pi05=True,
+            num_train_steps=30_000,
+            flow_ratio=0.25,
+            lambda_fm=0.5,
+            lambda_mf=0.5,
+            warmup_ratio=0.25,
+            transition_ratio=0.75,
+            critic_horizons=(5, 10, 25, 50),
+            compress_tokens=2,
+        ),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=16,
+        save_interval=5_000,
+    ),
     TrainConfig(
         name="pi05_rft_phase1_bc",
         model=_critic_model(warmup_ratio=0.25, transition_ratio=0.75),
@@ -943,6 +992,103 @@ _CONFIGS = [
         num_workers=64,
         save_interval=25_000,
     ),
+    # Same as phase2_rl_mh + LPSD: BC term pulling the steered action toward a base
+    # generation decode(s, e) (lpsd_alpha · mean‖a_actor − sg(decode(e))‖²), so DDPG
+    # can't steer the latent off-distribution (the exploding last/middle chunk steps).
+    TrainConfig(
+        name="pi05_rft_phase2_rl_mh_lpsd",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50), lpsd_alpha=1.0
+        ),
+        data=_tabletop_data(
+            "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_alphaflow_critic_rl_mh/pi05_alphaflow_critic_rl_mh/7499/params"
+        ),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=64,
+        save_interval=25_000,
+    ),
+    # OOD-steering fixes test: decode clip [-1,1] (default on) + critic ensemble of 4
+    # heads (TD target & DDPG actor use min over heads → clipped-double-Q pessimism).
+    # Loads base params (critic + latent train from scratch in phase-2, like phase2_rl).
+    TrainConfig(
+        name="pi05_rft_phase2_rl_mh_ens",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50), n_critics=4
+        ),
+        data=_tabletop_data(
+            "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=64,
+        save_interval=5000,
+    ),
+    # All three fixes together: clip + critic ensemble (pessimism) + LPSD (BC to base gen).
+    TrainConfig(
+        name="pi05_rft_phase2_rl_mh_ens_lpsd",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50), n_critics=4, lpsd_alpha=1.0
+        ),
+        data=_tabletop_data(
+            "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=64,
+        save_interval=25_000,
+    ),
+    # Ensemble + EMA target critic (Polyak τ=0.005) for a stabler/faster chunked-TD
+    # bootstrap (v_next from the trailing target instead of the online critic).
+    TrainConfig(
+        name="pi05_rft_phase2_rl_mh_ens_target",
+        model=pi0_lps_rft.Pi0LPSRFTConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50), n_critics=4, target_tau=0.005
+        ),
+        data=_tabletop_data(
+            "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTConfig(pi05=True).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=64,
+        save_interval=25_000,
+    ),
+    # LPS-RFT phase-2 with a learned KV-compression bottleneck ("middle transformer"):
+    # a per-layer attention-pool compresses the ~800-token frozen prefix to
+    # compress_tokens (N) summary tokens; action/critic/latent attend ONLY to those.
+    # The compressor is trainable (added to the freeze filter's trainable set).
+    TrainConfig(
+        name="pi05_rft_phase2_compressed",
+        model=pi0_lps_rft.Pi0LPSRFTCompressedConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50), compress_tokens=4
+        ),
+        data=_tabletop_data(
+            "jellyho/aloha_handover_box_joint_pos_rl_224", include_mc_return=True, include_next_obs=True
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(_PI05_BASE_PARAMS),
+        freeze_filter=pi0_lps_rft.Pi0LPSRFTCompressedConfig(
+            pi05=True, td_horizons=(5, 10, 25, 50), compress_tokens=4
+        ).get_freeze_filter(),
+        lr_schedule=_optimizer.ConstantSchedule(lr=5e-5),
+        num_train_steps=15_000,
+        batch_size=64,
+        num_workers=16,
+        save_interval=5_000,
+    ),
     # --- Challenge RFT: phase-1 (alphaflow+critic) + phase-2 (LPS) per task ------
     # Same 2-stage pipeline as tabletop, on DualYam data.  Each task's dataset must
     # carry mc_return / reward columns (run scripts/compute_mc_returns.py).
@@ -985,6 +1131,22 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc"),
         weight_loader=weight_loaders.CheckpointWeightLoader(_PI05_BASE_PARAMS),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=16,
+        save_interval=10_000,
+    ),
+    # Fine-tune pi05 BC from a SAVED checkpoint (not pi05_base): inits from the trained
+    # pi05_tabletop_bc/my_run/29999 params (fresh run, step 0, fresh optimizer).  Point
+    # `weight_loader` at any `<checkpoints>/<config>/<exp>/<step>/params`, and `data` at
+    # the dataset to fine-tune on.
+    TrainConfig(
+        name="pi05_tabletop_bc_ft",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/pi05_tabletop_bc/my_run/29999/params"
+        ),
         num_train_steps=30_000,
         batch_size=32,
         num_workers=16,

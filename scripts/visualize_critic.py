@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import dataclasses
 import pathlib
 
 import jax
@@ -41,7 +42,14 @@ import openpi.shared.download as download
 
 def build_input_transform(train_config, checkpoint_dir):
     """Same input pipeline as create_trained_policy (repack → ... → model transforms)."""
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    data_cfg = train_config.data
+    # Visualization runs the critic on a SINGLE observation, so disable the next-obs
+    # / TD windows — their loader-only columns (`observation.state_is_pad`, reward
+    # window) aren't present when reading frames one at a time.  Critic E[V] only
+    # needs image / state / action.
+    if hasattr(data_cfg, "include_next_obs"):
+        data_cfg = dataclasses.replace(data_cfg, include_next_obs=False)
+    data_config = data_cfg.create(train_config.assets_dirs, train_config.model)
     norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
     return _transforms.compose([
         *data_config.repack_transforms.inputs,
@@ -87,9 +95,15 @@ def main():
         root=args.local_root,
         delta_timestamps={"action": [t / fps for t in range(action_horizon)]},
     )
-    # Frame indices for the requested episode.
-    from_idx = ds.episode_data_index["from"][args.episode].item()
-    to_idx   = ds.episode_data_index["to"][args.episode].item()
+    # Frame indices for the requested episode (v2.1 vs v3.0 API differ).
+    if hasattr(ds, "episode_data_index"):  # lerobot v2.1
+        from_idx = int(ds.episode_data_index["from"][args.episode].item())
+        to_idx   = int(ds.episode_data_index["to"][args.episode].item())
+    else:  # lerobot v3.0: meta.episodes (HF Dataset or pandas) → dataset_from/to_index
+        eps = ds.meta.episodes
+        row = eps.iloc[args.episode] if hasattr(eps, "iloc") else eps[args.episode]
+        from_idx = int(row["dataset_from_index"])
+        to_idx   = int(row["dataset_to_index"])
     n_frames = to_idx - from_idx
     print(f"Episode {args.episode}: {n_frames} frames")
 
@@ -126,7 +140,13 @@ def main():
 
         # transform → model inputs (observation + normalized actions)
         out = input_transform(raw)
-        obs_dict = {"image": out["image"], "image_mask": out["image_mask"], "state": out["state"]}
+        # Masks come back as np.bool_ scalars (per-sample, not collated); wrap as
+        # 0-d arrays so the Observation typecheck passes (→ [b] after stacking).
+        obs_dict = {
+            "image": out["image"],
+            "image_mask": {k: np.asarray(v) for k, v in out["image_mask"].items()},
+            "state": out["state"],
+        }
         if out.get("tokenized_prompt") is not None:
             obs_dict["tokenized_prompt"] = out["tokenized_prompt"]
             obs_dict["tokenized_prompt_mask"] = out["tokenized_prompt_mask"]

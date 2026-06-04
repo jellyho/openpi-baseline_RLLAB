@@ -105,6 +105,11 @@ def init_train_state(
         # Convert frozen params to bfloat16.
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
+        # Optional EMA target critic (models that expose target_critic_filter, e.g.
+        # Pi0LPSRFT with target_tau).  Initialized as a copy of the (trainable) critic.
+        target_filter = getattr(config.model, "target_critic_filter", lambda: None)()
+        target_critic_params = None if target_filter is None else params.filter(target_filter)
+
         return training_utils.TrainState(
             step=0,
             params=params,
@@ -113,6 +118,7 @@ def init_train_state(
             opt_state=tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
+            target_critic_params=target_critic_params,
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
@@ -148,7 +154,9 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        out = model.compute_loss(rng, observation, actions, train=True)
+        # Pass the EMA target critic only when present (models without it never see the kwarg).
+        tgt_kw = {} if state.target_critic_params is None else {"target_critic": state.target_critic_params}
+        out = model.compute_loss(rng, observation, actions, train=True, **tgt_kw)
         # Models may return either just the per-token loss array, or a tuple
         # (loss_array, aux_metrics_dict).  Handle both (pi0 returns just the array).
         if isinstance(out, tuple):
@@ -180,6 +188,16 @@ def train_step(
             new_state,
             ema_params=jax.tree.map(
                 lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+            ),
+        )
+    # EMA (Polyak) target critic: θ_tgt ← τ·θ + (1-τ)·θ_tgt over the updated online critic.
+    if state.target_critic_params is not None:
+        tau = config.model.target_tau
+        online_critic = new_params.filter(config.model.target_critic_filter())
+        new_state = dataclasses.replace(
+            new_state,
+            target_critic_params=jax.tree.map(
+                lambda o, t: tau * o + (1.0 - tau) * t, online_critic, state.target_critic_params
             ),
         )
 

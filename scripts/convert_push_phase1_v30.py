@@ -17,6 +17,7 @@ Run (in the v3.0 .venv):
         ./.venv/bin/python scripts/convert_push_phase1_v30.py
 """
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -120,7 +121,10 @@ def main():
         repo = f"jellyho/{name}"
         print(f"\n==================== convert+push {repo} ====================", flush=True)
         # Idempotent: skip if already fully uploaded as v3.0 (tag + real data).
+        # FORCE_REPUSH=1 bypasses the skip (e.g. data was re-annotated).
         try:
+            if os.environ.get("FORCE_REPUSH") == "1":
+                raise RuntimeError("FORCE_REPUSH")
             fs = api.list_repo_files(repo, repo_type="dataset")
             tags = [t.name for t in api.list_repo_refs(repo, repo_type="dataset").tags]
             if "v3.0" in tags and "meta/info.json" in fs and any("file-" in f for f in fs):

@@ -69,6 +69,11 @@ class Args:
     # compute_norm_stats.py). If not set, norm stats are loaded from inside the checkpoint directory.
     norm_stats_dir: str | None = None
 
+    # If > 0, the policy also returns N base-policy action samples (random sphere latents)
+    # at each state plus the steered chunk (both model/normalized space), for debug overlays
+    # (e.g. examples/tabletop_sim/main.py --action-overlay).  Only LPS-RFT models support this.
+    num_action_samples: int = 0
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -123,6 +128,7 @@ def create_policy(args: Args) -> _policy.Policy:
                 default_prompt=args.default_prompt,
                 norm_stats=norm_stats,
                 sample_kwargs=sample_kwargs or None,
+                num_action_samples=args.num_action_samples,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

@@ -104,7 +104,10 @@ class TabletopInputs(transforms.DataTransformFn):
                     masks[dest] = np.False_
             return imgs, masks
 
-        if self.load_next_obs:
+        # The next-obs window only exists during TRAINING (the data loader supplies
+        # it).  At inference the env gives a single observation (no `next_is_pad`),
+        # so fall through to the single-obs path below.
+        if self.load_next_obs and "next_is_pad" in data:
             # images[cam] = [current, next] (2, C, H, W); state = [current, next] (2, S).
             cur_imgs  = {k: np.asarray(v)[0] for k, v in in_images.items()}
             next_imgs = {k: np.asarray(v)[1] for k, v in in_images.items()}

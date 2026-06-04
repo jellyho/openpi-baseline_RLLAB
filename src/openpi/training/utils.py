@@ -22,6 +22,10 @@ class TrainState:
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
 
+    # EMA target critic (Polyak) for the TD bootstrap.  None unless the model exposes
+    # a target critic filter (e.g. Pi0LPSRFT with target_tau set); updated in train_step.
+    target_critic_params: nnx.State | None = None
+
 
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:

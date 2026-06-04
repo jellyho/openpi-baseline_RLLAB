@@ -84,7 +84,10 @@ class Pi0LPSRFTConfig(Pi0WithCriticConfig):
     # critic_loss_weight inherited (default 1.0).
 
     # Discount factor (stored for the v2 chunked-TD term).
-    gamma: float = 0.995
+    # γ=1 (undiscounted) matches the Phase-1 mc_return annotation: a clean
+    # normalized time-to-outcome signal, not washed out at 60fps (γ=0.995 → ~3.3s
+    # effective horizon ≪ 40s episodes).
+    gamma: float = 1.0
 
     # ── RL ablation toggles (config-isolatable) ───────────────────────────────
     # CrossQ joint batch: process current s and next s' in ONE forward (concat →
@@ -111,6 +114,35 @@ class Pi0LPSRFTConfig(Pi0WithCriticConfig):
     # mean).  Empty → the full chunk (last td_horizon = action_horizon), i.e. the
     # deployed quantity (current behaviour).
     actor_horizons: tuple[int, ...] = ()
+
+    # Clip the decoded action to [-decode_clip, decode_clip] (model/normalized space).
+    # pi05 uses quantile norm (q01→-1, q99→+1) so in-distribution actions are ~[-1,1];
+    # clipping bounds the 1-NFE decode a = z - u(z) the same way the original LPS does
+    # (compute_flow_actions clips to [-1,1]), preventing the latent actor from steering
+    # z into directions where u(z) blows up to off-distribution actions.  None = no clip.
+    decode_clip: float | None = 1.0
+
+    # LPSD (Latent Policy Steering Distillation): add a BC term pulling the steered
+    # action a_actor = decode(s, z(s)) toward a base-policy generation decode(s, e),
+    # e ~ sphere (frozen + detached) — i.e. MSE to the action the base 1-NFE policy
+    # would generate.  Keeps the actor inside the base action distribution so DDPG
+    # can't steer z into off-distribution (exploding) actions.  0 = off (pure DDPG).
+    #   actor objective = -Q/scale  +  lpsd_alpha · mean‖a_actor − sg(decode(e))‖²
+    lpsd_alpha: float = 0.0
+
+    # EMA (Polyak) target critic for the TD bootstrap: v_next = V_target(s') uses a
+    # slowly-trailing copy of the critic params (θ_tgt ← τ·θ + (1-τ)·θ_tgt), updated
+    # in train_step.  Stabilizes/​speeds up the chunked-TD critic vs the current CrossQ
+    # "no target" bootstrap.  None = no target (online bootstrap, current behavior).
+    # Typical τ ≈ 0.005.
+    target_tau: float | None = None
+
+    def target_critic_filter(self) -> nnx.filterlib.Filter | None:
+        """Filter selecting the critic params to mirror as an EMA target (None = off).
+
+        Consumed generically by scripts/train.py to maintain TrainState.target_critic_params.
+        """
+        return _CRITIC_FILTER if self.target_tau is not None else None
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0LPSRFT":
@@ -205,8 +237,11 @@ class Pi0LPSRFT(Pi0WithCritic):
         )
 
         # ── Critic expert ────────────────────────────────────────────────────
+        # Ensemble of n_critics C51 heads on shared features (one wide proj → reshape
+        # [..., n_critics, n_bins]); n_critics=1 keeps shape [width, n_bins].
+        self.n_critics       = config.n_critics
         self.critic_in_proj  = nnx.Linear(config.action_dim, critic_expert_cfg.width, rngs=rngs)
-        self.critic_out_proj = nnx.Linear(critic_expert_cfg.width, config.n_bins, rngs=rngs)
+        self.critic_out_proj = nnx.Linear(critic_expert_cfg.width, config.n_bins * config.n_critics, rngs=rngs)
 
         # ── Latent actor expert ──────────────────────────────────────────────
         # Learned query tokens (one per action-horizon step) that attend to the
@@ -227,6 +262,8 @@ class Pi0LPSRFT(Pi0WithCritic):
         self.gamma              = config.gamma
         self.crossq_joint_batch   = config.crossq_joint_batch
         self.normalize_actor_loss = config.normalize_actor_loss
+        self.decode_clip          = config.decode_clip
+        self.lpsd_alpha           = config.lpsd_alpha
         # Multi-horizon Q-chunking.  Empty → single chunk-level Q.  Horizons are
         # numbers of committed actions (1..H); the critic token index is k-1.
         self.td_horizons = tuple(config.td_horizons)
@@ -288,8 +325,9 @@ class Pi0LPSRFT(Pi0WithCritic):
     def _critic_logits(self, kv_cache, prefix_mask, actions, token_indices=None):
         """C51 logits.  The critic is causal, so token i sees a_{0:i+1}.
 
-        token_indices=None → last token = whole chunk Q(s, a_{0:H})  → [b, n_bins].
-        token_indices=array(k-1) → per-horizon Q_k(s, a_{0:k})        → [b, n_h, n_bins].
+        token_indices=None → last token = whole chunk Q(s, a_{0:H})  → [b, E, n_bins].
+        token_indices=array(k-1) → per-horizon Q_k(s, a_{0:k})        → [b, n_h, E, n_bins].
+        (E = n_critics ensemble heads.)
         """
         kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)   # critic ⊥ frozen backbone
         critic_tokens, critic_mask, critic_ar = self.embed_critic_suffix(actions)
@@ -300,7 +338,8 @@ class Pi0LPSRFT(Pi0WithCritic):
             adarms_cond=[None, None, None, None],
         )
         feats = outs[2][:, -1] if token_indices is None else outs[2][:, token_indices]
-        return self.critic_out_proj(feats)               # [b, n_bins] or [b, n_h, n_bins]
+        logits = self.critic_out_proj(feats)             # [..., E*n_bins]
+        return logits.reshape(*logits.shape[:-1], self.n_critics, self.n_bins)  # [..., E, n_bins]
 
     def _critic_value_detached(self, kv_cache, prefix_mask, actions, token_indices=None):
         """E[V](s, a) with critic PARAMETERS detached (DDPG actor term).
@@ -310,15 +349,29 @@ class Pi0LPSRFT(Pi0WithCritic):
         the critic TD loss, never inflated by the actor's value-maximization.
 
         token_indices=None → full-chunk value [b];  array → per-head values
-        [b, n] at those critic token positions (multi-horizon actor).
+        [b, n] at those critic token positions (multi-horizon actor).  The ensemble
+        is reduced by MIN (clipped-double-Q): the actor maximizes the pessimistic
+        value, so it can't exploit a single head's OOD overestimate.
         """
         gdef, critic_params, rest = nnx.split(self, _CRITIC_FILTER, ...)
         critic_params = jax.tree.map(jax.lax.stop_gradient, critic_params)
         model_sg = nnx.merge(gdef, critic_params, rest)
-        logits = model_sg._critic_logits(kv_cache, prefix_mask, actions, token_indices)
-        return expected_value(
+        logits = model_sg._critic_logits(kv_cache, prefix_mask, actions, token_indices)  # [..., E, n_bins]
+        v = expected_value(
             jax.nn.softmax(logits, axis=-1), self.v_min, self.v_max, self.n_bins
-        )                                          # [b]  or  [b, n]
+        )                                          # [..., E]
+        return jnp.min(v, axis=-1)                 # [b]  or  [b, n]  (pessimistic)
+
+    def _critic_logits_target(self, kv_cache, prefix_mask, actions, target_critic, token_indices=None):
+        """C51 logits with the EMA TARGET critic params (TD bootstrap), [..., E, n_bins].
+
+        `target_critic` is the Polyak copy of the critic params (from the TrainState,
+        maintained in train_step).  We merge it over the online graph so only the
+        critic expert + projections use the target weights; the frozen prefix is the
+        same.  Caller stop-gradients the result (it's a target)."""
+        gdef, _online_critic, rest = nnx.split(self, _CRITIC_FILTER, ...)
+        model_tgt = nnx.merge(gdef, target_critic, rest)
+        return model_tgt._critic_logits(kv_cache, prefix_mask, actions, token_indices)
 
     # ------------------------------------------------------------------
     # Latent actor
@@ -356,13 +409,17 @@ class Pi0LPSRFT(Pi0WithCritic):
 
         Gradient flows through z into the latent actor; the action expert params
         are frozen (excluded from the trainable filter), so they are not updated.
-        No clip (matches pi0 / alpha-flow inference).
+        Clipped to [-decode_clip, decode_clip] (like the original LPS) to bound the
+        decode when the actor steers z into u(z)-blowup directions; None disables it.
         """
         b = z.shape[0]
         t = jnp.ones(b)
         r = jnp.zeros(b)
         u = self._action_velocity(kv_cache, prefix_mask, observation, z, t, r)
-        return z - u
+        a = z - u
+        if self.decode_clip is not None:
+            a = jnp.clip(a, -self.decode_clip, self.decode_clip)
+        return a
 
     def steer_actions(
         self,
@@ -380,6 +437,32 @@ class Pi0LPSRFT(Pi0WithCritic):
     def sample_actions(self, rng, observation, *, num_steps: int = 1, noise=None):  # noqa: ARG002
         """LPS inference uses the steered latent (ignores noise/num_steps)."""
         return self.steer_actions(rng, observation)
+
+    def sample_random_actions(self, rng, observation) -> _model.Actions:
+        """Base-policy action sample: a = decode(s, z) for z ~ uniform on the latent
+        sphere — i.e. what the frozen 1-NFE policy can generate BEFORE latent steering.
+
+        ONE sample per batch element; tile the observation to N (along the batch axis)
+        to get N samples for one state.  Returns [b, ah, ad] in model space — compare
+        against steered actions (sample_actions) to see whether steering goes
+        off-distribution.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        b = observation.state.shape[0]
+        kv, pm = self._embed_prefix_kv(observation)
+        z = self._to_sphere(jax.random.normal(rng, (b, self.action_horizon, self.action_dim)))
+        return self._decode(kv, pm, observation, z)
+
+    def _lpsd_bc(self, kv, pm, observation, a_actor, rng, b):
+        """LPSD behavior term: ‖a_actor − sg(decode(s, e))‖², e ~ sphere  → [b].
+
+        decode(s, e) is a base-policy generation (frozen action expert, detached),
+        so this pulls the steered action toward what the base 1-NFE policy would
+        produce — keeping it in the base action distribution.  Per-sample mean over
+        the chunk (action_horizon × action_dim)."""
+        z_e = self._to_sphere(jax.random.normal(rng, (b, self.action_horizon, self.action_dim)))
+        a_base = jax.lax.stop_gradient(self._decode(kv, pm, observation, z_e))
+        return jnp.mean(jnp.square(a_actor - a_base), axis=(-2, -1))
 
     # ------------------------------------------------------------------
     # Next-state prefix (built from the carried next-state fields)
@@ -424,7 +507,7 @@ class Pi0LPSRFT(Pi0WithCritic):
     # Multi-horizon Q-chunking loss (td_horizons set)
     # ------------------------------------------------------------------
 
-    def _loss_multi_horizon(self, observation, actions, mc_t, reward_win, done, b, H):
+    def _loss_multi_horizon(self, observation, actions, mc_t, reward_win, done, b, H, lpsd_rng, target_critic=None):
         """Multi-horizon PREDICTION, single-state BACKUP.
 
         Prediction: the causal critic exposes a value at every chunk length
@@ -459,10 +542,14 @@ class Pi0LPSRFT(Pi0WithCritic):
         # Backup: full-chunk value V(s_{t+H}) at the single next state.
         z_next = self._latent_action(kvn, pmn, b)
         a_next = self._decode(kvn, pmn, next_observation, z_next)
-        logits_next = jax.lax.stop_gradient(self._critic_logits(kvn, pmn, a_next))   # [b, n_bins]
+        # TD bootstrap: EMA target critic if provided, else online (CrossQ).
+        logits_next = jax.lax.stop_gradient(
+            self._critic_logits_target(kvn, pmn, a_next, target_critic) if target_critic is not None
+            else self._critic_logits(kvn, pmn, a_next)
+        )                                                          # [b, E, n_bins]
         v_next = expected_value(
             jax.nn.softmax(logits_next, axis=-1), self.v_min, self.v_max, self.n_bins
-        )                                                          # [b]  full-chunk V(s')
+        ).min(axis=-1)                                             # [b]  full-chunk V(s'), min over ensemble
 
         discounts = self.gamma ** jnp.arange(H, dtype=jnp.float32)  # [H]
         r_chunk = jnp.sum(reward_win * discounts, axis=-1)         # [b]
@@ -472,12 +559,13 @@ class Pi0LPSRFT(Pi0WithCritic):
         y       = jax.lax.stop_gradient(jnp.clip(y, self.v_min, self.v_max))  # [b]  single target
 
         # Prediction: per-horizon data Q  Q_k(s, a_data_{0:k}).
-        logits_data = self._critic_logits(kv, pm, actions, jnp.asarray(self._horizon_idx))        # [b, n_h, n_bins]
-        # Broadcast the SAME target y to every horizon head.
+        logits_data = self._critic_logits(kv, pm, actions, jnp.asarray(self._horizon_idx))        # [b, n_h, E, n_bins]
+        # Broadcast the SAME target y to every horizon head AND every ensemble member.
+        E = self.n_critics
         critic_loss = critic_loss_hl_gauss(
-            logits_data.reshape(b * n_h, self.n_bins), jnp.repeat(y, n_h),
+            logits_data.reshape(b * n_h * E, self.n_bins), jnp.repeat(y, n_h * E),
             self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma,
-        ).reshape(b, n_h).mean(axis=-1)                           # [b]  mean over horizons
+        ).reshape(b, n_h * E).mean(axis=-1)                       # [b]  mean over horizons × heads
 
         # ── Actor (DDPG): maximize the mean Q over the configured actor_horizons ──
         z_cur   = self._latent_action(kv, pm, b)
@@ -488,6 +576,9 @@ class Pi0LPSRFT(Pi0WithCritic):
         if self.normalize_actor_loss:
             actor_scale = jnp.abs(jnp.mean(jax.lax.stop_gradient(actor_loss))) + 1e-8
             actor_loss  = actor_loss / actor_scale
+        # LPSD: pull the steered action toward a base-policy generation (optional).
+        bc = self._lpsd_bc(kv, pm, observation, a_actor, lpsd_rng, b) if self.lpsd_alpha > 0.0 else jnp.zeros(b)
+        actor_loss = actor_loss + self.lpsd_alpha * bc
 
         total = self.critic_loss_weight * critic_loss + self.actor_loss_weight * actor_loss
 
@@ -495,7 +586,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         q_data = expected_value(
             jax.nn.softmax(jax.lax.stop_gradient(logits_data), axis=-1),
             self.v_min, self.v_max, self.n_bins,
-        )                                                          # [b, n_h]  Q_k(s, a_data)
+        ).mean(axis=-1)                                            # [b, n_h]  Q_k(s, a_data), mean over ensemble
         # advantage vs the dataset Q at the SAME head(s) the actor optimizes.
         q_data_actor = jnp.mean(q_data[:, jnp.asarray(self._actor_td_pos)], axis=-1)   # [b]
         advantage = value_actor - q_data_actor                     # steered − data (actor heads)
@@ -519,6 +610,7 @@ class Pi0LPSRFT(Pi0WithCritic):
             "td/done_frac":       jnp.mean(done),
             **_mmm("actor/q_steered", value_actor),
             **_mmm("actor/advantage", advantage),
+            "actor/lpsd_bc":      jnp.mean(bc),
             "latent/z_abs_mean":  jnp.mean(jnp.abs(z_flat)),
             "latent/z_norm_mean": jnp.mean(jnp.linalg.norm(z_flat, axis=-1)),
             "latent/z_batch_std": jnp.mean(jnp.std(z_flat, axis=0)),
@@ -540,6 +632,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         actions: _model.Actions,
         *,
         train: bool = False,
+        target_critic=None,
     ):
         """Returns (per-sample combined loss [b], aux dict).
 
@@ -550,7 +643,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         Actor : DDPG — maximize E[V](s, decode(s, z(s))) with critic params
                 detached, so only the latent actor moves toward high value.
         """
-        preprocess_rng, _ = jax.random.split(rng)
+        preprocess_rng, lpsd_rng = jax.random.split(rng)
         mc_t       = observation.mc_return    # mc_return[t]  (CalQL anchor only)
         reward_win = observation.reward       # reward[t:t+H]  [b, H]
         done       = observation.done.astype(jnp.float32)  # [b]  next state past episode end
@@ -562,7 +655,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         # Multi-horizon Q-chunking: per-horizon n-step TD (next-states at each
         # td_horizon).  Self-contained path; single chunk-level Q below otherwise.
         if self.td_horizons:
-            return self._loss_multi_horizon(observation, actions, mc_t, reward_win, done, b, H)
+            return self._loss_multi_horizon(observation, actions, mc_t, reward_win, done, b, H, lpsd_rng, target_critic)
 
         next_observation = self._next_observation(observation)
 
@@ -580,10 +673,16 @@ class Pi0LPSRFT(Pi0WithCritic):
             z_next = self._latent_action(kvn, pmn, b)
             a_next = self._decode(kvn, pmn, next_observation, z_next)
 
-            actions_joint = jnp.concatenate([actions, a_next], axis=0)   # [2b, ah, ad]
-            logits_joint  = self._critic_logits(kvj, pmj, actions_joint) # critic forward ×1 (2b)
-            logits_data = logits_joint[:b]
-            logits_next = jax.lax.stop_gradient(logits_joint[b:])
+            if target_critic is not None:
+                # Target net needs the next-state critic forward on TARGET params, so
+                # the data/next critic forwards can't be fused (prefix fusion kept).
+                logits_data = self._critic_logits(kv, pm, actions)                    # [b, E, n_bins]
+                logits_next = jax.lax.stop_gradient(self._critic_logits_target(kvn, pmn, a_next, target_critic))
+            else:
+                actions_joint = jnp.concatenate([actions, a_next], axis=0)   # [2b, ah, ad]
+                logits_joint  = self._critic_logits(kvj, pmj, actions_joint) # critic forward ×1 (2b)
+                logits_data = logits_joint[:b]
+                logits_next = jax.lax.stop_gradient(logits_joint[b:])
         else:
             # Baseline: separate forwards for current and next.
             kv,  pm  = self._embed_prefix_kv(observation)
@@ -592,12 +691,15 @@ class Pi0LPSRFT(Pi0WithCritic):
             z_next = self._latent_action(kvn, pmn, b)
             a_next = self._decode(kvn, pmn, next_observation, z_next)
 
-            logits_data = self._critic_logits(kv,  pm,  actions)        # [b, n_bins]
-            logits_next = jax.lax.stop_gradient(self._critic_logits(kvn, pmn, a_next))
+            logits_data = self._critic_logits(kv,  pm,  actions)        # [b, E, n_bins]
+            logits_next = jax.lax.stop_gradient(
+                self._critic_logits_target(kvn, pmn, a_next, target_critic) if target_critic is not None
+                else self._critic_logits(kvn, pmn, a_next)
+            )                                                           # [b, E, n_bins]
 
         v_next = expected_value(
             jax.nn.softmax(logits_next, axis=-1), self.v_min, self.v_max, self.n_bins
-        )                                                               # [b]  Q(s', a')  chunk value
+        ).min(axis=-1)                                                  # [b]  Q(s', a'), min over ensemble
 
         # ── Chunked TD target, MC-anchored (CalQL), done-masked ───────────────
         # R_chunk = Σ_{i=0}^{H-1} γ^i · reward[t+i]  (discounted dataset reward over
@@ -611,9 +713,11 @@ class Pi0LPSRFT(Pi0WithCritic):
         # return G_t directly (= truncated chunk return, terminal reward included).
         y       = jnp.where(done > 0.0, mc_t, y_boot)               # [b]
         y       = jax.lax.stop_gradient(jnp.clip(y, self.v_min, self.v_max))  # [b]
+        E = self.n_critics
         critic_loss = critic_loss_hl_gauss(
-            logits_data, y, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
-        )                                                               # [b]
+            logits_data.reshape(b * E, self.n_bins), jnp.repeat(y, E),
+            self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma,
+        ).reshape(b, E).mean(axis=-1)                                   # [b]  mean over ensemble
 
         # ── Actor (DDPG): maximize value, critic params detached ──────────────
         z_cur   = self._latent_action(kv, pm, b)
@@ -627,6 +731,9 @@ class Pi0LPSRFT(Pi0WithCritic):
             # relative weighting preserved).
             actor_scale = jnp.abs(jnp.mean(jax.lax.stop_gradient(actor_loss))) + 1e-8
             actor_loss  = actor_loss / actor_scale                     # [b], mean |·| ≈ 1
+        # LPSD: pull the steered action toward a base-policy generation (optional).
+        bc = self._lpsd_bc(kv, pm, observation, a_actor, lpsd_rng, b) if self.lpsd_alpha > 0.0 else jnp.zeros(b)
+        actor_loss = actor_loss + self.lpsd_alpha * bc
 
         total = self.critic_loss_weight * critic_loss + self.actor_loss_weight * actor_loss
 
@@ -634,7 +741,7 @@ class Pi0LPSRFT(Pi0WithCritic):
         pred_value_data = expected_value(
             jax.nn.softmax(jax.lax.stop_gradient(logits_data), axis=-1),
             self.v_min, self.v_max, self.n_bins,
-        )                                                               # [b]  Q(s, a_data)
+        ).mean(axis=-1)                                                 # [b]  Q(s, a_data), mean over ensemble
         advantage = value_actor - pred_value_data                       # [b]  steered − data
         probs_data = jax.nn.softmax(jax.lax.stop_gradient(logits_data), axis=-1)
         critic_entropy = -jnp.sum(probs_data * jnp.log(probs_data + 1e-8), axis=-1)  # [b]
@@ -662,9 +769,89 @@ class Pi0LPSRFT(Pi0WithCritic):
             # actor: steered value Q(s, decode(s, z(s))) and advantage over data
             **_mmm("actor/q_steered", value_actor),
             **_mmm("actor/advantage", advantage),                # >0 ⇒ actor steers up
+            "actor/lpsd_bc":      jnp.mean(bc),                  # base-gen MSE (LPSD)
             # latent actor health
             "latent/z_abs_mean":  jnp.mean(jnp.abs(z_flat)),
             "latent/z_norm_mean": jnp.mean(jnp.linalg.norm(z_flat, axis=-1)),
             "latent/z_batch_std": jnp.mean(jnp.std(z_flat, axis=0)),  # ~0 ⇒ latent collapse
         }
         return total, aux
+
+
+# ---------------------------------------------------------------------------
+# Compressed variant: learned middle-transformer KV bottleneck (Q-Former-style)
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class Pi0LPSRFTCompressedConfig(Pi0LPSRFTConfig):
+    """Pi0LPSRFT + a learned KV compressor between the frozen PaliGemma prefix and
+    the action/critic/latent experts.
+
+    Per layer, `compress_tokens` (N) learnable query slots attention-pool the
+    ~800-token prefix K/V down to N tokens.  Every expert then attends ONLY to this
+    N-token KV (the full prefix is never seen downstream) — so at RFT time the
+    N-token KV can be precomputed + cached and the PaliGemma backbone skipped.
+    compress_tokens=0 disables it (= plain Pi0LPSRFT, full prefix).
+    """
+
+    compress_tokens: int = 4
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0LPSRFTCompressed":
+        return Pi0LPSRFTCompressed(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        # Parent freeze (VLM + action frozen; critic + latent trainable) PLUS the
+        # KV compressor is trainable (it must learn to summarize the prefix).
+        trainable = nnx.Any(
+            nnx_utils.PathRegex(".*_2.*"),
+            nnx_utils.PathRegex(".*_3.*"),
+            nnx_utils.PathRegex(".*critic_.*"),
+            nnx_utils.PathRegex(".*latent_.*"),
+            nnx_utils.PathRegex(".*kv_compress.*"),
+        )
+        return nnx.Not(trainable)
+
+
+class Pi0LPSRFTCompressed(Pi0LPSRFT):
+    """Pi0LPSRFT whose experts attend to a compressed N-token prefix KV.
+
+    Only `_embed_prefix_kv` is overridden: after the (frozen) backbone produces the
+    per-layer prefix K/V, a per-layer learned attention-pool compresses Sp→N.  All
+    downstream expert code is unchanged — it just receives a shorter KV + mask.
+    """
+
+    def __init__(self, config: Pi0LPSRFTCompressedConfig, rngs: nnx.Rngs):
+        super().__init__(config, rngs)
+        self.compress_tokens = int(config.compress_tokens)
+        if self.compress_tokens > 0:
+            pcfg = _gemma.get_config(config.paligemma_variant)
+            # per-layer learnable query slots in key space: [depth, N, kv_heads, head_dim]
+            self.kv_compress_query = nnx.Param(
+                jax.random.normal(
+                    rngs.params(),
+                    (pcfg.depth, self.compress_tokens, pcfg.num_kv_heads, pcfg.head_dim),
+                )
+                * 0.02
+            )
+
+    @override
+    def _embed_prefix_kv(self, observation):
+        kv_cache, prefix_mask = super()._embed_prefix_kv(observation)
+        if self.compress_tokens <= 0:
+            return kv_cache, prefix_mask
+        k, v = kv_cache                                    # [L, b, Sp, Kh, D]
+        q = self.kv_compress_query.value                   # [L, N, Kh, D]
+        d = k.shape[-1]
+        # per-(layer, kv-head) attention of the N query slots over the Sp prefix tokens
+        logits = jnp.einsum("lnkh,lbskh->lbkns", q, k, preferred_element_type=jnp.float32)
+        logits = logits * (d ** -0.5)
+        big_neg = -2.3819763e38
+        m = prefix_mask[None, :, None, None, :]            # [1, b, 1, 1, Sp]
+        logits = jnp.where(m, logits, big_neg)
+        attn = jax.nn.softmax(logits, axis=-1).astype(k.dtype)   # softmax over Sp
+        k_c = jnp.einsum("lbkns,lbskh->lbnkh", attn, k)    # [L, b, N, Kh, D]
+        v_c = jnp.einsum("lbkns,lbskh->lbnkh", attn, v)
+        new_mask = jnp.ones((k.shape[1], self.compress_tokens), dtype=prefix_mask.dtype)
+        return (k_c, v_c), new_mask

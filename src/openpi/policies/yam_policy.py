@@ -115,7 +115,10 @@ class YamInputs(transforms.DataTransformFn):
         return d["state"], d["images"]
 
     def __call__(self, data: dict) -> dict:
-        if self.load_next_obs:
+        # The next-obs window only exists during TRAINING (the data loader supplies
+        # it).  At inference the env gives a single observation (no `next_is_pad`),
+        # so fall through to the single-obs path below.
+        if self.load_next_obs and "next_is_pad" in data:
             # state = [current, next] (2, 14); images[cam] = [current, next] (2, C, H, W).
             state_win = np.asarray(data["state"])
             imgs = {k: np.asarray(v) for k, v in data["images"].items()}

@@ -65,10 +65,12 @@ rlds = [
 # lerobot 0.4.4 (LeRobot dataset v3.0) requires av>=15.  av 15.1.0 ships prebuilt
 # wheels (bundling its own ffmpeg), so no system ffmpeg/dev packages are required.
 # (Older note: av 14.3/14.4 were sdist-only and needed ffmpeg-7-dev; 15.x has wheels.)
-# rerun-sdk>=0.23.2 forces numpy>=2, but openpi needs numpy<2 (jax/tf).  lerobot
-# pulls rerun only for (unused) visualization, so pin it to 0.23.1 — the newest
-# rerun that still allows numpy>=1.23 (i.e. numpy<2).  Overrides lerobot's >=0.24.
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "mujoco==3.2.0", "dm-control==1.0.21", "av==15.1.0", "rerun-sdk==0.23.1"]
+# lerobot pulls rerun-sdk only for (unused) visualization, but every numpy<2-
+# compatible rerun ships only manylinux_2_31 wheels (no sdist), so it can't install
+# on older-glibc clusters (manylinux_2_28) AND rerun>=0.23.2 forces numpy>=2 (openpi
+# needs numpy<2 for jax/tf).  lerobot imports rerun lazily, so we DROP it entirely
+# via an always-false marker (overrides lerobot's rerun-sdk>=0.24 requirement).
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "mujoco==3.2.0", "dm-control==1.0.21", "av==15.1.0", "rerun-sdk ; sys_platform == 'never'"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

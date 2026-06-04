@@ -134,6 +134,14 @@ class Pi0WithCriticConfig(Pi0AlphaFlowConfig):
     v_max:           float = 0.0
     hl_gauss_sigma:  float = 0.5   # Gaussian width in units of bin_width
 
+    # Critic ensemble: number of independent C51 readout heads on the SHARED critic
+    # features (one wide critic_out_proj → reshape to [..., n_critics, n_bins]).  Each
+    # head has its own init so they disagree on OOD actions; the TD target and the
+    # DDPG actor use the MIN over heads (clipped-double-Q pessimism), the critic loss
+    # trains every head to the same target.  1 = no ensemble (bit-identical to before,
+    # critic_out_proj keeps shape [width, n_bins] so old checkpoints still load).
+    n_critics:       int   = 1
+
     # Weight of the critic loss relative to the alpha-flow loss in compute_loss.
     critic_loss_weight: float = 1.0
 
@@ -251,7 +259,10 @@ class Pi0WithCritic(Pi0AlphaFlow):
 
         # ── Critic expert ────────────────────────────────────────────────────
         self.critic_in_proj  = nnx.Linear(config.action_dim, critic_expert_cfg.width, rngs=rngs)
-        self.critic_out_proj = nnx.Linear(critic_expert_cfg.width, config.n_bins, rngs=rngs)
+        # Ensemble: one wide head → reshape to [..., n_critics, n_bins].  n_critics=1
+        # keeps width n_bins (old checkpoints load unchanged).
+        self.n_critics          = config.n_critics
+        self.critic_out_proj = nnx.Linear(critic_expert_cfg.width, config.n_bins * config.n_critics, rngs=rngs)
 
         # C51 params stored as plain attributes (not nnx params)
         self.n_bins             = config.n_bins
@@ -337,7 +348,8 @@ class Pi0WithCritic(Pi0AlphaFlow):
         )
         idx = jnp.asarray(self._critic_token_idx)
         critic_out = outs[2][:, idx]                     # [b, K, critic_w]  K horizon tokens
-        return self.critic_out_proj(critic_out)          # [b, K, n_bins]
+        logits = self.critic_out_proj(critic_out)        # [b, K, n_critics*n_bins]
+        return logits.reshape(*critic_out.shape[:-1], self.n_critics, self.n_bins)  # [b, K, E, n_bins]
 
     # ------------------------------------------------------------------
     # compute_loss: alpha-flow (reused from parent) + critic, shared prefix KV
@@ -375,19 +387,21 @@ class Pi0WithCritic(Pi0AlphaFlow):
 
         # Critic expert: multi-horizon C51 loss (reuses the same prefix KV).  All
         # K horizons share the chunk MC return G_t as target (telescopes under MC).
-        logits      = self._critic_logits(kv_cache, prefix_mask, actions)  # [b, K, n_bins]
+        logits      = self._critic_logits(kv_cache, prefix_mask, actions)  # [b, K, E, n_bins]
         K           = logits.shape[1]
         mc_exp      = jnp.broadcast_to(mc_returns[:, None], (mc_returns.shape[0], K))  # [b, K]
+        # Every ensemble head regresses the same MC target; mean the CE over (K, E).
+        mc_exp_e    = jnp.broadcast_to(mc_returns[:, None, None], logits.shape[:-1])   # [b, K, E]
         critic_loss = critic_loss_hl_gauss(
-            logits, mc_exp, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
-        ).mean(axis=-1)                                                   # [b]  (mean over horizons)
+            logits, mc_exp_e, self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma
+        ).reshape(mc_returns.shape[0], -1).mean(axis=-1)                  # [b]  (mean over horizons × heads)
 
         # Advance the shared alpha schedule once per train step.
         self.train_step.value = self.train_step.value + 1
 
-        # Critic diagnostics: predicted E[V] vs MC return (averaged over horizons).
+        # Critic diagnostics: predicted E[V] vs MC return (mean over heads, per horizon).
         probs       = jax.nn.softmax(jax.lax.stop_gradient(logits), axis=-1)
-        pred_value  = expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b, K]
+        pred_value  = expected_value(probs, self.v_min, self.v_max, self.n_bins).mean(-1)  # [b, K]
         value_mae   = jnp.mean(jnp.abs(pred_value - mc_exp))
 
         phase = jnp.where(alpha >= 1.0, 1.0, jnp.where(alpha <= 0.0, 0.0, 0.5))
@@ -483,14 +497,12 @@ class Pi0WithCritic(Pi0AlphaFlow):
         preprocess_rng, _ = jax.random.split(rng)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        logits = self.compute_critic_logits(observation, actions)  # [b, K, n_bins]
-        K      = logits.shape[1]
-        mc_exp = jnp.broadcast_to(mc_returns[:, None], (mc_returns.shape[0], K))  # [b, K]
-
+        logits = self.compute_critic_logits(observation, actions)  # [b, K, E, n_bins]
+        mc_exp_e = jnp.broadcast_to(mc_returns[:, None, None], logits.shape[:-1])  # [b, K, E]
         return critic_loss_hl_gauss(
-            logits, mc_exp,
+            logits, mc_exp_e,
             self.v_min, self.v_max, self.n_bins, self.hl_gauss_sigma,
-        )                                                           # [b, K]
+        ).mean(axis=-1)                                             # [b, K]  (mean over heads)
 
     # ------------------------------------------------------------------
     # Value inference
@@ -506,6 +518,76 @@ class Pi0WithCritic(Pi0AlphaFlow):
 
         Returns [b, K] — one expected value per horizon (critic_horizons order).
         """
-        logits = self.compute_critic_logits(observation, actions)  # [b, K, n_bins]
+        logits = self.compute_critic_logits(observation, actions)  # [b, K, E, n_bins]
         probs  = jax.nn.softmax(logits, axis=-1)
-        return expected_value(probs, self.v_min, self.v_max, self.n_bins)  # [b, K]
+        # E[V] per head, then mean over the ensemble → [b, K].
+        return expected_value(probs, self.v_min, self.v_max, self.n_bins).mean(-1)  # [b, K]
+
+
+# ---------------------------------------------------------------------------
+# Learned KV-compression bottleneck ("middle transformer" / Q-Former-style)
+# ---------------------------------------------------------------------------
+
+def attention_pool_kv(query, kv_cache, prefix_mask):
+    """Compress per-layer prefix K/V (Sp tokens) -> N tokens via learned attention
+    pooling.  `query` is [L, N, Kh, D] learnable slots (one set per layer); each set
+    attention-pools the Sp prefix tokens at its layer.  Returns (compressed_kv,
+    new_mask) with the SAME kv_cache structure (N instead of Sp).  Shared by the
+    phase-1 (Pi0WithCriticCompressed) and phase-2 (Pi0LPSRFTCompressed) variants so
+    the compressor is trained in phase-1 and frozen/reused in phase-2.
+    """
+    k, v = kv_cache                                    # [L, b, Sp, Kh, D]
+    d = k.shape[-1]
+    logits = jnp.einsum("lnkh,lbskh->lbkns", query, k, preferred_element_type=jnp.float32)
+    logits = logits * (d ** -0.5)
+    logits = jnp.where(prefix_mask[None, :, None, None, :], logits, -2.3819763e38)
+    attn = jax.nn.softmax(logits, axis=-1).astype(k.dtype)   # softmax over Sp
+    k_c = jnp.einsum("lbkns,lbskh->lbnkh", attn, k)    # [L, b, N, Kh, D]
+    v_c = jnp.einsum("lbkns,lbskh->lbnkh", attn, v)
+    new_mask = jnp.ones((k.shape[1], query.shape[1]), dtype=prefix_mask.dtype)
+    return (k_c, v_c), new_mask
+
+
+def init_kv_compress_query(config, rngs):
+    """Learnable per-layer query slots [depth, N, kv_heads, head_dim] for the pool."""
+    pcfg = _gemma.get_config(config.paligemma_variant)
+    return nnx.Param(
+        jax.random.normal(
+            rngs.params(),
+            (pcfg.depth, int(config.compress_tokens), pcfg.num_kv_heads, pcfg.head_dim),
+        )
+        * 0.02
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0WithCriticCompressedConfig(Pi0WithCriticConfig):
+    """Phase-1 (alpha-flow distillation + C51 critic) + a learned KV-compression
+    bottleneck.  Compressor + action expert + critic CO-TRAIN here (phase-1 is full
+    fine-tuning), so the action expert learns to decode from the N-token compressed
+    prefix.  The aligned (compressor + action + critic) is then frozen for LPS-RFT
+    phase-2.  compress_tokens=0 disables it (= plain Pi0WithCritic).
+    """
+
+    compress_tokens: int = 4
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0WithCriticCompressed":
+        return Pi0WithCriticCompressed(self, rngs=nnx.Rngs(rng))
+
+
+class Pi0WithCriticCompressed(Pi0WithCritic):
+    """Pi0WithCritic whose experts attend to a compressed N-token prefix KV."""
+
+    def __init__(self, config: Pi0WithCriticCompressedConfig, rngs: nnx.Rngs):
+        super().__init__(config, rngs)
+        self.compress_tokens = int(config.compress_tokens)
+        if self.compress_tokens > 0:
+            self.kv_compress_query = init_kv_compress_query(config, rngs)
+
+    @override
+    def _embed_prefix_kv(self, observation):
+        kv_cache, prefix_mask = super()._embed_prefix_kv(observation)
+        if self.compress_tokens <= 0:
+            return kv_cache, prefix_mask
+        return attention_pool_kv(self.kv_compress_query.value, kv_cache, prefix_mask)

@@ -320,6 +320,16 @@ class BaseModel(nnx.Module, abc.ABC):
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
 
+    def sample_random_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions:
+        """One base-policy action sample per batch element, with fresh noise.
+
+        Tile the observation to N along the batch axis to draw N diverse samples for a
+        single state — used by `Policy(num_action_samples=N)` for action-cloud debug
+        overlays.  The default reuses `sample_actions` (flow/BC models get noise
+        diversity); LPS-RFT overrides it with sphere-latent sampling.
+        """
+        return self.sample_actions(rng, observation)
+
 
 def restore_params(
     params_path: pathlib.Path | str,
