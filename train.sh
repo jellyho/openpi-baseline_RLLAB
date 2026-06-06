@@ -21,9 +21,9 @@ fi
 
 # Under SLURM (srun --gres=gpu:N) the scheduler already sets CUDA_VISIBLE_DEVICES;
 # only set it ourselves when running outside SLURM.
-if [ -z "$SLURM_JOB_ID" ]; then
-    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS - 1)))
-fi
+# if [ -z "$SLURM_JOB_ID" ]; then
+#     export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS - 1)))
+# fi
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 
 mkdir -p logs

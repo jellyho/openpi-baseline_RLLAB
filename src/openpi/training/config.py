@@ -785,7 +785,7 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
         repo_id=f"jellyho/{task}_rl_224",
         base_config=DataConfig(
             prompt_from_task=True,
-            local_files_path=f"/data5/jellyho/.cache/huggingface/lerobot/jellyho/{task}_rl_224",
+            local_files_path=f"/home/yonsei_jell/{task}",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
@@ -1153,6 +1153,18 @@ _CONFIGS = [
         num_workers=16,
         save_interval=25_000,
     ),
+    TrainConfig(
+        name="pi05_insert-mouse-battery_bc_ft",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=_dualyam_data("insert-mouse-battery"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_insert-mouse-battery/199999/params"
+        ),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=16,
+        save_interval=25_000,
+    ),
     # ── RL Token bottleneck (arXiv:2604.23073) ───────────────────────────────
     # Train the encoder–decoder RL-token bottleneck on top of a FROZEN, task-
     # finetuned pi05 policy.  Only the rlt_* params train (VLA + action expert
@@ -1165,6 +1177,19 @@ _CONFIGS = [
         data=_dualyam_data("seal-water-bottle-cap"),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
             "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
+        ),
+        lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
+        num_train_steps=30_000,
+        batch_size=128,
+        num_workers=16,
+        save_interval=10_000,
+    ),
+    TrainConfig(
+        name="pi05_insert-mouse-battery_rlt",
+        model=pi0_rlt.Pi0RLTConfig(pi05=True),
+        data=_dualyam_data("insert-mouse-battery"),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_insert-mouse-battery_bc_ft/pi05_insert-mouse-battery_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=30_000,
