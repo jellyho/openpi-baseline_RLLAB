@@ -154,17 +154,24 @@ def create_torch_dataset(
     # serve them from RAM (no per-step video decode / NFS).  Built once in the main
     # process; workers mmap it.  No-op otherwise.
     import openpi.training.preload_dataset as _preload
+    # Loosen the frame-timestamp tolerance: float32 timestamps drift ~1e-4 on long
+    # videos (e.g. t≈1570s → 1570.7334 vs 1570.7333), tripping lerobot's default
+    # tolerance_s=1e-4.  1e-3 ≪ 1/fps (0.02 @ 50fps) so the nearest frame is still
+    # the correct one — this only absorbs the precision drift.
+    tolerance_s = 1e-3
     if _preload.maybe_build_cache(data_config.repo_id, data_config.local_files_path):
         dataset = _preload.PreloadedLeRobotDataset(
             data_config.repo_id,
             delta_timestamps=delta_timestamps,
             root=data_config.local_files_path,
+            tolerance_s=tolerance_s,
         )
     else:
         dataset = lerobot_dataset.LeRobotDataset(
             data_config.repo_id,
             delta_timestamps=delta_timestamps,
             root=data_config.local_files_path,
+            tolerance_s=tolerance_s,
         )
 
     if data_config.prompt_from_task:

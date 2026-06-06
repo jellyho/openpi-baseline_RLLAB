@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_alphaflow as pi0_alphaflow
 import openpi.models.pi0_alphaflow_critic as pi0_alphaflow_critic
 import openpi.models.pi0_lps_rft as pi0_lps_rft
+import openpi.models.pi0_rlt as pi0_rlt
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -781,10 +782,10 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
     LPS-RFT chunked-TD windows); the dataset must then carry mc_return / reward.
     """
     return DualYamDataConfig(
-        repo_id=f"{task}/expert-data",
+        repo_id=f"jellyho/{task}_rl_224",
         base_config=DataConfig(
             prompt_from_task=True,
-            local_files_path=f"/Your/path/to/Posttraining-RFM-RSS2026/Challenge-phase1-dataset/{task}/expert-data",
+            local_files_path=f"/data5/jellyho/.cache/huggingface/lerobot/jellyho/{task}_rl_224",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
@@ -1141,14 +1142,33 @@ _CONFIGS = [
     # `weight_loader` at any `<checkpoints>/<config>/<exp>/<step>/params`, and `data` at
     # the dataset to fine-tune on.
     TrainConfig(
-        name="pi05_tabletop_bc_ft",
+        name="pi05_seal-water-bottle-cap_bc_ft",
         model=pi0_config.Pi0Config(pi05=True),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc"),
+        data=_dualyam_data("seal-water-bottle-cap"),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "checkpoints/pi05_tabletop_bc/my_run/29999/params"
+            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
         ),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=16,
+        save_interval=25_000,
+    ),
+    # ── RL Token bottleneck (arXiv:2604.23073) ───────────────────────────────
+    # Train the encoder–decoder RL-token bottleneck on top of a FROZEN, task-
+    # finetuned pi05 policy.  Only the rlt_* params train (VLA + action expert
+    # frozen); the objective is autoregressive reconstruction of the VLA's prefix
+    # embeddings (+ proprio) through the compact RL token.  AlphaFlowWeightLoader
+    # loads the overlapping pi05 weights and keeps the new rlt_* params at init.
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_rlt",
+        model=pi0_rlt.Pi0RLTConfig(pi05=True),
+        data=_dualyam_data("seal-water-bottle-cap"),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
+        ),
+        lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=30_000,
-        batch_size=32,
+        batch_size=128,
         num_workers=16,
         save_interval=10_000,
     ),
