@@ -785,7 +785,8 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
         repo_id=f"jellyho/{task}_rl_224",
         base_config=DataConfig(
             prompt_from_task=True,
-            local_files_path=f"/home/yonsei_jell/{task}",
+            # local_files_path=f"/home/yonsei_jell/{task}",
+            # local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
@@ -1149,7 +1150,7 @@ _CONFIGS = [
             "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
         ),
         num_train_steps=100_000,
-        batch_size=128,
+        batch_size=256,
         num_workers=16,
         save_interval=25_000,
     ),
@@ -1176,13 +1177,13 @@ _CONFIGS = [
         model=pi0_rlt.Pi0RLTConfig(pi05=True),
         data=_dualyam_data("seal-water-bottle-cap"),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
+            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_seal-water-bottle-cap_bc_ft/pi05_seal-water-bottle-cap_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
-        num_train_steps=30_000,
+        num_train_steps=200_000,
         batch_size=128,
-        num_workers=16,
-        save_interval=10_000,
+        num_workers=32,
+        save_interval=20_000,
     ),
     TrainConfig(
         name="pi05_insert-mouse-battery_rlt",
@@ -1193,8 +1194,8 @@ _CONFIGS = [
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=30_000,
-        batch_size=128,
-        num_workers=16,
+        batch_size=256,
+        num_workers=32,
         save_interval=10_000,
     ),
 ]

@@ -300,6 +300,67 @@ class Pi0RLT(Pi0):
         return self._encode_rl_token(z, prefix_mask, observation.state)
 
     # ------------------------------------------------------------------
+    # Base-VLA action sampling (precompute reference action chunks)
+    # ------------------------------------------------------------------
+
+    def sample_base_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_samples: int,
+        num_steps: int = 10,
+    ) -> at.Float[at.Array, "b n ah ad"]:
+        """Sample ``num_samples`` base-VLA action chunks per state.
+
+        Returns [b, num_samples, H, action_dim] in normalized model space — the
+        SAME distribution as ``Pi0.sample_actions`` (π_vla), just drawn many times
+        per state.  These are the reference action chunks ã ~ π_vla that the
+        downstream RLT actor conditions on / is regularized toward.
+
+        Efficiency: the full VLA prefix (2B backbone over image+language+state) is
+        run ONCE per state; the action-expert flow-matching denoising is vmapped
+        over the ``num_samples`` noises (the action expert is small, so this is
+        cheap relative to re-running the backbone per sample).
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        b = observation.state.shape[0]
+        dt = -1.0 / num_steps
+
+        # Prefix KV once (this is the real π_vla prefix: images + language + state).
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def denoise(noise):
+            def step(carry):
+                x_t, time = carry
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    observation, x_t, jnp.broadcast_to(time, b)
+                )
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                prefix_attn = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn = jnp.concatenate([prefix_attn, suffix_attn_mask], axis=-1)
+                pos = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+                (_, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens], mask=full_attn, positions=pos,
+                    kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+                )
+                v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+                return x_t + dt * v_t, time + dt
+
+            def cond(carry):
+                return carry[1] >= -dt / 2
+
+            x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            return x_0
+
+        noises = jax.random.normal(rng, (num_samples, b, self.action_horizon, self.action_dim))
+        chunks = jax.vmap(denoise)(noises)              # [n, b, H, D]
+        return jnp.transpose(chunks, (1, 0, 2, 3))       # [b, n, H, D]
+
+    # ------------------------------------------------------------------
     # compute_loss: autoregressive reconstruction (Eq. 2) + proprio
     # ------------------------------------------------------------------
 
