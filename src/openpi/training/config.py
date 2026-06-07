@@ -1091,12 +1091,16 @@ _CONFIGS = [
         num_workers=16,
         save_interval=5_000,
     ),
-    # --- Challenge RFT: phase-1 (alphaflow+critic) + phase-2 (LPS) per task ------
-    # Same 2-stage pipeline as tabletop, on DualYam data.  Each task's dataset must
-    # carry mc_return / reward columns (run scripts/compute_mc_returns.py).
-    *_challenge_rft("insert-mouse-battery"),
-    *_challenge_rft("seal-water-bottle-cap"),
-    *_challenge_rft("tower-of-hanoi-game"),
+    TrainConfig(
+        name="pi05_tabletop_bc",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_PI05_BASE_PARAMS),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=16,
+        save_interval=10_000,
+    ),
     # Challenge Baseline Examples
     TrainConfig(
         name="pi05_insert-mouse-battery_bc",
@@ -1133,7 +1137,7 @@ _CONFIGS = [
     #  + tower-of-hanoi-game, 3205 episodes / 3 tasks).  prompt_from_task keeps each
     # episode's own task string, so a single policy learns all three.
     TrainConfig(
-        name="pi05_dualyam_combined_bc",
+        name="pi05_generalist_bc_ft",
         model=pi0_config.Pi0Config(pi05=True),
         data=DualYamDataConfig(
             repo_id="jellyho/phase1_combined",
@@ -1144,21 +1148,11 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/NHNHOME/WORKSPACE/0526040008_A/jellyho/ckpts_rss/pi05_rss2026_multitask/199999/params"),
         num_train_steps=200_000,
-        batch_size=64,
+        batch_size=128,
         num_workers=32,
-        save_interval=40_000,
-    ),
-    TrainConfig(
-        name="pi05_tabletop_bc",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=_tabletop_data("jellyho/aloha_handover_box_joint_pos_bc"),
-        weight_loader=weight_loaders.CheckpointWeightLoader(_PI05_BASE_PARAMS),
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=16,
-        save_interval=10_000,
+        save_interval=25_000,
     ),
     # Fine-tune pi05 BC from a SAVED checkpoint (not pi05_base): inits from the trained
     # pi05_tabletop_bc/my_run/29999 params (fresh run, step 0, fresh optimizer).  Point
@@ -1188,6 +1182,19 @@ _CONFIGS = [
         num_workers=16,
         save_interval=25_000,
     ),
+    TrainConfig(
+        name="pi05_tower-of-hanoi-game_bc_ft",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=_dualyam_data("tower-of-hanoi-game"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_tower-of-hanoi-game/199999/params"
+        ),
+        num_train_steps=100_000,
+        batch_size=128,
+        num_workers=16,
+        save_interval=25_000,
+    ),
+    
     # ── RL Token bottleneck (arXiv:2604.23073) ───────────────────────────────
     # Train the encoder–decoder RL-token bottleneck on top of a FROZEN, task-
     # finetuned pi05 policy.  Only the rlt_* params train (VLA + action expert
