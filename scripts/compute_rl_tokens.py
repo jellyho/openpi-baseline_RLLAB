@@ -69,6 +69,15 @@ import openpi.training.data_loader as _data_loader
 import openpi.transforms as _transforms
 from openpi.training.data_loader import _collate_fn
 
+# Rows per from_dict chunk when building columns (keeps pyarrow 32-bit list offsets
+# < 2GB / 2^31 leaf elements; base_action [N,H,14] f16 ≈ 45KB/row → 20k ≈ 0.9GB).
+_BUILD_CHUNK_ROWS = 20_000
+# Parquet row-group size on write (small → safe to build AND to read back).
+_WRITE_ROW_GROUP = 1_000
+# Crash-safety: flush computed rows to a .npz part every this many rows, so a killed
+# run resumes from the last part instead of recomputing the whole (multi-hour) file.
+_CHECKPOINT_ROWS = 50_000
+
 
 def _make_data_config(config: _config.TrainConfig, root_override: str | None):
     data_config = config.data.create(config.assets_dirs, config.model)
@@ -160,24 +169,35 @@ def _write_data_file(path: pathlib.Path, rl_col, z_arr, ba_col, ba_arr):
     drop = [c for c, arr in [(rl_col, z_arr), (ba_col, ba_arr)] if arr is not None and c in ds.column_names]
     if drop:
         ds = ds.remove_columns(drop)
-    # Build the new columns as a separate Dataset with explicit feature types
-    # (from_dict honours Array3D/Sequence; add_column/pyarrow cannot encode >1-D
-    # arrays), then glue them on by columns.
-    extra, feats = {}, {}
+
+    feats = {}
     if z_arr is not None:
         if len(z_arr) != n:
             raise RuntimeError(f"{path}: {len(z_arr)} rl_tokens != {n} rows (alignment).")
-        extra[rl_col] = list(z_arr)
         feats[rl_col] = datasets.Sequence(length=z_arr.shape[1], feature=datasets.Value("float32"))
     if ba_arr is not None:
         if len(ba_arr) != n:
             raise RuntimeError(f"{path}: {len(ba_arr)} base_actions != {n} rows (alignment).")
-        extra[ba_col] = list(ba_arr)
         feats[ba_col] = datasets.Array3D(shape=ba_arr.shape[1:], dtype="float16")
-    new_cols = datasets.Dataset.from_dict(extra, features=datasets.Features(feats))
+
+    # Build the new columns in ROW CHUNKS: pyarrow list arrays use 32-bit offsets, so
+    # a single base_action column for a whole file (>2GB / >2^31 leaf elements) would
+    # overflow.  Each chunk stays small; concatenate_datasets keeps them as separate
+    # Arrow chunks, and to_parquet writes small row groups (also safe to read back).
+    feats = datasets.Features(feats)
+    parts = []
+    for i in range(0, n, _BUILD_CHUNK_ROWS):
+        d = {}
+        if z_arr is not None:
+            d[rl_col] = list(z_arr[i:i + _BUILD_CHUNK_ROWS])
+        if ba_arr is not None:
+            d[ba_col] = list(ba_arr[i:i + _BUILD_CHUNK_ROWS])
+        parts.append(datasets.Dataset.from_dict(d, features=feats))
+    new_cols = datasets.concatenate_datasets(parts) if len(parts) > 1 else parts[0]
+
     merged = datasets.concatenate_datasets([ds, new_cols], axis=1)
     tmp = path.with_name(path.name + ".tmp")
-    merged.to_parquet(str(tmp))
+    merged.to_parquet(str(tmp), batch_size=_WRITE_ROW_GROUP)
     os.replace(tmp, path)
 
 
@@ -308,38 +328,91 @@ def main():
             [args.base_action_column] if args.base_actions else [])
         return all(c in cols for c in need)
 
+    def _parse_part(name):  # "part_{start:09d}_{n:06d}.npz" -> (start, n)
+        s, nn = name[len("part_"):-len(".npz")].split("_")
+        return int(s), int(nn)
+
+    def _count_done(partial):
+        done = 0
+        for pf in sorted(partial.glob("part_*.npz")):
+            s, nn = _parse_part(pf.name)
+            if s != done:
+                raise RuntimeError(f"non-contiguous checkpoint part {pf.name} (expected start {done}).")
+            done += nn
+        return done
+
     def process_file(k):
-        # Resume: a written file already carries the columns (atomic replace → no
-        # partial state), so skip it unless --overwrite.
-        if not args.overwrite and _file_done(data_paths[k]):
+        path = data_paths[k]
+        # Resume #1: a fully written file already carries the columns (atomic replace) → skip.
+        if not args.overwrite and _file_done(path):
             print(f"file{k}: already annotated, skipping (resume).")
             return
         rows = data_rows[k]
         g0 = offsets[k]
-        sub = torch.utils.data.Subset(dataset, range(g0, g0 + rows))
-        loader = torch.utils.data.DataLoader(
-            sub, batch_size=args.batch_size, shuffle=False, drop_last=False,
-            num_workers=args.num_workers, collate_fn=_collate_fn,
-            persistent_workers=args.num_workers > 0,
-        )
-        buf_z, buf_a = [], []
+        partial = path.with_name(path.stem + ".partial")
+        if args.overwrite and partial.exists():
+            shutil.rmtree(partial)        # fresh start; don't mix old N/checkpoints
+        partial.mkdir(exist_ok=True)
         file_rng = jax.random.fold_in(base_rng, k)
-        n_batches = (rows + args.batch_size - 1) // args.batch_size
-        for step, batch in enumerate(tqdm.tqdm(loader, total=n_batches, desc=f"file{k}")):
-            obs = _model.Observation.from_dict(batch)
-            if args.rl_tokens:
-                z = np.asarray(jax.device_get(extract_token(model, obs)), np.float32)
-                buf_z.extend(z)
-            if args.base_actions:
-                a = np.asarray(jax.device_get(
-                    sample_actions(model, jax.random.fold_in(file_rng, step), obs)), np.float32)  # [B,N,H,Dm]
-                a = to_raw_actions(a, np.asarray(obs.state)).astype(np.float16)                   # [B,N,H,14]
-                buf_a.extend(a)
-        z_arr = np.stack(buf_z, axis=0) if args.rl_tokens else None
-        ba_arr = np.stack(buf_a, axis=0) if args.base_actions else None
-        if z_arr is not None and len(z_arr) != rows:
-            raise RuntimeError(f"file{k}: got {len(z_arr)} rows, expected {rows}.")
-        _write_data_file(data_paths[k], args.column_name, z_arr, args.base_action_column, ba_arr)
+
+        def save_part(start, bz, ba):     # atomic .npz checkpoint
+            arrs = {}
+            if args.rl_tokens: arrs["z"] = np.asarray(bz, np.float32)
+            if args.base_actions: arrs["ba"] = np.asarray(ba, np.float16)
+            nn = len(bz) if args.rl_tokens else len(ba)
+            # np.savez APPENDS ".npz" to the path, so write to "_writing_<start>" → it
+            # becomes "_writing_<start>.npz" (doesn't match the part_*.npz glob), then
+            # atomically rename to the final part name.
+            stem = partial / f"_writing_{start:09d}"
+            np.savez(str(stem), **arrs)
+            os.replace(str(stem) + ".npz", partial / f"part_{start:09d}_{nn:06d}.npz")
+
+        # Resume #2: continue from the last contiguous checkpoint part.
+        done = _count_done(partial)
+        if done:
+            print(f"file{k}: resuming from row {done}/{rows}.")
+        if done < rows:
+            sub = torch.utils.data.Subset(dataset, range(g0 + done, g0 + rows))
+            loader = torch.utils.data.DataLoader(
+                sub, batch_size=args.batch_size, shuffle=False, drop_last=False,
+                num_workers=args.num_workers, collate_fn=_collate_fn,
+                persistent_workers=args.num_workers > 0,
+            )
+            buf_z, buf_a = [], []
+            row = flush_start = done      # absolute row in file at the next batch's start
+            n_batches = (rows - done + args.batch_size - 1) // args.batch_size
+            for batch in tqdm.tqdm(loader, total=n_batches, desc=f"file{k}"):
+                obs = _model.Observation.from_dict(batch)
+                B = int(obs.state.shape[0])
+                if args.rl_tokens:
+                    z = np.asarray(jax.device_get(extract_token(model, obs)), np.float32)
+                    buf_z.extend(z)
+                if args.base_actions:
+                    # RNG keyed by ABSOLUTE row (not loop step) → identical across resumes.
+                    a = np.asarray(jax.device_get(
+                        sample_actions(model, jax.random.fold_in(file_rng, row), obs)), np.float32)  # [B,N,H,Dm]
+                    a = to_raw_actions(a, np.asarray(obs.state)).astype(np.float16)                  # [B,N,H,14]
+                    buf_a.extend(a)
+                row += B
+                if (len(buf_z) if args.rl_tokens else len(buf_a)) >= _CHECKPOINT_ROWS:
+                    save_part(flush_start, buf_z, buf_a)
+                    flush_start, buf_z, buf_a = row, [], []
+            if (len(buf_z) if args.rl_tokens else len(buf_a)) > 0:
+                save_part(flush_start, buf_z, buf_a)
+
+        # Assemble all checkpoint parts → write the columns into the data parquet → clean up.
+        if _count_done(partial) != rows:
+            raise RuntimeError(f"file{k}: checkpointed {_count_done(partial)} rows != {rows}.")
+        zs, bas = [], []
+        for pf in sorted(partial.glob("part_*.npz")):
+            d = np.load(pf)
+            if args.rl_tokens: zs.append(d["z"])
+            if args.base_actions: bas.append(d["ba"])
+        z_arr = np.concatenate(zs, axis=0) if args.rl_tokens else None
+        ba_arr = np.concatenate(bas, axis=0) if args.base_actions else None
+        _write_data_file(path, args.column_name, z_arr, args.base_action_column, ba_arr)
+        shutil.rmtree(partial)
+        print(f"file{k}: done ({rows} rows).")
 
     for k in my_files:
         process_file(k)
