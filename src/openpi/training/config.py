@@ -1128,6 +1128,28 @@ _CONFIGS = [
         num_workers=32,
         save_interval=40_000
     ),
+    # BC on the three DualYam tasks merged into one dataset
+    # (/home/yonsei_jell/dualyam_combined; insert-mouse-battery + seal-water-bottle-cap
+    #  + tower-of-hanoi-game, 3205 episodes / 3 tasks).  prompt_from_task keeps each
+    # episode's own task string, so a single policy learns all three.
+    TrainConfig(
+        name="pi05_dualyam_combined_bc",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="jellyho/phase1_combined",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/home/yonsei_jell/dualyam_combined",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=64,
+        num_workers=32,
+        save_interval=40_000,
+    ),
     TrainConfig(
         name="pi05_tabletop_bc",
         model=pi0_config.Pi0Config(pi05=True),
@@ -1193,10 +1215,10 @@ _CONFIGS = [
             "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_insert-mouse-battery_bc_ft/pi05_insert-mouse-battery_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
-        num_train_steps=30_000,
+        num_train_steps=100_000,
         batch_size=256,
-        num_workers=32,
-        save_interval=10_000,
+        num_workers=64,
+        save_interval=20_000,
     ),
 ]
 
