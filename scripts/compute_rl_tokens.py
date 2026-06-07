@@ -1,67 +1,90 @@
 """
-Augment a LeRobot dataset (v2.1) with two precomputed quantities from a trained
-``Pi0RLT`` model, for the downstream actor-critic RL stage:
+Augment a LeRobot dataset (v3.0) with two precomputed quantities from a trained
+``Pi0RLT`` model, for the downstream actor-critic RL stage.  BOTH are stored as
+standard LeRobot feature columns (registered in ``meta/info.json``), so they load
+through the normal pipeline and are accessible as ``item["rl_token"]`` /
+``item["base_action"]`` via ``LeRobotDataset``.
 
   1. **RL token** ``z_rl`` — a compact per-frame state representation (the
-     encoder-decoder bottleneck of ``src/openpi/models/pi0_rlt.py``).  Stored as
-     a ``rl_token`` column (dim ``rlt_token_dim``) in each episode parquet.
+     encoder-decoder bottleneck of ``src/openpi/models/pi0_rlt.py``).  Stored as a
+     1-D ``rl_token`` column (``Sequence[rlt_token_dim]``, float32).
 
-  2. **Base-VLA action chunks** — ``num_action_samples`` action chunks sampled
-     per frame from the frozen base policy π_vla, shape ``[N, H, D]`` in
-     normalized model space (the reference chunks ã the RLT actor conditions on /
-     is regularized toward).  Stored as a per-episode sidecar
-     ``base_actions/episode_{ep:06d}.npy`` (float16) — NOT a parquet column, since
-     ``N·H·D`` floats per frame would bloat the parquet badly.
+  2. **Base-VLA action chunks** — ``num_action_samples`` (N) action chunks sampled
+     per frame from the frozen base policy π_vla.  Stored as a ``base_action``
+     column (``Array3D[N, H, 14]``, float16) in **raw original action space** — the
+     SAME space as the dataset's ``action`` column (un-normalized, absolute, yam
+     14-dim).  At load time, normalize it with the dataset's *action* stats to put
+     it back in model space, exactly like the ``action`` column.
 
-Both are computed in a SINGLE ordered pass over the dataset (one video decode).
-Frame order is guaranteed (``shuffle=False``, ``drop_last=False``), so item ``i``
-is global frame ``i`` == the episode-concatenation order of the parquets; the
-script asserts ``sum(episode_lengths) == n_frames`` before writing.
+Both columns are written back per DATA FILE (v3.0 packs many episodes per
+size-capped parquet), keyed by each file's ACTUAL row count.  Each file covers a
+contiguous global frame range, so the work parallelizes cleanly across GPUs.
 
-Storage is streamed per episode (bounded memory): buffers fill in frame order and
-flush at each episode boundary.
+Multi-GPU (DDP-style data parallel)
+───────────────────────────────────
+The GPU sampling is the bottleneck (data loading is ~100× faster), so split the
+data files across processes.  Pre-copy the dataset to a roomy disk once, then run
+one process per GPU on a disjoint shard, and register the features once at the end:
+
+    OUT=/big/disk/insert-mouse-battery_annotated
+    cp -r /home/yonsei_jell/insert-mouse-battery "$OUT"     # once
+    for i in 0 1 2 3; do
+      CUDA_VISIBLE_DEVICES=$i uv run scripts/compute_rl_tokens.py \\
+        --config-name pi05_insert-mouse-battery_rlt --checkpoint <ckpt> \\
+        --dataset-root "$OUT" --num-shards 4 --shard-index $i \\
+        --num-action-samples 32 --batch-size 128 --num-workers 8 &
+    done; wait
+    uv run scripts/compute_rl_tokens.py --config-name pi05_insert-mouse-battery_rlt \\
+        --checkpoint <ckpt> --dataset-root "$OUT" --num-action-samples 32 \\
+        --register-features-only
+
+Single GPU: omit --num-shards/--shard-index (defaults to the whole dataset) and the
+features are registered automatically at the end.
 
 Notes
 ─────
-  * The RL token's backbone forward is image-only (instruction is fixed), so the
-    prompt does not affect ``z_rl``.  Base-action sampling uses the FULL π_vla
-    prefix (images + language + state).
-  * Default writes to a COPY (``--output``); pass ``--in-place`` to edit the
-    source dataset directly.
-
-Usage
-─────
-    uv run scripts/compute_rl_tokens.py \\
-        --config-name pi05_seal-water-bottle-cap_rlt \\
-        --checkpoint  /data5/.../pi05_seal-water-bottle-cap_rlt/<exp>/<step> \\
-        --in-place
+  * The RL token's backbone forward is image-only (the prompt does not affect z_rl);
+    base-action sampling uses the FULL π_vla prefix (images + language + state).
+  * Sampled chunks come out in normalized model space; they are pushed back to raw
+    action space through the SAME canonical output transform the policy uses
+    (Unnormalize → AbsoluteActions → YamOutputs), vectorized over N.
+  * Per-file RNG (fold_in by file & step) makes results identical regardless of how
+    files are sharded across GPUs.
 """
 
 import argparse
 import json
+import os
 import pathlib
 import shutil
 
 import flax.nnx as nnx
 import jax
 import numpy as np
-import pandas as pd
 import tqdm
 
 import openpi.models.model as _model
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.transforms as _transforms
 from openpi.training.data_loader import _collate_fn
 
 
-def _build_dataset(config: _config.TrainConfig):
-    """Transformed dataset (full training pipeline) + its DataConfig."""
+def _make_data_config(config: _config.TrainConfig, root_override: str | None):
     data_config = config.data.create(config.assets_dirs, config.model)
+    if root_override is not None:
+        import dataclasses
+        data_config = dataclasses.replace(data_config, local_files_path=root_override)
     if data_config.local_files_path is None:
         raise ValueError("DataConfig.local_files_path is None — need a local dataset to write back to.")
+    return data_config
+
+
+def _build_dataset(config: _config.TrainConfig, data_config):
+    """Transformed dataset (full training pipeline) for the given data_config."""
     dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
     dataset = _data_loader.transform_dataset(dataset, data_config)
-    return dataset, data_config
+    return dataset
 
 
 def _load_model(config: _config.TrainConfig, checkpoint: pathlib.Path):
@@ -72,25 +95,127 @@ def _load_model(config: _config.TrainConfig, checkpoint: pathlib.Path):
     return model
 
 
-def _episode_paths(out: pathlib.Path):
-    """(info dict, [episode parquet paths in episode-index order])."""
+def _build_action_decoder(data_config):
+    """Vectorized normalized-model-space → raw-action-space converter for sampled chunks.
+
+    Reuses the EXACT canonical output transform the policy applies (Unnormalize →
+    AbsoluteActions → YamOutputs), so the stored ``base_action`` lives in the same
+    space as the dataset's raw ``action`` column.  AbsoluteActions needs the state
+    and broadcasts over a [.., H, D] batch; the remaining (dim-reducing) outputs run
+    row-wise, so we reshape to 2-D for them.
+    """
+    if data_config.norm_stats is None:
+        raise ValueError("DataConfig.norm_stats is None — cannot un-normalize sampled actions.")
+    unnorm = _transforms.Unnormalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm)
+    outs = list(data_config.data_transforms.outputs)
+
+    def decode(sampled: np.ndarray, state: np.ndarray) -> np.ndarray:
+        # sampled: [B, N, H, Dm] (normalized model space); state: [B, Dm] (normalized).
+        b, n, h, dm = sampled.shape
+        acts = sampled.reshape(b * n, h, dm).astype(np.float32)
+        st = np.repeat(state.astype(np.float32), n, axis=0)            # [B*N, Dm]
+        d = unnorm({"state": st, "actions": acts})
+        # State-dependent transforms (AbsoluteActions) act on the [.., H, Dm] batch.
+        i = 0
+        while i < len(outs) and isinstance(outs[i], _transforms.AbsoluteActions):
+            d = outs[i](d)
+            i += 1
+        # Remaining transforms (e.g. YamOutputs: slice to 14 dims, un-adapt) are row-wise.
+        flat = d["actions"].reshape(-1, dm)
+        for t in outs[i:]:
+            flat = t({"actions": flat})["actions"]
+        return flat.reshape(b, n, h, -1)                              # [B, N, H, 14]
+
+    return decode
+
+
+def _data_files(out: pathlib.Path):
+    """(ordered data-parquet paths, row counts, global start offsets).
+
+    Files are globally ordered by (chunk_index, file_index), matching global frame
+    order; each file covers the contiguous range [offset, offset+rows).
+    """
+    import pyarrow.parquet as pq
+
+    paths = sorted((out / "data").glob("chunk-*/file-*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"no data parquets under {out/'data'}.")
+    rows = [pq.ParquetFile(p).metadata.num_rows for p in paths]
+    offsets = np.concatenate([[0], np.cumsum(rows)])[:-1].tolist()
+    return paths, rows, offsets
+
+
+def _write_data_file(path: pathlib.Path, rl_col, z_arr, ba_col, ba_arr):
+    """Add the rl_token / base_action columns to one data parquet (atomic replace).
+
+    Written via HF ``datasets`` so ``base_action`` is encoded as a real Array3D
+    feature that ``Dataset.from_parquet(features=...)`` reads back with shape.
+    """
+    import datasets
+
+    ds = datasets.Dataset.from_parquet(str(path))
+    n = len(ds)
+    # Drop any pre-existing copies of the columns we're (re)writing (e.g. --overwrite
+    # over an already-annotated file), so the concat below can't collide.
+    drop = [c for c, arr in [(rl_col, z_arr), (ba_col, ba_arr)] if arr is not None and c in ds.column_names]
+    if drop:
+        ds = ds.remove_columns(drop)
+    # Build the new columns as a separate Dataset with explicit feature types
+    # (from_dict honours Array3D/Sequence; add_column/pyarrow cannot encode >1-D
+    # arrays), then glue them on by columns.
+    extra, feats = {}, {}
+    if z_arr is not None:
+        if len(z_arr) != n:
+            raise RuntimeError(f"{path}: {len(z_arr)} rl_tokens != {n} rows (alignment).")
+        extra[rl_col] = list(z_arr)
+        feats[rl_col] = datasets.Sequence(length=z_arr.shape[1], feature=datasets.Value("float32"))
+    if ba_arr is not None:
+        if len(ba_arr) != n:
+            raise RuntimeError(f"{path}: {len(ba_arr)} base_actions != {n} rows (alignment).")
+        extra[ba_col] = list(ba_arr)
+        feats[ba_col] = datasets.Array3D(shape=ba_arr.shape[1:], dtype="float16")
+    new_cols = datasets.Dataset.from_dict(extra, features=datasets.Features(feats))
+    merged = datasets.concatenate_datasets([ds, new_cols], axis=1)
+    tmp = path.with_name(path.name + ".tmp")
+    merged.to_parquet(str(tmp))
+    os.replace(tmp, path)
+
+
+def _register_features(out: pathlib.Path, args, config, data_config):
+    """Write the rl_token / base_action feature entries into meta/info.json.
+
+    Dims come from the config (no GPU / parquet read needed), so this can run as a
+    cheap final step after all shards finish.
+    """
     info = json.loads((out / "meta" / "info.json").read_text())
-    tmpl = info["data_path"]            # data/chunk-{episode_chunk}/episode_{episode_index}.parquet
-    chunks_size = info["chunks_size"]
-    n_episodes = info["total_episodes"]
-    paths = [
-        out / tmpl.format(episode_chunk=ep // chunks_size, episode_index=ep)
-        for ep in range(n_episodes)
-    ]
-    return info, paths
+    if args.rl_tokens:
+        token_dim = int(config.model.rlt_token_dim)
+        info["features"][args.column_name] = {"dtype": "float32", "shape": [token_dim], "names": None}
+    if args.base_actions:
+        # raw action dim recovered by running the decoder on a dummy (yam → 14).
+        decode = _build_action_decoder(data_config)
+        raw_dim = int(decode(np.zeros((1, 1, 1, config.model.action_dim), np.float32),
+                             np.zeros((1, config.model.action_dim), np.float32)).shape[-1])
+        shape = [int(args.num_action_samples), int(config.model.action_horizon), raw_dim]
+        info["features"][args.base_action_column] = {"dtype": "float16", "shape": shape, "names": None}
+    (out / "meta" / "info.json").write_text(json.dumps(info, indent=4))
+    return info
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config-name", required=True, help="RLT TrainConfig name (e.g. pi05_seal-water-bottle-cap_rlt).")
+    p.add_argument("--config-name", required=True, help="RLT TrainConfig name (e.g. pi05_insert-mouse-battery_rlt).")
     p.add_argument("--checkpoint", required=True, help="Trained RLT checkpoint step dir (contains params/).")
-    p.add_argument("--output", default=None, help="Destination dataset root (omit when --in-place).")
-    p.add_argument("--in-place", action="store_true", help="Edit the source dataset directly (no copy).")
+    p.add_argument("--output", default=None, help="Destination dataset root to COPY to (single-process).")
+    p.add_argument("--in-place", action="store_true", help="Edit the source (local_files_path) directly.")
+    p.add_argument("--dataset-root", default=None,
+                   help="Operate in-place on this dataset dir (read + write). Use for sharded multi-GPU "
+                        "runs on a pre-copied dataset; overrides --output/--in-place.")
+    # sharding (DDP-style data parallel: one process per GPU over disjoint data files)
+    p.add_argument("--num-shards", type=int, default=1, help="Total number of parallel processes.")
+    p.add_argument("--shard-index", type=int, default=0, help="This process's shard id in [0, num-shards).")
+    p.add_argument("--register-features-only", action="store_true",
+                   help="Just register rl_token/base_action in meta/info.json and exit (run once after all shards).")
     # what to compute
     p.add_argument("--rl-tokens", action="store_true", default=True, help="Compute the rl_token column.")
     p.add_argument("--no-rl-tokens", dest="rl_tokens", action="store_false")
@@ -98,7 +223,8 @@ def main():
     p.add_argument("--no-base-actions", dest="base_actions", action="store_false")
     # params
     p.add_argument("--column-name", default="rl_token", help="Parquet column name for the RL token.")
-    p.add_argument("--num-action-samples", type=int, default=64, help="Base action chunks sampled per frame (N).")
+    p.add_argument("--base-action-column", default="base_action", help="Parquet column name for base action chunks.")
+    p.add_argument("--num-action-samples", type=int, default=32, help="Base action chunks sampled per frame (N).")
     p.add_argument("--num-flow-steps", type=int, default=10, help="Flow-matching denoising steps for sampling.")
     p.add_argument("--batch-size", type=int, default=8, help="Frames per batch (effective action batch = B·N).")
     p.add_argument("--num-workers", type=int, default=8)
@@ -108,131 +234,122 @@ def main():
 
     if not args.rl_tokens and not args.base_actions:
         raise ValueError("Nothing to do: both --no-rl-tokens and --no-base-actions set.")
+    if not (0 <= args.shard_index < args.num_shards):
+        raise ValueError(f"--shard-index {args.shard_index} out of range for --num-shards {args.num_shards}.")
 
     config = _config.get_config(args.config_name)
+    data_config = _make_data_config(config, args.dataset_root)
+
+    # ── register-only: cheap metadata step (no model / GPU) ───────────────────
+    if args.register_features_only:
+        out = pathlib.Path(args.dataset_root).resolve() if args.dataset_root else pathlib.Path(
+            data_config.local_files_path).resolve()
+        _register_features(out, args, config, data_config)
+        print(f"Registered features in {out}/meta/info.json")
+        return
+
     checkpoint = pathlib.Path(args.checkpoint).resolve()
     if not (checkpoint / "params").exists():
         raise FileNotFoundError(f"{checkpoint}/params not found — pass the checkpoint STEP dir.")
 
-    # ── Dataset + model ───────────────────────────────────────────────────────
-    dataset, data_config = _build_dataset(config)
-    n_frames = len(dataset)
-    print(f"Dataset: {data_config.repo_id} | frames: {n_frames} | root: {data_config.local_files_path}")
-
-    model = _load_model(config, checkpoint)
-    N, S = args.num_action_samples, args.num_flow_steps
-    extract_token = nnx.jit(lambda m, obs: m.extract_rl_token(obs))
-    sample_actions = nnx.jit(lambda m, rng, obs: m.sample_base_actions(rng, obs, num_samples=N, num_steps=S))
-
-    # ── Resolve write target (source parquets live in local_files_path) ───────
-    src = pathlib.Path(data_config.local_files_path).resolve()
-    if args.in_place:
-        out = src
+    # ── Resolve read/write root ───────────────────────────────────────────────
+    if args.dataset_root:
+        out = pathlib.Path(args.dataset_root).resolve()   # read + write in-place here
+        print(f"Shard {args.shard_index}/{args.num_shards}: in-place on {out}")
+    elif args.in_place:
+        out = pathlib.Path(data_config.local_files_path).resolve()
         print(f"In-place: editing {out}")
     else:
         if not args.output:
-            raise ValueError("--output is required unless --in-place is set.")
+            raise ValueError("Provide one of --dataset-root, --in-place, or --output.")
         out = pathlib.Path(args.output).resolve()
         if out.exists():
             if not args.overwrite:
                 raise FileExistsError(f"{out} exists. Pass --overwrite.")
             shutil.rmtree(out)
-        print(f"Copying full dataset {src} → {out}")
-        shutil.copytree(src, out)
+        print(f"Copying full dataset {data_config.local_files_path} → {out}")
+        shutil.copytree(data_config.local_files_path, out)
 
-    # ── Episode boundaries (frame order == episode concatenation order) ───────
-    info, ep_paths = _episode_paths(out)
-    lengths = [len(pd.read_parquet(pth, columns=[])) for pth in ep_paths]
-    total = int(np.sum(lengths))
-    if total != n_frames:
+    # ── Dataset + model ───────────────────────────────────────────────────────
+    dataset = _build_dataset(config, data_config)
+    n_frames = len(dataset)
+    data_paths, data_rows, offsets = _data_files(out)
+    if int(np.sum(data_rows)) != n_frames:
         raise RuntimeError(
-            f"Sum of episode lengths ({total}) != dataset frame count ({n_frames}). "
-            "Global frame ordering does not match the per-episode parquets; aborting to avoid misalignment."
+            f"Frame-count mismatch: sum(data-file rows)={int(np.sum(data_rows))} != dataset frames={n_frames}. "
+            "Global ordering would be misaligned; aborting."
         )
+    info = json.loads((out / "meta" / "info.json").read_text())
+    if not args.overwrite and args.num_shards == 1:
+        if args.rl_tokens and args.column_name in info["features"]:
+            raise FileExistsError(f"'{args.column_name}' already in features. Pass --overwrite.")
+        if args.base_actions and args.base_action_column in info["features"]:
+            raise FileExistsError(f"'{args.base_action_column}' already in features. Pass --overwrite.")
 
-    base_dir = out / "base_actions"
-    if args.base_actions:
-        base_dir.mkdir(exist_ok=True)
+    model = _load_model(config, checkpoint)
+    N, S = args.num_action_samples, args.num_flow_steps
+    extract_token = nnx.jit(lambda m, obs: m.extract_rl_token(obs))
+    sample_actions = nnx.jit(lambda m, rng, obs: m.sample_base_actions(rng, obs, num_samples=N, num_steps=S))
+    to_raw_actions = _build_action_decoder(data_config) if args.base_actions else None
+    base_rng = jax.random.key(args.seed)
 
-    # ── Per-episode streaming flush (bounded memory) ──────────────────────────
-    token_dim = {"val": None}
+    # ── This shard's data files (round-robin keeps sizes balanced) ────────────
+    my_files = [k for k in range(len(data_paths)) if k % args.num_shards == args.shard_index]
+    print(f"Shard handles {len(my_files)}/{len(data_paths)} data files: {my_files}")
 
-    def flush(ep: int, buf_z: list, buf_a: list):
-        if args.rl_tokens:
-            df = pd.read_parquet(ep_paths[ep])
-            z_ep = np.asarray(buf_z, dtype=np.float32)               # [ep_len, D]
-            df[args.column_name] = list(z_ep)
-            df.to_parquet(ep_paths[ep])
-            token_dim["val"] = z_ep.shape[1]
-        if args.base_actions:
-            a_ep = np.asarray(buf_a, dtype=np.float16)               # [ep_len, N, H, D]
-            np.save(base_dir / f"episode_{ep:06d}.npy", a_ep)
-
-    # ── Ordered single pass ───────────────────────────────────────────────────
     import torch  # local import (only needed here)
 
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,       # global frame order == parquet concatenation order
-        drop_last=False,     # cover EVERY frame (training loader drops the tail!)
-        num_workers=args.num_workers,
-        collate_fn=_collate_fn,
-        persistent_workers=args.num_workers > 0,
-    )
+    def _file_done(path):
+        import pyarrow.parquet as pq
+        # schema_arrow gives the logical top-level names (rl_token/base_action);
+        # the low-level .schema.names reports list-leaf names ("element").
+        cols = set(pq.ParquetFile(path).schema_arrow.names)
+        need = ([args.column_name] if args.rl_tokens else []) + (
+            [args.base_action_column] if args.base_actions else [])
+        return all(c in cols for c in need)
 
-    rng = jax.random.key(args.seed)
-    cur_ep, filled = 0, 0
-    buf_z: list = []
-    buf_a: list = []
-    n_batches = (n_frames + args.batch_size - 1) // args.batch_size
-    desc = "rl_token + base_actions" if (args.rl_tokens and args.base_actions) else (
-        "rl_token" if args.rl_tokens else "base_actions")
-    for step, batch in enumerate(tqdm.tqdm(loader, total=n_batches, desc=desc)):
-        obs = _model.Observation.from_dict(batch)
-        B = int(obs.state.shape[0])
-        z = np.asarray(jax.device_get(extract_token(model, obs)), np.float32) if args.rl_tokens else None
-        if args.base_actions:
-            batch_rng = jax.random.fold_in(rng, step)
-            a = np.asarray(jax.device_get(sample_actions(model, batch_rng, obs)), np.float16)  # [B,N,H,D]
-        else:
-            a = None
-        for i in range(B):
+    def process_file(k):
+        # Resume: a written file already carries the columns (atomic replace → no
+        # partial state), so skip it unless --overwrite.
+        if not args.overwrite and _file_done(data_paths[k]):
+            print(f"file{k}: already annotated, skipping (resume).")
+            return
+        rows = data_rows[k]
+        g0 = offsets[k]
+        sub = torch.utils.data.Subset(dataset, range(g0, g0 + rows))
+        loader = torch.utils.data.DataLoader(
+            sub, batch_size=args.batch_size, shuffle=False, drop_last=False,
+            num_workers=args.num_workers, collate_fn=_collate_fn,
+            persistent_workers=args.num_workers > 0,
+        )
+        buf_z, buf_a = [], []
+        file_rng = jax.random.fold_in(base_rng, k)
+        n_batches = (rows + args.batch_size - 1) // args.batch_size
+        for step, batch in enumerate(tqdm.tqdm(loader, total=n_batches, desc=f"file{k}")):
+            obs = _model.Observation.from_dict(batch)
             if args.rl_tokens:
-                buf_z.append(z[i])
+                z = np.asarray(jax.device_get(extract_token(model, obs)), np.float32)
+                buf_z.extend(z)
             if args.base_actions:
-                buf_a.append(a[i])
-            filled += 1
-            if filled == lengths[cur_ep]:
-                flush(cur_ep, buf_z, buf_a)
-                cur_ep += 1
-                filled = 0
-                buf_z, buf_a = [], []
-    assert cur_ep == len(ep_paths) and filled == 0, f"stream ended mid-episode (ep {cur_ep}, filled {filled})"
+                a = np.asarray(jax.device_get(
+                    sample_actions(model, jax.random.fold_in(file_rng, step), obs)), np.float32)  # [B,N,H,Dm]
+                a = to_raw_actions(a, np.asarray(obs.state)).astype(np.float16)                   # [B,N,H,14]
+                buf_a.extend(a)
+        z_arr = np.stack(buf_z, axis=0) if args.rl_tokens else None
+        ba_arr = np.stack(buf_a, axis=0) if args.base_actions else None
+        if z_arr is not None and len(z_arr) != rows:
+            raise RuntimeError(f"file{k}: got {len(z_arr)} rows, expected {rows}.")
+        _write_data_file(data_paths[k], args.column_name, z_arr, args.base_action_column, ba_arr)
 
-    # ── Register metadata in info.json ────────────────────────────────────────
-    if args.rl_tokens:
-        info["features"][args.column_name] = {"dtype": "float32", "shape": [token_dim["val"]], "names": None}
-    if args.base_actions:
-        # Sidecar (not a parquet feature): row r of episode_{ep}.npy is frame r's
-        # [N, H, D] base-action chunks in normalized model space.
-        info["base_actions"] = {
-            "path": "base_actions/episode_{episode_index:06d}.npy",
-            "num_samples": N,
-            "action_horizon": int(config.model.action_horizon),
-            "action_dim": int(config.model.action_dim),
-            "dtype": "float16",
-            "space": "normalized_model",
-            "num_flow_steps": S,
-        }
-    (out / "meta" / "info.json").write_text(json.dumps(info, indent=4))
+    for k in my_files:
+        process_file(k)
 
-    msg = []
-    if args.rl_tokens:
-        msg.append(f"'{args.column_name}' (dim {token_dim['val']}) → parquets")
-    if args.base_actions:
-        msg.append(f"base_actions [N={N}, H={config.model.action_horizon}, D={config.model.action_dim}] fp16 → {base_dir}")
-    print(f"Done @ {out}: " + " ; ".join(msg) + f" for {len(ep_paths)} episodes.")
+    # ── Register features (single-process only; for shards run --register-features-only after wait) ──
+    if args.num_shards == 1:
+        _register_features(out, args, config, data_config)
+
+    done = [c for c, on in [(args.column_name, args.rl_tokens), (args.base_action_column, args.base_actions)] if on]
+    print(f"Shard {args.shard_index}/{args.num_shards} done @ {out}: wrote {done} for files {my_files}.")
 
 
 if __name__ == "__main__":
