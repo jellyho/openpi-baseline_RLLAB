@@ -1,0 +1,43 @@
+{
+  "_comment": "AQC sweep config. 'fixed' = held constant; 'sweep' = grid dims; 'envs' = per-env settings. Regression ignores num_atoms/v_min/v_max (those apply to distributional only).",
+  "fixed": {
+    "agent": "agents/aqc.py",
+    "use_target_critic": false,
+    "num_action_samples": 4,
+    "discount": 0.99,
+    "offline_steps": 500000,
+    "online_steps": 0,
+    "eval_interval": 50000,
+    "eval_episodes": 30,
+    "video_episodes": 0,
+    "save_interval": 0,
+    "wandb_entity": "gwanwoo-yonsei-university",
+    "wandb_project": "AQC",
+    "support_type": "data"
+  },
+  "sweep": {
+    "critic_type": [
+      "regression",
+      "distributional"
+    ],
+    "num_atoms": [
+      101,
+      201
+    ],
+    "horizon_length": [
+      3,
+      5
+    ],
+    "seed": [
+      0,
+      1
+    ]
+  },
+  "envs": {
+    "cube-double-play-singletask-task1-v0": {
+      "sparse": true,
+      "v_min": -100,
+      "v_max": 0
+    }
+  }
+}

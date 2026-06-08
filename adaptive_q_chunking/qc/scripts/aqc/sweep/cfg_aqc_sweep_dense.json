@@ -1,0 +1,44 @@
+{
+  "_comment": "Dense (sparse:false) cube-double sweep. Reward in {-2,-1,0} -> discounted returns ~[-200,0] (gamma=0.99), so v_min=-220. video_episodes=1 logs eval/video + eval/aqc_video per config.",
+  "fixed": {
+    "agent": "agents/aqc.py",
+    "tag": "dense",
+    "use_target_critic": false,
+    "num_action_samples": 4,
+    "discount": 0.99,
+    "offline_steps": 500000,
+    "online_steps": 0,
+    "eval_interval": 50000,
+    "eval_episodes": 30,
+    "video_episodes": 1,
+    "save_interval": 0,
+    "wandb_entity": "gwanwoo-yonsei-university",
+    "wandb_project": "AQC",
+    "support_type": "data"
+  },
+  "sweep": {
+    "critic_type": [
+      "regression",
+      "distributional"
+    ],
+    "num_atoms": [
+      101,
+      201
+    ],
+    "horizon_length": [
+      3,
+      5
+    ],
+    "seed": [
+      0,
+      1
+    ]
+  },
+  "envs": {
+    "cube-double-play-singletask-task1-v0": {
+      "sparse": false,
+      "v_min": -220,
+      "v_max": 0
+    }
+  }
+}

@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AQC (ACSAC) · Implementation Reading Guide</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#161a23; --panel2:#1b2030; --ink:#e6e9ef; --muted:#9aa4b8;
+    --accent:#5eead4; --accent2:#818cf8; --line:#262c3a; --code:#0c0e14;
+    --kr:#3b2f10; --kr-bd:#b08900; --tap:#0e2b25; --tap-bd:#2dd4bf;
+    --warn:#3a1d1d; --warn-bd:#f87171; --note:#15233a; --note-bd:#60a5fa;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",Helvetica,Arial,sans-serif;}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:var(--code);color:#cbd5e1;padding:1px 5px;border-radius:4px;font-size:.86em;border:1px solid #1f2533}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;
+    font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.55}
+  pre code{background:none;border:none;padding:0}
+  .layout{display:flex;max-width:1400px;margin:0 auto}
+  nav.side{position:sticky;top:0;align-self:flex-start;height:100vh;width:300px;min-width:300px;
+    overflow-y:auto;padding:18px 14px 60px;border-right:1px solid var(--line);background:var(--panel)}
+  nav.side h1{font-size:15px;margin:4px 8px 4px;color:var(--accent)}
+  nav.side .sub{font-size:12px;color:var(--muted);margin:0 8px 12px}
+  nav.side input{width:100%;padding:8px 10px;margin:0 0 12px;border-radius:8px;border:1px solid var(--line);
+    background:var(--code);color:var(--ink);font-size:13px}
+  nav.side a{display:block;color:var(--muted);padding:4px 8px;border-radius:6px;font-size:13px}
+  nav.side a:hover{background:var(--panel2);color:var(--ink);text-decoration:none}
+  nav.side a.h2{padding-left:18px;font-size:12.5px}
+  nav.side a.active{color:var(--accent);background:var(--panel2)}
+  nav.side .grp{margin:10px 8px 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#6b7488}
+  main{flex:1;min-width:0;padding:30px 42px 120px;max-width:1040px}
+  h2.sec{font-size:25px;margin:46px 0 6px;padding-top:14px;border-top:1px solid var(--line);color:#fff}
+  h2.sec:first-of-type{border-top:none;margin-top:6px}
+  h3{font-size:19px;margin:30px 0 6px;color:var(--accent)}
+  h4{font-size:15.5px;margin:20px 0 4px;color:var(--accent2)}
+  .file{font-family:"JetBrains Mono",monospace;font-size:13px;color:#fbbf24}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 8px 0;padding-left:22px}
+  li{margin:3px 0}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#fff}
+  td code{font-size:.82em}
+  tr:nth-child(even) td{background:#12151d}
+  .box{border-radius:10px;padding:12px 16px;margin:14px 0;border-left:4px solid}
+  .kr{background:var(--kr);border-color:var(--kr-bd)}
+  .kr::before{content:"🇰🇷  한국어 설명";display:block;font-weight:700;color:#ffd966;margin-bottom:4px;font-size:13px}
+  .tap{background:var(--tap);border-color:var(--tap-bd)}
+  .tap::before{content:"🎯  Paper ↔ code";display:block;font-weight:700;color:var(--accent);margin-bottom:4px;font-size:13px}
+  .warn{background:var(--warn);border-color:var(--warn-bd)}
+  .warn::before{content:"⚠️  Gotcha";display:block;font-weight:700;color:#fca5a5;margin-bottom:4px;font-size:13px}
+  .note{background:var(--note);border-color:var(--note-bd)}
+  .note::before{content:"ℹ️  Note";display:block;font-weight:700;color:#93c5fd;margin-bottom:4px;font-size:13px}
+  .box p{margin:5px 0}
+  .pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;
+    padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}
+  .lead{font-size:16px;color:var(--muted)}
+  .toc-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:14px 0}
+  hr{border:none;border-top:1px solid var(--line);margin:20px 0}
+  .small{font-size:12.5px;color:var(--muted)}
+  .kbd{font-family:monospace;background:#0c0e14;border:1px solid #2b3346;border-bottom-width:2px;border-radius:5px;padding:1px 6px;font-size:12px}
+  .flow pre{background:#0a0c12}
+  .tag{font-size:11px;padding:1px 7px;border-radius:5px;font-weight:600}
+  .tag.jax{background:#1e3a34;color:#5eead4}
+  .tag.pt{background:#3a1e2e;color:#fda4af}
+  .tag.cfg{background:#26304a;color:#a5b4fc}
+  .anchor{scroll-margin-top:20px}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin:10px 0}
+  summary{cursor:pointer;color:var(--accent2);font-weight:600}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:1000px){.twocol{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <h1>AQC · code ↔ paper</h1>
+  <div class="sub">Adaptive Q-Chunking (ACSAC) — reading companion</div>
+  <input id="filter" placeholder="filter sections…" oninput="filterNav()">
+
+  <div class="grp">Start here</div>
+  <a href="#howto">§0 · How to use this guide</a>
+  <a href="#bigpicture">§1 · The big picture</a>
+  <a href="#concepts">§2 · Concept primer</a>
+
+  <div class="grp">Map</div>
+  <a href="#map">§3 · Paper ↔ file map</a>
+  <a href="#diagram">§4 · The central diagram ★</a>
+
+  <div class="grp">Critic (the heart)</div>
+  <a href="#transformer" class="h2">Causal prefix critic ★</a>
+  <a href="#criticloss" class="h2">Multi-step TD loss ★</a>
+  <a href="#target" class="h2">Expected-prefix-max target ★</a>
+
+  <div class="grp">Policy &amp; data</div>
+  <a href="#actor" class="h2">Flow-BC actor</a>
+  <a href="#extract" class="h2">Adaptive extraction ★</a>
+  <a href="#dataset" class="h2">Chunked dataset</a>
+
+  <div class="grp">Run &amp; see</div>
+  <a href="#eval" class="h2">Eval &amp; replanning</a>
+  <a href="#viz" class="h2">Diagnostic video</a>
+  <a href="#mainloop" class="h2">Training loop</a>
+
+  <div class="grp">Reference</div>
+  <a href="#cheatsheet">§5 · Cheat-sheet</a>
+  <a href="#review">§6 · Review checklist ★</a>
+  <a href="#glossary">§7 · Glossary</a>
+</nav>
+<main>
+
+<!-- ============================================================ §0 -->
+<section id="howto" class="anchor">
+<h2 class="sec">§0 · How to use this guide</h2>
+<p class="lead">This is a <b>reading companion for the AQC (Adaptive Q-Chunking) critic</b> we added to the
+QC codebase, written to be read with one goal in mind: <b>review the implementation and convince yourself
+it faithfully matches the ACSAC paper</b> (<span class="file">acsac.pdf</span>), then extend or run it.</p>
+
+<div class="toc-card">
+<b>Recommended reading order</b> (don't skip §2 or §4):
+<ol>
+<li><a href="#bigpicture">§1 big picture</a> — what AQC is and the one-line difference from QC.</li>
+<li><a href="#concepts">§2 concept primer</a> — 6 ideas you need before opening any file.</li>
+<li><a href="#diagram">§4 the central diagram ★</a> — read it <b>twice</b>; everything else hangs off it.</li>
+<li><a href="#transformer">Causal prefix critic ★</a> → <a href="#criticloss">TD loss ★</a> → <a href="#target">target ★</a> — the critic, in dependency order.</li>
+<li><a href="#extract">Adaptive extraction ★</a> — how the chunk size becomes state-dependent.</li>
+<li><a href="#review">§6 review checklist ★</a> — the 10 paper↔code claims to verify, each with line + equation.</li>
+</ol>
+</div>
+
+<p><b>Marker legend.</b>
+<span class="pill">★ = highest priority, open first</span>
+<span class="pill"><span class="tag jax">code</span> our JAX/Flax code</span>
+<span class="pill"><span class="tag pt">paper</span> ACSAC §/Eq./Fig.</span>
+<span class="pill"><span class="tag cfg">config</span> a tunable flag</span>
+Filenames look like <span class="file">agents/aqc.py</span>; citations look like <code>aqc.py:98</code> (code) or <code>Eq. 6</code> / <code>§4.2</code> (paper).</p>
+
+<div class="box kr">
+이 문서는 ACSAC 논문을 우리 QC 코드베이스 위에 구현한 <b>AQC critic</b>을 빠르게 이해하고,
+<b>구현이 논문과 일치하는지 검토</b>하기 위한 동반 문서입니다. 모든 핵심 개념마다 코드 위치(<code>파일:줄</code>)와
+논문 위치(<code>Eq./§/Fig.</code>)를 같이 표기했습니다. §4의 중심 다이어그램을 <b>두 번</b> 읽고,
+마지막 §6의 검토 체크리스트로 충실도(faithfulness)를 직접 확인하세요.
+</div>
+<p class="small">References point at the source as of writing — re-check line numbers against the files if they drift after edits.</p>
+</section>
+
+<!-- ============================================================ §1 -->
+<section id="bigpicture" class="anchor">
+<h2 class="sec">§1 · The big picture</h2>
+<p class="lead">QC trains a <b>fixed-size</b> chunked critic and always executes <code>H</code> actions before
+replanning. AQC learns a critic that scores <b>every prefix</b> of a chunk at once and lets the
+<b>execution horizon become state-dependent</b>.</p>
+
+<p>Action chunking gives multi-step value backups without the off-policy bias of n-step returns, because the
+critic conditions on the exact executed sequence (<span class="tag pt">paper</span> §3, Eq. 2). But a single
+fixed <code>H</code> forces one global trade-off between <b>reactivity</b> (short chunks, replan often) and
+<b>temporal coherence</b> (long chunks, fast backups). The optimal trade-off is state-dependent — long on a
+straight route, short near a turn (<span class="tag pt">paper</span> Fig. 1).</p>
+
+<p>ACSAC makes the horizon adaptive with three moving parts, all of which exist in our code:</p>
+<table>
+<tr><th>Part</th><th>What it does</th><th>Code</th><th>Paper</th></tr>
+<tr><td><b>Causal Transformer critic</b></td><td>emits <code>Q(s,a₁:ₕ)</code> for all <code>h=1…H</code> in one pass, on a shared return scale</td><td><span class="file">utils/transformer.py</span></td><td>§4.1</td></tr>
+<tr><td><b>Per-horizon TD loss</b></td><td>regresses each prefix to its own h-step target, gradient-averaged</td><td><span class="file">agents/aqc.py</span> <code>:98</code></td><td>Eq. 5–6</td></tr>
+<tr><td><b>Joint (n,h) extraction</b></td><td>picks the best (candidate, prefix length) and executes that prefix</td><td><span class="file">agents/aqc.py</span> <code>:214</code></td><td>Eq. 8</td></tr>
+</table>
+
+<div class="box kr">
+<b>한 문장 요약:</b> AQC는 인과적(causal) Transformer critic으로 한 chunk의 <b>모든 prefix</b>
+<code>Q(s,a₁:ₕ)</code>를 한 번에 평가하고, 매 replan 시점마다 그 값이 가장 큰 prefix 길이 <code>h*</code>를
+골라 실행합니다. 즉 chunk 크기가 <b>상태에 따라 가변</b>이 됩니다. QC는 <code>H</code>로 고정.
+</div>
+<div class="box tap">
+The whole guide is organized so you can verify one claim: <b>"this code = ACSAC."</b> Each unit below ends
+with a Paper↔code box naming the exact equation/section it implements and what to spot-check. The condensed
+verification list is <a href="#review">§6</a>.
+</div>
+</section>
+
+<!-- ============================================================ §2 -->
+<section id="concepts" class="anchor">
+<h2 class="sec">§2 · Concept primer</h2>
+<p class="lead">Six ideas to hold in your head before reading any file.</p>
+
+<h3>2.1 · Action chunk &amp; prefix</h3>
+<p>A length-<code>H</code> <b>chunk</b> is <code>a_{t:t+H} = (a_t,…,a_{t+H-1})</code>. Its length-<code>h</code>
+<b>prefix</b> is the first <code>h</code> actions <code>a_{t:t+h}</code>. AQC reasons about <i>all</i> prefixes
+of one chunk (<span class="tag pt">paper</span> §4, first paragraph).</p>
+
+<h3>2.2 · Prefix-conditioned Q &amp; cross-horizon comparability</h3>
+<p><code>Q(s, a_{t:t+h})</code> is the value of executing exactly <code>h</code> actions open-loop, then following
+the policy. ACSAC defines it as <code>Q(s,a_{1:h}) = r^h_t + γ^h V(s_{t+h})</code> (<span class="tag pt">paper</span>
+Eq. 14) — so for every <code>h</code> it is "total discounted return from <code>s_t</code>". Same unit ⇒ the values
+are <b>comparable across <code>h</code></b>, which is what makes a joint arg-max over prefix lengths meaningful
+(<span class="tag pt">paper</span> Thm G.9).</p>
+<div class="box kr">
+서로 다른 prefix 길이 <code>h</code>의 Q값들이 모두 "<code>s_t</code>에서의 총 할인 누적 보상"이라는
+<b>같은 단위</b>를 갖기 때문에 직접 비교(arg-max)가 가능합니다. 이게 ACSAC의 핵심 전제입니다.
+</div>
+
+<h3>2.3 · Prefix consistency (why a Transformer, not an MLP)</h3>
+<p>The <code>h</code>-th output must depend only on <code>(s, a_{1:h})</code> and <b>not</b> on the future actions
+<code>a_{h:H}</code>. A causal mask guarantees this by construction (<span class="tag pt">paper</span> Prop G.7).
+An MLP fed a truncated chunk would leak the suffix and is <i>not</i> guaranteed consistent (<span class="tag pt">paper</span>
+Remark G.8). We verified our critic is prefix-consistent to bit-exactness (<a href="#review">§6 #1</a>).</p>
+
+<h3>2.4 · Expected-prefix-max bootstrap (a generalized EMaQ)</h3>
+<p>The bootstrap value at a next state samples <code>N</code> chunks from the BC policy and maxes over <i>all</i>
+<code>N×H</code> prefixes: <code>V*(s') = max_{n,k} min_K Q(s', ã^(n)_{1:k})</code> (<span class="tag pt">paper</span>
+Eq. 19). With <code>H=1</code> this is exactly EMaQ. This operator is a γ-contraction whose fixed point is the
+adaptive policy's value (<span class="tag pt">paper</span> Thm G.13/G.15).</p>
+
+<h3>2.5 · Rejection sampling extraction (best-of-N over two axes)</h3>
+<p>The policy is the frozen flow-BC policy filtered by the critic. QC does best-of-<code>N</code> over candidate
+<i>chunks</i>; AQC does best-of-<code>N×H</code> over (candidate, prefix length) and executes the winning prefix
+(<span class="tag pt">paper</span> Eq. 8, Fig. 2). No behavior-reg coefficient to tune.</p>
+
+<h3>2.6 · Gradient-level loss averaging</h3>
+<p>The <code>H</code> per-horizon squared errors are averaged <b>at the gradient level</b> (one loss = mean over
+<code>h</code>), not by averaging the targets. This reduces variance while preserving sparse-reward signal in each
+target (<span class="tag pt">paper</span> §G.5, Remark G.20).</p>
+<div class="box warn">
+"Average the <b>losses</b>, not the <b>targets</b>." Averaging targets would collapse the per-horizon signals
+and dilute sparse rewards. Our loss does the right thing at <code>aqc.py:123</code> — a single
+<code>.mean()</code> over the <code>(K,B,H)</code> error tensor.
+</div>
+</section>
+
+<!-- ============================================================ §3 -->
+<section id="map" class="anchor">
+<h2 class="sec">§3 · Paper ↔ file map</h2>
+<p class="lead">Where each piece of ACSAC lives in the tree. ★ marks the files to open first.</p>
+
+<h4>New files (the AQC implementation)</h4>
+<pre><code>adaptive_q_chunking/
+├── acsac.pdf                      the paper
+├── implementation_plan.html       as-designed plan (design decisions DD-1..4, risks)
+└── qc/
+    ├── utils/transformer.py   ★   CausalPrefixCritic + PrefixValue        §4.1, Prop G.7
+    ├── agents/aqc.py          ★   AQCAgent: losses, target, extraction     §4.2/4.3, Eq.5-8,19
+    ├── utils/aqc_viz.py            diagnostic rollout video                  Fig.3/Fig.4 (qualitative)
+    ├── agents/__init__.py          registers  aqc=AQCAgent
+    ├── evaluation.py        (mod)  adaptive (chunk,h*) rollout + chunk-size stats
+    ├── main.py              (mod)  wandb entity/project, video, aqc video hook
+    ├── AQC.md                      how AQC differs from QC, run/eval guide
+    └── scripts/aqc/*.sh            offline / o2o / smoke / sbatch launchers</code></pre>
+
+<h4>Reused from QC unchanged</h4>
+<table>
+<tr><th>File</th><th>Provides</th><th>Paper</th></tr>
+<tr><td><span class="file">utils/networks.py</span> <code>ActorVectorField</code></td><td>flow-BC velocity field + <code>ensemblize</code></td><td>Eq. 7</td></tr>
+<tr><td><span class="file">utils/datasets.py</span> <code>sample_sequence</code></td><td>chunked transitions: per-step cumulative reward, all next-states, <code>valid</code></td><td>feeds Eq. 6</td></tr>
+<tr><td><span class="file">utils/flax_utils.py</span></td><td><code>ModuleDict</code>, <code>TrainState</code></td><td>—</td></tr>
+<tr><td><span class="file">envs/ogbench_utils.py</span></td><td>OGBench env + dataset loading</td><td>§5.1, App E</td></tr>
+</table>
+
+<h4>Paper-at-a-glance</h4>
+<table>
+<tr><th>§ / Eq. / Fig.</th><th>Content</th><th>Implemented in</th></tr>
+<tr><td>§4.1</td><td>causal Transformer critic, prefix outputs</td><td><span class="file">transformer.py</span></td></tr>
+<tr><td>Eq. 5 / Eq. 6</td><td>per-horizon target / multi-step TD loss</td><td><span class="file">aqc.py</span> <code>:117 / :123</code></td></tr>
+<tr><td>Eq. 7</td><td>flow-BC matching loss on full chunks</td><td><span class="file">aqc.py</span> <code>:135</code></td></tr>
+<tr><td>Eq. 8</td><td>joint (n,h) arg-max extraction</td><td><span class="file">aqc.py</span> <code>:214</code></td></tr>
+<tr><td>Eq. 19 / Def G.11</td><td>expected-prefix-max bootstrap</td><td><span class="file">aqc.py</span> <code>:68</code></td></tr>
+<tr><td>App B</td><td>impl details (Pre-LN, min, online-critic target)</td><td><span class="file">transformer.py</span>, <span class="file">aqc.py</span></td></tr>
+<tr><td>Table 2 / 3</td><td>hyperparameters (H=5, N=4/8, n_layer=2…)</td><td><span class="file">aqc.py</span> <code>get_config():384</code></td></tr>
+<tr><td>Fig. 3</td><td>chunk-size distribution over a rollout</td><td><span class="file">aqc_viz.py</span> + <code>eval/chunk_len_mean</code></td></tr>
+</table>
+</section>
+
+<!-- ============================================================ §4 -->
+<section id="diagram" class="anchor">
+<h2 class="sec">§4 · The central diagram ★ <span class="small">(read this twice)</span></h2>
+<p class="lead">One training step (prediction + expected-prefix-max target) and the deployment/bootstrap extraction.
+If you understand this picture, the per-unit sections are just zoom-ins.</p>
+
+<div class="flow">
+<pre><code>┌───────────────────────────────  ONE  TRAINING  STEP  ( aqc.py: total_loss :163 )  ───────────────────────────────┐
+│                                                                                                                  │
+│  dataset chunk            ── PREDICTION (one forward pass) ──            ── TARGET  G_h  (expected-prefix-max) ── │
+│  sample_sequence          ┌───────────────────────────┐                 for each next state s_{t+h}, h=1..H:     │
+│  datasets.py:92           │  Causal Transformer Q_φ    │                 ┌──────────────────────────────────────┐│
+│   s_t                     │  transformer.py:38         │   Q_φ(s_t,a_{1:h})  │ z~N(0,I) → flow-BC π_θ → N chunks  ││
+│   a_{t:t+H}        ──────▶│  tokens [s|a₁|…|a_H]       │── (K,B,H) ─┐    │ Q_φ → (K,N,H) → min_K → max_{n,k}     ││
+│   r^{1..H}  (cum.γ)       │  causal mask  :90          │            │    │   = V*(s_{t+h})   aqc.py:68          ││
+│   s_{t+1..t+H}            │  read head @ action tok p  │            │    └──────────────────────────────────────┘│
+│   masks, valid            │   → Q(s,a_{1:p})  :114     │            │                    │                       │
+│                           └───────────────────────────┘            │     G_h = r^h_t + γ^h · mask_h · V*(s_{t+h})│
+│                                                                     │            (stop-grad)   aqc.py:117       │
+│                                        L = mean_{K,B,h}  valid · ( Q_φ(s_t,a_{1:h}) − G_h )²   ◀────────────────┐ │
+│                                            └─ 1/H gradient-level averaging (Eq.6)   aqc.py:123 ─────────────────┘ │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────  DEPLOYMENT / BOOTSTRAP  EXTRACTION  (Eq. 8, Fig. 2)   aqc.py: sample_actions :214  ───────────┐
+│  state s_t →  z^(n)~N(0,I_Hd)  →  π_θ  →  N chunks a^(n)_{1:H}  →  Q_φ → (N,H) →  q_by_h = max_n Q(s,a^(n)_{1:h})  │
+│  (n*, h*) = argmax_{n∈[N], h∈[H]} Q_φ(s_t, a^(n)_{1:h})  →  execute prefix a^(n*)_{1:h*}  →  replan after h* steps │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<table>
+<tr><th>Stage</th><th>Shapes</th><th>Code</th><th>Paper</th></tr>
+<tr><td>1. sample chunk</td><td>obs <code>(B,d_s)</code>, actions <code>(B,H,d_a)</code>, rewards/masks/valid <code>(B,H)</code>, next_obs <code>(B,H,d_s)</code></td><td><code>datasets.py:92</code></td><td>feeds Eq. 6</td></tr>
+<tr><td>2. predict all prefixes</td><td><code>Q_φ → (K,B,H)</code></td><td><code>aqc.py:106</code></td><td>§4.1</td></tr>
+<tr><td>3. bootstrap V* at each <code>s_{t+h}</code></td><td><code>(B·H,d_s) → (B,H)</code></td><td><code>aqc.py:108–112</code></td><td>Eq. 19</td></tr>
+<tr><td>4. per-horizon target</td><td><code>G_h (B,H)</code></td><td><code>aqc.py:116–118</code></td><td>Eq. 5</td></tr>
+<tr><td>5. masked, averaged loss</td><td>scalar</td><td><code>aqc.py:121–123</code></td><td>Eq. 6</td></tr>
+<tr><td>6. extract (deploy)</td><td><code>(N,H) → (n*,h*)</code></td><td><code>aqc.py:242–251</code></td><td>Eq. 8</td></tr>
+</table>
+
+<div class="box tap">
+The single thing that makes AQC ≠ QC lives in two places in this diagram: the critic outputs a <b>vector over h</b>
+(not a scalar), and both the target's <code>max</code> (stage 3) and the extraction's arg-max (stage 6) range over
+<b><code>(n,h)</code></b> instead of just <code>n</code>. Everything else is QC machinery.
+</div>
+<div class="box kr">
+한 training step은 ① chunk 샘플 → ② Transformer로 모든 prefix Q 예측 <code>(K,B,H)</code> →
+③ 각 next state <code>s_{t+h}</code>에서 N개 후보 chunk를 뽑아 <code>(n,k)</code>에 대해 max → <code>V*</code> →
+④ horizon별 target <code>G_h</code> → ⑤ valid 마스킹 후 <code>(K,B,H)</code> 제곱오차를 평균. 배포 시에는
+<code>(n,h)</code> joint arg-max로 prefix <code>h*</code>만 실행하고 그만큼 지난 뒤 다시 계획합니다.
+</div>
+</section>
+
+<!-- ============================================================ transformer -->
+<section id="transformer" class="anchor">
+<h2 class="sec">Causal prefix critic ★ <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">utils/transformer.py</span> — the network that emits all <code>H</code>
+prefix Q-values at once, on a shared return scale. This is the ONE genuinely new architectural piece.</p>
+
+<h4>Token layout &amp; prefix read-out (transformer.py:62–115)</h4>
+<pre><code>tokens:   [ s_t | a_t | a_{t+1} | … | a_{t+H-1} ]      length L = H+1
+position:    0     1      2              H
+causal mask (transformer.py:90):  token i attends only to j ≤ i
+output head read at action token p (1..H)  →  Q(s_t, a_{t:t+p})        (transformer.py:114)
+   token 1 sees {s, a₁}            → Q(s, a_{1:1})
+   token H sees {s, a₁,…,a_H}      → Q(s, a_{1:H})</code></pre>
+
+<table>
+<tr><th>Field / step</th><th>Value</th><th>Line</th><th>Paper</th></tr>
+<tr><td>state + action tokens</td><td><code>Dense(n_embd)</code> on <code>s</code> and each <code>aᵢ</code></td><td><code>:78–82</code></td><td>App B</td></tr>
+<tr><td>positional emb</td><td>learned absolute, <code>(L,n_embd)</code></td><td><code>:85</code></td><td>(unspecified → OQ-1)</td></tr>
+<tr><td>causal mask</td><td><code>nn.make_causal_mask</code></td><td><code>:90</code></td><td>Prop G.7</td></tr>
+<tr><td>blocks</td><td><b>Pre-LN</b> attn + GELU MLP, residual</td><td><code>:93–106</code></td><td>App B (Pre-LN)</td></tr>
+<tr><td>read heads</td><td>shared <code>Dense(1)</code> at action tokens 1..H</td><td><code>:114–115</code></td><td>§4.1 (shared backbone)</td></tr>
+<tr><td>ensemble</td><td><code>PrefixValue</code> wraps with <code>ensemblize(K)</code></td><td><code>:119,:144</code></td><td>App B (K=2)</td></tr>
+</table>
+
+<p><b>Sizes</b> (<span class="tag cfg">config</span>, Table 3): <code>num_layers=2</code>, <code>num_heads=8</code>,
+<code>head_dim=16</code> ⇒ <code>n_embd = 8·16 = 128</code>; MLP width <code>512</code>. Smallest param count of all
+baselines because one shallow backbone serves every prefix length (<span class="tag pt">paper</span> §F.1).</p>
+
+<div class="box warn">
+Read the prefix value off the <b>action token</b>, not the state token: head at position <code>p∈{1..H}</code>
+(the <code>aₚ₋₁</code> token, which has attended to <code>s</code> + <code>a₁..aₚ</code>) gives
+<code>Q(s,a_{1:p})</code>. That's why the code slices <code>x[..., 1:, :]</code> at <code>:114</code> — dropping the
+state token's output. Off-by-one here silently shifts every horizon.
+</div>
+<div class="box tap">
+Implements <span class="tag pt">paper</span> §4.1 + Prop G.7. <b>Spot-check:</b> Pre-LN is on
+(<code>:94,:104</code>) and a final LayerNorm (<code>:111</code>) — App B leans on LayerNorm (SEEM) for the
+no-target-network choice (see <a href="#target">target ★</a>). Verify prefix-consistency empirically
+(<a href="#review">§6 #1</a>).
+</div>
+<div class="box kr">
+인과적 마스크 덕분에 <code>p</code>번째 action 토큰의 출력은 <code>s</code>와 <code>a₁..aₚ</code>에만 의존 →
+<code>Q(s,a_{1:p})</code>. 한 번의 forward로 <code>H</code>개의 prefix Q를 동시에 출력하며, 모두 같은 backbone을
+공유하므로 동일 스케일을 갖습니다. 크기는 n_layer=2, n_head=8, head_dim=16(n_embd=128).
+</div>
+</section>
+
+<!-- ============================================================ critic loss -->
+<section id="criticloss" class="anchor">
+<h2 class="sec">Multi-step TD loss ★ <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">agents/aqc.py</span> <code>critic_loss():98</code> — regress every prefix to its own
+h-step target, average the <code>H</code> squared errors.</p>
+
+<pre><code># aqc.py:106   prediction: all H prefixes in one pass
+q = critic(s_t, a_{t:t+H})                       # (K, B, H)
+# aqc.py:108-112   bootstrap V* at every next state s_{t+h}
+v_next = _expected_prefix_max( s_{t+1..t+H} )    # (B, H)
+# aqc.py:116-118   per-horizon target  (Eq. 5)
+discounts = γ ** arange(1, H+1)                  # γ¹ … γ^H
+G_h = rewards[:, :] + discounts * masks * v_next # rewards[:,h-1] = r^h_t  (cum. discounted)
+G_h = stop_gradient(G_h)
+# aqc.py:121-123   masked, gradient-averaged loss  (Eq. 6)
+loss = ( (q - G_h)² * valid ).mean()             # mean over (K, B, H) → 1/H averaging</code></pre>
+
+<table>
+<tr><th>Term</th><th>Source</th><th>Why</th></tr>
+<tr><td><code>rewards[:,h-1] = r^h_t</code></td><td><code>datasets.py:126</code></td><td>cumulative discounted reward Σγ^τ r already precomputed</td></tr>
+<tr><td><code>masks[:,h-1]</code></td><td><code>datasets.py</code></td><td>zeroes bootstrap if a terminal occurred within the h steps</td></tr>
+<tr><td><code>valid[:,h-1]</code></td><td><code>datasets.py:129</code></td><td>masks horizons that cross an episode boundary</td></tr>
+<tr><td><code>discounts = γ^h</code></td><td><code>aqc.py:116</code></td><td>per-horizon discount on the bootstrap</td></tr>
+</table>
+
+<div class="box tap">
+Implements <span class="tag pt">paper</span> Eq. 5–6. <b>Spot-check three things:</b> (1) the index alignment —
+prefix <code>h</code> uses <code>rewards[:,h-1]</code>, <code>masks[:,h-1]</code>, <code>γ^h</code>, and bootstraps at
+<code>next_obs[:,h-1]=s_{t+h}</code>; (2) the target is <code>stop_gradient</code>'d (<code>:118</code>); (3) the loss is
+<code>.mean()</code> over all of <code>(K,B,H)</code> — that <code>1/H</code> is the gradient-level averaging of §G.5.
+</div>
+<div class="box warn">
+QC bootstraps at <b>only</b> <code>s_{t+H}</code> with <code>γ^H</code> (one target). AQC bootstraps at <b>all</b>
+<code>H</code> next-states (one target per prefix). The dataset already returns every intermediate next-state and the
+cumulative reward vector, so this needed <b>no dataset change</b> — but it means the bootstrap cost is ~<code>H×</code>
+QC's (see <a href="#target">target</a>). This is faithful to Eq. 6, not an optimization.
+</div>
+<div class="box kr">
+각 prefix 길이 <code>h</code>마다 별도의 target <code>G_h = r^h_t + γ^h·mask·V*(s_{t+h})</code>로 회귀하고,
+<code>H</code>개의 제곱오차를 <b>평균</b>합니다(<code>.mean()</code>의 <code>1/H</code>). 인덱스 정렬(보상/마스크/할인/다음상태가
+모두 <code>h</code>에 맞는지)과 <code>stop_gradient</code>가 핵심 확인 포인트입니다.
+</div>
+</section>
+
+<!-- ============================================================ target -->
+<section id="target" class="anchor">
+<h2 class="sec">Expected-prefix-max target ★ <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">agents/aqc.py</span> <code>_expected_prefix_max():68</code> — the bootstrap value
+that generalizes EMaQ from "max over N actions" to "max over N×H prefixes".</p>
+
+<pre><code># aqc.py:68   for a batch of next states s' = s_{t+h}
+states_rep = repeat(states, N)                       # (M·N, d_s)
+chunks     = flow_BC(states_rep, noise)              # (M·N, H·d_a)   N proposals each
+q          = min_K  critic(states_rep, chunks)       # (M·N, H)       min over ensemble
+V*         = q.reshape(M, N*H).max(axis=-1)          # (M,)  max over (n, k)     ← Eq. 19</code></pre>
+
+<table>
+<tr><th>Choice</th><th>Code</th><th>Paper</th></tr>
+<tr><td>min over ensemble for both target &amp; extraction</td><td><code>_aggregate():43</code>, <code>q_agg='min'</code></td><td>App B ("takes the minimum of the two")</td></tr>
+<tr><td>max over <code>(n,k)∈[N]×[H]</code></td><td><code>:91</code></td><td>Eq. 19 / Def G.11</td></tr>
+<tr><td>proposals from frozen flow-BC π_θ</td><td><code>compute_flow_actions():49</code></td><td>§4.2</td></tr>
+</table>
+
+<h4>Target network: the one deviation worth your attention</h4>
+<p>App B says ACSAC bootstraps from the <b>online critic with the gradient stopped</b> — no Polyak target network —
+relying on LayerNorm (SEEM) for stability. We default to that: <code>use_target_critic=False</code>
+(<span class="file">aqc.py</span> <code>:411</code>), so <code>_expected_prefix_max</code> queries the <code>'critic'</code>
+module with stored params and the whole target is <code>stop_gradient</code>'d (<code>aqc.py:118</code>). A Polyak target
+(<code>τ=5e-3</code>) is available as a fallback flag.</p>
+
+<div class="box warn">
+<b>DD-1 (the design decision to scrutinize).</b> The paper's value learning uses online-critic-as-target. We made
+that the <b>default</b> for faithfulness, but it relies on the Transformer's Pre-LN keeping the NTK bounded. If you
+ever see Q diverge, flip <code>--agent.use_target_critic=True</code>. Table 2 lists <code>τ</code> "(when used)" — it is
+for the target-network baselines, not ACSAC's main method.
+</div>
+<div class="box tap">
+Implements <span class="tag pt">paper</span> Eq. 19 + App B. <b>Spot-check:</b> (1) <code>min</code> over K happens
+<i>before</i> the <code>max</code> over <code>(n,h)</code> (clipped-double-Q on the bootstrap); (2) the reshape
+<code>(M·N,H)→(M,N·H)</code> groups the right candidates per state (proposals are <code>repeat</code>'d contiguously at
+<code>:88</code>); (3) default is the online-critic target (DD-1).
+</div>
+<div class="box kr">
+다음 상태마다 flow-BC로 <code>N</code>개의 chunk를 뽑아 <code>(n,k)</code> 전부에 대해 Q를 평가하고(앙상블은 먼저
+<code>min</code>) 최댓값을 <code>V*</code>로 씁니다(EMaQ의 확장, Eq. 19). 기본값은 <b>별도 target network 없이</b> 온라인
+critic + <code>stop_gradient</code> (App B). 불안정하면 <code>use_target_critic=True</code>로 Polyak target 사용.
+</div>
+</section>
+
+<!-- ============================================================ actor -->
+<section id="actor" class="anchor">
+<h2 class="sec">Flow-BC actor <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">agents/aqc.py</span> <code>actor_loss():135</code> — pure behavior cloning of
+full-length chunks via flow matching. Identical to QC; no distillation, no Q-term (rejection sampling does policy
+improvement).</p>
+<pre><code># aqc.py:135  (Eq. 7)
+x_0 ~ N(0,I);  x_1 = a_{t:t+H};  x_t = (1-t)x_0 + t·x_1
+pred = ActorVectorField(s, x_t, t)
+bc_flow_loss = mean( (pred - (x_1 - x_0))² * valid )      # valid masks past-boundary steps</code></pre>
+<p>Inference is Euler integration of the velocity field over <code>F=10</code> steps
+(<code>compute_flow_actions():49</code>), reused verbatim from QC's <code>ActorVectorField</code>.</p>
+<div class="box tap">
+Implements <span class="tag pt">paper</span> Eq. 7. Nothing AQC-specific here — this is exactly QC's flow-BC policy
+(<span class="file">utils/networks.py</span>). The "improvement" is entirely in the critic + the
+<a href="#extract">extraction arg-max</a>.
+</div>
+<div class="box kr">
+정책 자체는 QC와 동일한 flow-matching BC (전체 길이 <code>H</code> chunk를 학습). 별도의 distillation/Q-loss 없이,
+critic 기반 rejection sampling으로 정책 개선을 합니다.
+</div>
+</section>
+
+<!-- ============================================================ extract -->
+<section id="extract" class="anchor">
+<h2 class="sec">Adaptive extraction ★ <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">agents/aqc.py</span> <code>sample_actions():214</code> — the joint
+<code>(n,h)</code> arg-max that turns the chunk size state-dependent.</p>
+<pre><code># aqc.py:214
+obs → N noise → flow-BC → N chunks → critic → (N,H) = min_K Q
+if adaptive_chunking:                                          # aqc.py:242
+    n*, h* = argmax over flattened (N·H)                       # joint arg-max (Eq. 8)
+else:
+    n* = argmax_n q[:, -1];  h* = H                            # fixed-H control (QT-QC-style)
+return best_chunk (full H), h*                                 # jit-static shape</code></pre>
+
+<div class="box warn">
+<b>jit + variable-length output.</b> A jit-compiled function can't return a data-dependent shape, so
+<code>sample_actions</code> returns the <b>full</b> best chunk <code>(H·d_a,)</code> plus a scalar <code>h*</code>. The
+<b>Python rollout loops</b> slice the first <code>h*</code> actions (<code>evaluation.py:94</code>,
+<code>main.py:262</code>). That's the whole trick for adaptive replanning — don't look for variable shapes inside jit.
+</div>
+<div class="box tap">
+Implements <span class="tag pt">paper</span> Eq. 8 / Fig. 2. The <b>same</b> rule is used for the bootstrap action
+(via <code>_expected_prefix_max</code>'s <code>max</code>) and for deployment — exactly as the paper states
+("the same extraction rule is used for bootstrap action sampling and deployment"). <code>adaptive_chunking=False</code>
+gives you the paper's fixed-H Transformer-critic ablation for free.
+</div>
+<div class="box kr">
+<code>N</code>개 후보 chunk의 <code>(N,H)</code> Q에서 <code>(n,h)</code> 전체에 대해 arg-max → 후보 <code>n*</code>와 prefix
+길이 <code>h*</code> 선택, <code>h*</code>개 행동만 실행 후 재계획. jit은 가변 길이를 반환할 수 없어 <b>전체 chunk + h*</b>를
+돌려주고, 실제 잘라내기는 파이썬 rollout 루프에서 합니다.
+</div>
+</section>
+
+<!-- ============================================================ dataset -->
+<section id="dataset" class="anchor">
+<h2 class="sec">Chunked dataset <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">utils/datasets.py</span> <code>sample_sequence():92</code> — reused from QC unchanged;
+it already returns exactly what Eq. 6 needs.</p>
+<table>
+<tr><th>Key returned</th><th>Meaning</th><th>Used by</th></tr>
+<tr><td><code>observations (B,d_s)</code></td><td><code>s_t</code></td><td>prediction</td></tr>
+<tr><td><code>actions (B,H,d_a)</code></td><td><code>a_{t:t+H}</code></td><td>prediction, BC</td></tr>
+<tr><td><code>rewards (B,H)</code></td><td><code>rewards[:,h-1] = Σ_{τ&lt;h} γ^τ r_{t+τ} = r^h_t</code> (<code>:126</code>)</td><td>target</td></tr>
+<tr><td><code>next_observations (B,H,d_s)</code></td><td><code>next_obs[:,h-1] = s_{t+h}</code></td><td>bootstrap</td></tr>
+<tr><td><code>masks (B,H)</code></td><td>cumulative <code>1-terminal</code></td><td>target</td></tr>
+<tr><td><code>valid (B,H)</code></td><td><code>valid[:,i] = 1 - terminals[:,i-1]</code> (<code>:129</code>)</td><td>loss mask</td></tr>
+</table>
+<div class="box note">
+This is the happy accident that made the integration clean: QC's <code>sample_sequence</code> was already
+emitting per-step cumulative rewards and <i>all</i> intermediate next-states (QC only used the last one). AQC just
+consumes the full vectors. Zero dataset changes.
+</div>
+<div class="box kr">
+QC의 <code>sample_sequence</code>가 이미 step별 누적보상과 모든 중간 next-state를 반환하기 때문에 AQC는 데이터 코드
+수정 없이 그대로 사용합니다. (QC는 마지막 <code>s_{t+H}</code>만 사용)
+</div>
+</section>
+
+<!-- ============================================================ eval -->
+<section id="eval" class="anchor">
+<h2 class="sec">Eval &amp; adaptive replanning <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">evaluation.py</span> <code>:88–100</code> — the rollout loop that realizes
+state-dependent replanning, and (bonus) logs the chunk-size distribution of Fig. 3.</p>
+<pre><code># evaluation.py:88
+if len(action_queue) == 0:
+    result = actor_fn(observations)
+    if isinstance(result, tuple):                 # AQC: (full_chunk, h*)
+        chunk, h_star = result
+        chunk = chunk.reshape(-1, action_dim)[: int(h_star)]   # execute prefix
+    else:                                         # QC: fixed chunk (back-compat)
+        chunk = result.reshape(-1, action_dim)
+    chunk_lengths.append(chunk.shape[0])          # → eval/chunk_len_mean (Fig. 3)
+    enqueue(chunk)
+action = action_queue.pop(0)</code></pre>
+<div class="box tap">
+The branch on <code>isinstance(result, tuple)</code> is what keeps QC agents working unchanged while adding adaptive
+replanning. <code>chunk_len_mean/min/max</code> (<code>:157–159</code>) is the paper's <b>Fig. 3</b> ("distribution of
+chunk size decisions") computed for free at every eval.
+</div>
+<div class="box kr">
+큐가 비면 새로 <code>(chunk, h*)</code>를 뽑아 앞 <code>h*</code>개만 큐에 넣고, 다 소비하면 재계획. 튜플 여부로
+QC(고정)와 AQC(가변)를 구분하여 하위호환을 유지합니다. 실행된 chunk 길이 통계가 곧 논문 Fig. 3입니다.
+</div>
+</section>
+
+<!-- ============================================================ viz -->
+<section id="viz" class="anchor">
+<h2 class="sec">Diagnostic video <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">utils/aqc_viz.py</span> <code>aqc_rollout_video():117</code> — a composite video so you
+can <i>watch</i> AQC decide: rollout on the left, the prefix-Q curve + chunk-size timeline on the right.</p>
+<table>
+<tr><th>Panel</th><th>Shows</th><th>Source</th></tr>
+<tr><td>left</td><td>env render (MuJoCo, EGL)</td><td><code>env.render()</code></td></tr>
+<tr><td>top-right</td><td><code>q_by_h</code> bars, selected <code>h*</code> in red</td><td><code>sample_actions_with_info():255</code> → <code>q_by_h</code></td></tr>
+<tr><td>bottom-right</td><td>timeline of <code>h*</code> (red) and selected Q (blue)</td><td>accumulated per step</td></tr>
+</table>
+<p>The agent method <code>sample_actions_with_info():255</code> returns <code>q_by_h = max_n Q(s,a^(n)_{1:h})</code>
+(<code>:281</code>) — the exact curve the arg-max selects from — plus <code>h*, n*, q_best</code>. Logged to W&amp;B as
+<code>eval/aqc_video</code> from <code>main.py</code> <code>maybe_log_aqc_video():72</code>, wrapped in try/except so a
+render hiccup can never crash training.</p>
+<div class="box tap">
+This is the qualitative checks of the paper made per-rollout: <b>Fig. 3</b> (h* follows task phase) and the intuition
+behind <b>Fig. 4</b> (prefix-Q calibration drives selection). If AQC works, you'll see <code>h*</code> shrink near
+precise/turning phases and grow on straight segments.
+</div>
+<div class="box kr">
+롤아웃 영상(왼쪽) + 현재 상태의 prefix-Q 곡선(오른쪽 위, 선택된 <code>h*</code> 빨강) + <code>h*</code>/Q 시계열(오른쪽
+아래)을 합성한 영상. AQC가 잘 작동하면 정밀/회전 구간에서 <code>h*</code>가 작아지고 직선 구간에서 커지는 것을 눈으로
+확인할 수 있습니다. (논문 Fig. 3/4의 정성 분석)
+</div>
+</section>
+
+<!-- ============================================================ mainloop -->
+<section id="mainloop" class="anchor">
+<h2 class="sec">Training loop <span class="tag jax">code</span></h2>
+<p class="lead"><span class="file">main.py</span> — offline (1M) then offline-to-online (1M), same objective; the AQC
+agent is selected with <code>--agent agents/aqc.py</code>.</p>
+<table>
+<tr><th>Line</th><th>What</th></tr>
+<tr><td><code>main.py:210–212</code></td><td>offline: <code>sample_sequence</code> → <code>agent.update(batch)</code></td></tr>
+<tr><td><code>main.py:259–269</code></td><td>online: adaptive <code>(chunk,h*)</code> handling in the env loop</td></tr>
+<tr><td><code>main.py:326</code></td><td>online updates via <code>batch_update</code> (UTD scan)</td></tr>
+<tr><td><code>main.py:99 / 27–28</code></td><td>W&amp;B <code>--wandb_entity</code> / <code>--wandb_project=AQC</code></td></tr>
+<tr><td><code>main.py:72 / 45</code></td><td><code>maybe_log_aqc_video</code> + <code>--aqc_diagnostic_video</code> flag</td></tr>
+</table>
+<div class="box note">
+Offline-to-online is "just add online transitions to the same buffer and keep the same loss" (<span class="tag pt">paper</span>
+App B) — no special O2O tricks. The online env loop replans at chunk boundaries using the adaptive <code>h*</code>.
+</div>
+</section>
+
+<!-- ============================================================ §5 -->
+<section id="cheatsheet" class="anchor">
+<h2 class="sec">§5 · Cheat-sheet</h2>
+<h4>Notation ↔ symbol ↔ code</h4>
+<table>
+<tr><th>Symbol</th><th>Meaning</th><th>Code</th></tr>
+<tr><td><code>H</code></td><td>max chunk size</td><td><code>--horizon_length=5</code></td></tr>
+<tr><td><code>N</code></td><td>rejection-sampling size</td><td><code>--agent.num_action_samples=4</code> (8 for quadruple)</td></tr>
+<tr><td><code>K</code></td><td>critic ensemble</td><td><code>num_qs=2</code>, <code>q_agg='min'</code></td></tr>
+<tr><td><code>Q(s,a_{1:h})</code></td><td>prefix value</td><td><code>q[...,h-1]</code> of <code>(K,B,H)</code></td></tr>
+<tr><td><code>r^h_t</code></td><td>h-step cum. disc. reward</td><td><code>rewards[:,h-1]</code></td></tr>
+<tr><td><code>G_h</code></td><td>per-horizon target</td><td><code>aqc.py:117</code></td></tr>
+<tr><td><code>V*(s')</code></td><td>expected-prefix-max</td><td><code>_expected_prefix_max:68</code></td></tr>
+<tr><td><code>(n*,h*)</code></td><td>selected candidate / prefix len</td><td><code>aqc.py:243–245</code></td></tr>
+</table>
+<h4>Shapes</h4>
+<table>
+<tr><th>Tensor</th><th>Shape</th></tr>
+<tr><td>critic prediction</td><td><code>(K, B, H)</code></td></tr>
+<tr><td>per-horizon target <code>G_h</code></td><td><code>(B, H)</code></td></tr>
+<tr><td>bootstrap proposals</td><td><code>(B·H·N, H·d_a)</code></td></tr>
+<tr><td>extraction Q</td><td><code>(N, H)</code> → <code>q_by_h (H,)</code></td></tr>
+<tr><td>deployed action</td><td>full chunk <code>(H·d_a,)</code> + scalar <code>h*</code></td></tr>
+</table>
+<h4>Default hyperparameters (<span class="file">aqc.py:get_config():384</span>, Table 2/3)</h4>
+<pre><code>lr 3e-4 · batch 256 · γ 0.99 · F(flow steps) 10 · K 2 (min)
+transformer: n_layer 2 · n_head 8 · head_dim 16 (n_embd 128) · mlp 512 · Pre-LN
+AQC: N 4 · adaptive_chunking True · use_target_critic False (DD-1)</code></pre>
+</section>
+
+<!-- ============================================================ §6 -->
+<section id="review" class="anchor">
+<h2 class="sec">§6 · Review checklist ★ <span class="small">(is this really ACSAC?)</span></h2>
+<p class="lead">Ten concrete claims that together say "this code = the paper". Each names the code line, the paper
+anchor, and what to check. This is the section to read with the paper open.</p>
+
+<table>
+<tr><th>#</th><th>Claim</th><th>Code</th><th>Paper</th><th>How to verify</th></tr>
+<tr><td>1</td><td><b>Prefix consistency</b>: head <code>h</code> ignores <code>a_{h:H}</code></td><td><code>transformer.py:90,114</code></td><td>Prop G.7</td><td>perturb suffix actions, confirm <code>Q[:&lt;h]</code> unchanged (we measured Δ=0)</td></tr>
+<tr><td>2</td><td><b>All H prefixes</b> in one forward pass</td><td><code>transformer.py:114</code></td><td>§4.1</td><td>critic output is <code>(K,B,H)</code>, not a scalar</td></tr>
+<tr><td>3</td><td><b>Per-horizon targets</b>, one per <code>h</code></td><td><code>aqc.py:116–118</code></td><td>Eq. 5</td><td>index alignment reward/mask/γ^h/next_obs all use <code>h-1</code></td></tr>
+<tr><td>4</td><td><b>Gradient-level 1/H averaging</b></td><td><code>aqc.py:123</code></td><td>Eq. 6, §G.5</td><td>single <code>.mean()</code> over <code>(K,B,H)</code>; targets are <i>not</i> averaged</td></tr>
+<tr><td>5</td><td><b>Expected-prefix-max</b> over <code>N×H</code></td><td><code>aqc.py:91</code></td><td>Eq. 19</td><td><code>max</code> ranges over <code>N·H</code>, <code>min</code> over K first</td></tr>
+<tr><td>6</td><td><b>min over ensemble</b> for target &amp; extraction</td><td><code>aqc.py:43</code></td><td>App B</td><td><code>q_agg='min'</code> default</td></tr>
+<tr><td>7</td><td><b>Online-critic target</b>, grad stopped (DD-1)</td><td><code>aqc.py:85,118,411</code></td><td>App B</td><td>default <code>use_target_critic=False</code>; target <code>stop_gradient</code>'d</td></tr>
+<tr><td>8</td><td><b>Joint (n,h) arg-max</b> extraction</td><td><code>aqc.py:243–245</code></td><td>Eq. 8</td><td>flatten <code>(N,H)</code>, decode <code>n*=idx//H, h*=idx%H+1</code></td></tr>
+<tr><td>9</td><td><b>Same rule</b> for bootstrap &amp; deploy</td><td><code>aqc.py:68</code> vs <code>:214</code></td><td>§4.3</td><td>both do min-K then max/argmax over <code>(n,h)</code></td></tr>
+<tr><td>10</td><td><b>Flow-BC on full chunks</b> + Euler F=10</td><td><code>aqc.py:135,49</code></td><td>Eq. 7</td><td>BC loss masked by <code>valid</code>; <code>flow_steps=10</code></td></tr>
+</table>
+
+<h4>Documented deviations (read these in <span class="file">implementation_plan.html</span> §6)</h4>
+<table>
+<tr><th>ID</th><th>Deviation</th><th>Why it's OK</th></tr>
+<tr><td>DD-1</td><td>default = online-critic target (Polyak optional)</td><td>this <i>is</i> the paper's choice (App B); fallback flag exists</td></tr>
+<tr><td>DD-2</td><td>single shared output head across positions</td><td>shared-backbone / common-scale argument; matches small param count</td></tr>
+<tr><td>DD-3</td><td>bootstrap at all H next-states (no subsampling)</td><td>faithful to Eq. 6; it's the cost, not an approximation</td></tr>
+<tr><td>OQ-1</td><td>learned absolute positional emb</td><td>paper unspecified; standard choice, H is tiny</td></tr>
+</table>
+
+<div class="box tap">
+If #1–#10 all check out and DD-1/DD-2 are acceptable to you, the implementation is a faithful ACSAC. The one I'd
+personally re-derive on paper is <b>#3 (index alignment)</b> and the one I'd watch empirically is <b>#7 (no target
+network)</b> — flip to a Polyak target if Q diverges.
+</div>
+<div class="box kr">
+이 10개 항목(특히 #3 인덱스 정렬, #5 <code>N×H</code> max, #7 target network 부재, #8 joint arg-max)을 논문과
+대조해 확인하면 구현이 ACSAC에 충실한지 검증됩니다. 의도적 변경(DD-1~3, OQ-1)은 <code>implementation_plan.html</code>
+§6에 근거와 함께 정리되어 있습니다.
+</div>
+</section>
+
+<!-- ============================================================ §7 -->
+<section id="glossary" class="anchor">
+<h2 class="sec">§7 · Glossary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>AQC / ACSAC</td><td>Adaptive (Chunk Size) Q-Chunking — the method this code implements</td></tr>
+<tr><td>QC</td><td>Q-Chunking — the fixed-chunk baseline this builds on (<span class="file">agents/acfql.py</span>)</td></tr>
+<tr><td>chunk / prefix</td><td>length-H action sequence / its first h actions</td></tr>
+<tr><td>prefix-conditioned Q</td><td><code>Q(s, a_{1:h})</code> = return of executing h actions then following the policy</td></tr>
+<tr><td>cross-horizon comparability</td><td>all prefix Q's share the "total discounted return" unit ⇒ arg-max over h is valid (Thm G.9)</td></tr>
+<tr><td>prefix consistency</td><td>head h depends only on (s, a_{1:h}); enforced by the causal mask (Prop G.7)</td></tr>
+<tr><td>expected-prefix-max</td><td>bootstrap = max over N×H proposal prefixes (Eq. 19); EMaQ generalized</td></tr>
+<tr><td>rejection sampling</td><td>extract policy by filtering BC samples through the critic (best-of-N×H)</td></tr>
+<tr><td>flow-BC</td><td>flow-matching behavior-cloning policy generating chunks via Euler integration</td></tr>
+<tr><td>h*</td><td>the state-dependent executed chunk size chosen by the joint arg-max</td></tr>
+<tr><td>UTD</td><td>update-to-data ratio (=1 here); online uses <code>batch_update</code> scan</td></tr>
+<tr><td>DD-/OQ-</td><td>documented Design Decisions / Open Questions in <span class="file">implementation_plan.html</span></td></tr>
+</table>
+
+<hr/>
+<p class="small">Generated as a reading companion for the AQC (ACSAC) implementation. Code references
+(<code>file:line</code>) and paper references (<code>§/Eq./Fig.</code>) point at the source at the time of writing —
+<b>re-verify against <span class="file">acsac.pdf</span> and the files</b> as you review, especially if line numbers
+drift after edits. Open first, in order: <a href="#diagram">§4 diagram</a> → <a href="#transformer">critic</a> →
+<a href="#target">target (DD-1)</a> → <a href="#review">§6 checklist</a>.</p>
+</section>
+
+</main>
+</div>
+<script>
+// active-section highlight on scroll
+const links = [...document.querySelectorAll('nav.side a')];
+const map = {};
+links.forEach(a=>{const id=a.getAttribute('href').slice(1); map[id]=a;});
+const obs = new IntersectionObserver((entries)=>{
+  entries.forEach(e=>{
+    if(e.isIntersecting){
+      links.forEach(l=>l.classList.remove('active'));
+      const a = map[e.target.id];
+      if(a) a.classList.add('active');
+    }
+  });
+},{rootMargin:'-10% 0px -80% 0px',threshold:0});
+document.querySelectorAll('section[id]').forEach(s=>obs.observe(s));
+// nav filter box
+function filterNav(){
+  const q = document.getElementById('filter').value.toLowerCase();
+  links.forEach(a=>{
+    if(a.classList.contains('grp')) return;
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+  document.querySelectorAll('nav.side .grp').forEach(g=>g.style.display = q ? 'none' : '');
+}
+</script>
+</body>
+</html>

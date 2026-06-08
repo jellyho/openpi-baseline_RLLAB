@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Adaptive Q-Chunking (ACSAC) — Implementation Plan</title>
+<style>
+  :root { --fg:#1b1f24; --muted:#5b6570; --acc:#2b6cb0; --acc2:#7c3aed;
+          --ok:#1a7f37; --warn:#9a6700; --bad:#b42318; --bg:#fff; --code:#f5f7fa;
+          --border:#e3e8ee; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         color:var(--fg); background:var(--bg); margin:0; line-height:1.55; }
+  .wrap { max-width:1024px; margin:0 auto; padding:32px 28px 96px; }
+  h1 { font-size:30px; margin:0 0 4px; letter-spacing:-.4px; }
+  h2 { font-size:22px; margin:40px 0 10px; padding-bottom:6px; border-bottom:2px solid var(--border); }
+  h3 { font-size:17px; margin:22px 0 6px; color:#243; }
+  h4 { font-size:15px; margin:16px 0 4px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+  p, li { font-size:15px; }
+  code { background:var(--code); padding:1px 5px; border-radius:4px; font-size:13px;
+         font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; }
+  pre { background:var(--code); border:1px solid var(--border); border-radius:8px;
+        padding:14px 16px; overflow:auto; font-size:12.5px; line-height:1.5;
+        font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace; }
+  .sub { color:var(--muted); font-size:14px; margin-top:0; }
+  .pill { display:inline-block; font-size:11px; padding:2px 9px; border-radius:999px;
+          background:#eef2ff; color:#4338ca; font-weight:600; margin-right:6px; }
+  table { border-collapse:collapse; width:100%; margin:12px 0; font-size:13.5px; }
+  th,td { border:1px solid var(--border); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#f8fafc; font-weight:600; }
+  .ok { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  .box { border:1px solid var(--border); border-left:4px solid var(--acc); border-radius:8px;
+         padding:12px 16px; margin:14px 0; background:#fbfdff; }
+  .box.warn { border-left-color:var(--warn); background:#fffdf5; }
+  .box.dev  { border-left-color:var(--acc2); background:#fbf7ff; }
+  .box.ok   { border-left-color:var(--ok); background:#f6fffa; }
+  .toc { columns:2; font-size:14px; }
+  .toc a { color:var(--acc); text-decoration:none; }
+  .small { font-size:13px; color:var(--muted); }
+  .eq { background:var(--code); border:1px solid var(--border); border-radius:6px;
+        padding:8px 12px; margin:8px 0; font-family:ui-monospace,Menlo,monospace; font-size:13px; }
+  kbd { background:#111827; color:#fff; border-radius:4px; padding:1px 6px; font-size:12px; }
+  hr { border:0; border-top:1px solid var(--border); margin:28px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Adaptive Q-Chunking — Implementation Plan</h1>
+<p class="sub">Faithful integration of <b>ACSAC: Adaptive Chunk Size Actor-Critic with Causal Transformer
+Q-Network</b> (Chen et al., 2026, <code>acsac.pdf</code>) into the existing <b>QC / Q-Chunking</b> codebase.
+Scope: the <b>critic-learning component</b> of the RSS 2026 Post-Finetuning Robot Foundation Model Challenge.</p>
+<p><span class="pill">RL critic</span><span class="pill">JAX / Flax</span><span class="pill">OGBench</span>
+<span class="pill">offline + offline-to-online</span></p>
+
+<div class="box">
+<b>One-paragraph summary.</b> ACSAC replaces QC's fixed-chunk MLP critic
+<code>Q(s, a<sub>1:H</sub>)</code> with a <b>causal Transformer</b> that emits, in a single forward pass,
+the Q-values of <i>every prefix</i> <code>Q(s, a<sub>1:h</sub>)</code> for <code>h = 1…H</code>. The critic is
+trained with a <b>per-horizon multi-step TD loss</b> (one target per prefix length, averaged at the
+gradient level), and the policy is the QC flow-BC policy extracted by <b>joint rejection sampling over
+(candidate index n, prefix length h)</b>: at each replanning state we sample <code>N</code> length-<code>H</code>
+chunks, score all <code>N&times;H</code> prefixes, execute the arg-max prefix <code>a<sup>(n*)</sup><sub>1:h*</sub></code>,
+and replan at the next chunk boundary. The chunk size therefore becomes <b>state-dependent</b> instead of fixed.</p>
+</div>
+
+<h4>Contents</h4>
+<div class="toc">
+<a href="#summary">1. Paper Summary</a><br/>
+<a href="#compare">2. Comparison with Existing QC</a><br/>
+<a href="#arch">3. Proposed Architecture</a><br/>
+<a href="#pipeline">4. Training Pipeline</a><br/>
+<a href="#files">5. Files Added / Modified</a><br/>
+<a href="#risks">6. Risks, Open Questions &amp; Design Decisions</a><br/>
+<a href="#run">7. How to Run (OGBench)</a><br/>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="summary">1. Paper Summary</h2>
+
+<h3>Main idea</h3>
+<p>Long-horizon, sparse-reward tasks make single-step TD learning slow (bootstrapping error
+accumulates over many Bellman updates). Action chunking — running RL over action sequences
+<code>a<sub>t:t+H</sub></code> — gives multi-step value backups <i>without</i> the off-policy bias of n-step
+returns, because the critic conditions on the exact executed sequence. But existing chunking methods (QC,
+QC-FQL, DEAS, DQC, MAC) use a <b>fixed</b> <code>H</code>, which forces one global trade-off between
+<i>reactivity</i> (short chunks, frequent replanning) and <i>temporal coherence</i> (long chunks, fast
+backups). The optimal trade-off is <b>state-dependent</b>. ACSAC makes the execution horizon adaptive by
+learning prefix-conditioned Q-values on a shared return scale and selecting the horizon that maximises
+the critic at each replanning state.</p>
+
+<h3>Network architecture (§4.1, App. B)</h3>
+<ul>
+<li><b>Causal Transformer critic.</b> Ingests the token sequence
+<code>(s<sub>t</sub>, a<sub>t</sub>, a<sub>t+1</sub>, …, a<sub>t+H-1</sub>)</code> (1 state token + H action tokens)
+and outputs <code>H</code> heads <code>[Q(s,a<sub>t:t+1</sub>), …, Q(s,a<sub>t:t+H</sub>)]</code> in one pass.</li>
+<li>A <b>causal attention mask</b> makes the <code>h</code>-th head depend only on <code>(s, a<sub>t:t+h</sub>)</code>
+&rArr; <b>prefix consistency</b> (Prop. G.7): no causal leakage from future actions, unlike an MLP fed truncated chunks.</li>
+<li><b>Pre-LayerNorm</b> before every attention and feed-forward sublayer. LayerNorm bounds the critic's NTK
+(SEEM [43]), which is what lets ACSAC use the <b>online critic with stopped gradient as the bootstrap target</b>
+(no separate Polyak target network needed).</li>
+<li>Size (all tasks): <code>n_layer=2</code>, <code>n_head=8</code>, <code>d_head=16</code> &rArr; <code>n_embd=128</code>.
+Critic <b>ensemble K=2</b>; ACSAC takes the <b>min</b> of the two Q-values for both the bootstrap target and policy extraction.
+Smallest parameter count of all baselines (2.46M) precisely because one shallow shared backbone serves all prefix lengths.</li>
+<li><b>Flow-BC policy</b> (unchanged from QC): a state-conditioned velocity field <code>v<sub>θ</sub>(u, s, a<sub>z</sub>)</code>
+over <code>R<sup>Hd</sup></code>, trained by flow matching on full-length chunks; chunks generated by <code>F=10</code> Euler steps.</li>
+</ul>
+
+<h3>Loss functions</h3>
+<div class="eq">Critic (multi-step TD over all prefixes, Eq. 6):<br/>
+L(&phi;) = E<sub>(s<sub>t:t+H+1</sub>, a<sub>t:t+H</sub>, r<sub>t:t+H</sub>)~D</sub> [ (1/H) &sum;<sub>h=1…H</sub> ( Q<sub>&phi;</sub>(s<sub>t</sub>, a<sub>t:t+h</sub>) &minus; G<sub>h</sub> )<sup>2</sup> ]</div>
+<div class="eq">Per-horizon target (Eq. 5):  G<sub>h</sub> = &sum;<sub>&tau;=0…h-1</sub> &gamma;<sup>&tau;</sup> r<sub>t+&tau;</sub>  +  &gamma;<sup>h</sup> Q̄<sub>&phi;</sub>(s<sub>t+h</sub>, &pi;*(s<sub>t+h</sub>))</div>
+<div class="eq">Flow-BC actor (Eq. 7):  L(&theta;) = E[ &Vert; v<sub>&theta;</sub>(u, s<sub>t</sub>, a<sub>z</sub>) &minus; (a<sub>t:t+H</sub> &minus; z) &Vert;<sup>2</sup> ],  a<sub>z</sub>=(1&minus;u)z+u&middot;a<sub>t:t+H</sub></div>
+<p class="small">Averaging the <code>H</code> squared losses at the <i>gradient</i> level (not the target level)
+reduces update variance (App. G.5, Lemma G.18) while preserving sparse-reward signal in each per-horizon target.</p>
+
+<h3>Target computation — expected-prefix-max backup (§4.2, Def. G.11)</h3>
+<p>The bootstrap value <code>Q̄(s<sub>t+h</sub>, &pi;*(s<sub>t+h</sub>))</code> generalises EMaQ's expected-max operator:
+at the next state <code>s<sub>t+h</sub></code> sample <code>N</code> length-<code>H</code> chunks from the flow-BC policy, score
+<i>all</i> <code>N&times;H</code> prefixes, and take the max:</p>
+<div class="eq">V*(s') = max<sub>n&isin;[N], k&isin;[H]</sub>  min<sub>j&isin;[K]</sub>  Q<sub>&phi;,j</sub>(s', ã<sup>(n)</sup><sub>s':s'+k</sub>)</div>
+<p>Appendix G proves this backup <code>B<sup>N,H</sup><sub>&theta;</sub></code> is a <b>&gamma;-contraction</b> in
+sup-norm whose unique fixed point is <code>Q<sup>&pi;*</sup></code>, the action-value function of the deployed
+adaptive-prefix policy. Prefix values across <code>h</code> are <b>cross-horizon comparable</b> (Thm. G.9):
+all share the unit "total discounted return from <code>s<sub>t</sub></code>", so the joint arg-max is principled.</p>
+
+<h3>Inference / policy extraction (§4.3, Eq. 8)</h3>
+<div class="eq">z<sup>(n)</sup> ~ N(0, I<sub>Hd</sub>);   a<sup>(n)</sup><sub>t:t+H</sub> = &pi;<sub>&theta;</sub>(s<sub>t</sub>, z<sup>(n)</sup>);
+  (n*, h*) = argmax<sub>n&isin;[N], h&isin;[H]</sub> Q<sub>&phi;</sub>(s<sub>t</sub>, a<sup>(n)</sup><sub>t:t+h</sub>);   &pi;*(s<sub>t</sub>) = a<sup>(n*)</sup><sub>t:t+h*</sub></div>
+<p>The <b>same</b> extraction rule is used for (a) the bootstrap action in the TD target and (b) deployment.
+Online fine-tuning (Alg. 1): act with the selected prefix open-loop, replan at the chunk boundary, append
+single-step transitions to <code>D</code>, keep training with the same offline objective (no special O2O tricks).</p>
+
+<h3>Key hyperparameters (Tables 2–3)</h3>
+<table>
+<tr><th>Shared</th><th>Value</th><th>Transformer / AQC</th><th>Value</th></tr>
+<tr><td>optimizer / lr</td><td>Adam / 3e-4</td><td>n_layer</td><td>2</td></tr>
+<tr><td>batch size</td><td>256</td><td>n_head</td><td>8</td></tr>
+<tr><td>discount &gamma;</td><td>0.99</td><td>d_head (&rArr; n_embd)</td><td>16 (128)</td></tr>
+<tr><td>flow steps F</td><td>10</td><td>max chunk size H</td><td>5 (cube/scene/puzzle)</td></tr>
+<tr><td>critic ensemble K</td><td>2 (min)</td><td>rejection size N</td><td>4 (8 for cube-quadruple)</td></tr>
+<tr><td>UTD ratio</td><td>1</td><td>bootstrap target</td><td>online critic, stop-grad</td></tr>
+<tr><td>offline / online steps</td><td>1e6 / 1e6</td><td>eval episodes</td><td>50</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="compare">2. Comparison with Existing QC</h2>
+
+<h3>Similarities (reused wholesale)</h3>
+<ul>
+<li>Flow-BC policy = <code>ActorVectorField</code> + flow-matching loss + Euler <code>compute_flow_actions</code>
+— identical to QC (<code>acfql.py</code>, <code>actor_type="best-of-n"</code>).</li>
+<li>Rejection-sampling ("best-of-N") extraction concept — ACSAC adds a second axis (prefix length).</li>
+<li>Dataset chunking: <code>Dataset.sample_sequence</code> already returns per-step cumulative discounted
+rewards, all intermediate next-observations, masks and a <code>valid</code> flag — <b>exactly</b> the
+quantities ACSAC's per-horizon targets need. <span class="ok">No dataset change required.</span></li>
+<li>Train/eval scaffolding: <code>main.py</code> (offline + online), <code>evaluation.py</code> (action-queue
+rollout), <code>flax_utils</code> (<code>ModuleDict</code>/<code>TrainState</code>), config-via-<code>get_config()</code>,
+W&amp;B/CSV logging, replay buffer, OGBench env utils.</li>
+</ul>
+
+<h3>Differences (what AQC changes)</h3>
+<table>
+<tr><th>Aspect</th><th>QC (acfql, best-of-n)</th><th>AQC (ACSAC)</th></tr>
+<tr><td>Critic network</td><td>MLP <code>Value</code>, single scalar <code>Q(s, a<sub>1:H</sub>)</code></td>
+    <td>Causal Transformer, vector <code>[Q(s,a<sub>1:h</sub>)]<sub>h=1…H</sub></code></td></tr>
+<tr><td>TD target</td><td>single H-step: <code>r<sup>H</sup> + &gamma;<sup>H</sup> Q̄(s<sub>t+H</sub>, &middot;)</code></td>
+    <td>H targets <code>G<sub>h</sub></code>, one per prefix, gradient-averaged</td></tr>
+<tr><td>Next states used</td><td>only <code>s<sub>t+H</sub></code></td><td>all <code>s<sub>t+1…t+H</sub></code></td></tr>
+<tr><td>Bootstrap action</td><td>best-of-N over chunks: <code>max<sub>n</sub></code></td>
+    <td>best-of-(N&times;H) over prefixes: <code>max<sub>n,k</sub></code></td></tr>
+<tr><td>Target network</td><td>Polyak target_critic (&tau;=5e-3)</td>
+    <td>online critic + stop-grad (default); Polyak optional</td></tr>
+<tr><td>Q aggregation</td><td>mean (acfql default)</td><td>min (paper)</td></tr>
+<tr><td>Execution at deploy</td><td>fixed H actions per replan</td><td>adaptive <code>h*</code> actions per replan</td></tr>
+<tr><td>Actor</td><td>flow-BC (+ optional DDPG distill)</td><td>flow-BC only (rejection sampling)</td></tr>
+</table>
+
+<h3>Components reused vs. modified vs. new</h3>
+<table>
+<tr><th>Status</th><th>Component</th></tr>
+<tr><td class="ok">Reuse as-is</td><td><code>ActorVectorField</code>, <code>MLP</code>, <code>ensemblize</code>,
+   <code>Dataset.sample_sequence</code>, <code>ReplayBuffer</code>, <code>flax_utils</code>, env utils, logging</td></tr>
+<tr><td class="warn">Modify (small, back-compat)</td><td><code>agents/__init__.py</code> (register aqc),
+   <code>evaluation.py</code> + <code>main.py</code> online loop (handle adaptive <code>(chunk, h*)</code> return; log h* stats)</td></tr>
+<tr><td class="bad">New</td><td><code>utils/transformer.py</code> (causal prefix critic + ensemble wrapper),
+   <code>agents/aqc.py</code> (AQC agent + config), <code>scripts/aqc/*.sh</code>, <code>AQC.md</code></td></tr>
+</table>
+
+<h3>Potential implementation challenges</h3>
+<ul>
+<li><b>Prefix consistency must come from architecture</b>, not data (Remark G.8) &rArr; correct causal mask + read
+each prefix-Q from the matching action token's hidden state.</li>
+<li><b>Variable-length output at deploy</b> breaks <code>jax.jit</code> (output shape depends on data). Solved by
+returning the <i>full</i> best chunk + a scalar <code>h*</code>; the Python rollout loop slices the first <code>h*</code> actions.</li>
+<li><b>Cost of the bootstrap</b>: per transition we bootstrap at <code>H</code> next-states &times; <code>N</code> proposals,
+each an <code>F</code>-step flow rollout. Batched as one <code>(B&middot;H&middot;N)</code> tensor; comparable to QC's N=32 sampling.</li>
+<li><b>Shared online/target critic stability</b> hinges on Pre-LayerNorm being correct (SEEM). Pre-LN + final LN included;
+Polyak target available as a fallback flag.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="arch">3. Proposed Architecture</h2>
+
+<h3>New modules</h3>
+<pre>utils/transformer.py
+  CausalPrefixCritic(nn.Module)      # one critic: (obs, flat_chunk) -> (..., H) prefix Q-values
+    - Dense state-token + Dense action-token embeddings, learned positional embeddings
+    - n_layer Pre-LN Transformer blocks (MultiHeadDotProductAttention + GELU MLP), causal mask
+    - final LayerNorm, shared Dense(1) head read at each of the H action positions
+  PrefixValue(nn.Module)             # mirrors networks.Value: optional encoder + ensemblize(K)
+    - __call__(obs, actions) -> (K, ..., H)
+
+agents/aqc.py
+  AQCAgent(flax.struct.PyTreeNode)
+    critic_loss      # per-horizon multi-step TD (Eq. 6), expected-prefix-max target (Eq. 5/19)
+    actor_loss       # flow-BC matching loss only (Eq. 7)
+    _target_values   # batched V*(s') = max over N x H prefixes, min over K  (Eq. 19)
+    sample_actions   # adaptive (n*,h*) extraction -> (full_chunk, h*)       (Eq. 8)
+    compute_flow_actions, target_update, update, batch_update, create, get_config</pre>
+
+<h3>Token layout &amp; prefix read-out</h3>
+<pre>tokens:   [ s_t | a_t | a_{t+1} | ... | a_{t+H-1} ]      length L = H+1
+position:   0     1      2              H
+causal mask: token i attends to j &le; i
+read head h from action token at position h  ->  Q(s_t, a_{t:t+h})   (h = 1..H)
+  token 1 sees {s_t, a_t}                 -> Q(s, a_{t:t+1})
+  token H sees {s_t, a_t,...,a_{t+H-1}}   -> Q(s, a_{t:t+H})</pre>
+
+<h3>Dependency structure</h3>
+<pre>main.py ── agents/aqc.py ──┬── utils/transformer.py (PrefixValue, CausalPrefixCritic)
+                           ├── utils/networks.py     (ActorVectorField, MLP, ensemblize)
+                           ├── utils/flax_utils.py   (ModuleDict, TrainState)
+                           └── utils/datasets.py     (sample_sequence — unchanged)
+evaluation.py ── agent.sample_actions() -> (chunk, h*)   [adaptive-aware rollout]</pre>
+
+<h3>Data flow (one critic update)</h3>
+<pre>batch = sample_sequence(B, H, &gamma;)
+  observations      (B, obs)            = s_t
+  actions           (B, H, act)         = a_{t:t+H}
+  rewards           (B, H)              = cumulative discounted r^h_t  (index h-1)
+  next_observations (B, H, obs)         = s_{t+1..t+H}
+  masks, valid      (B, H)
+
+prediction:  q = critic(s_t, flatten(a))             -> (K, B, H)     # all prefixes, one pass
+target:      V* = _target_values(next_obs (B*H,obs)) -> (B, H)        # expected-prefix-max
+             G_h = rewards[:,h] + (&gamma;^h)*masks[:,h]*V*[:,h]          # per horizon
+loss:        mean_h mean_K ( valid[:,h] * (q - stop_grad(G_h))^2 )</pre>
+
+<!-- ============================================================ -->
+<h2 id="pipeline">4. Training Pipeline</h2>
+
+<h4>Data loading</h4>
+<p>Unchanged from QC. <code>--horizon_length=H</code> sets the max chunk size; <code>sample_sequence(B, H, &gamma;)</code>
+returns the full sub-trajectory with per-step cumulative rewards/masks and a per-step <code>valid</code> mask.
+<code>--sparse</code> reproduces scene/puzzle sparse rewards; large datasets (cube-quadruple-100M) are streamed via
+<code>--ogbench_dataset_dir</code> + <code>--dataset_replace_interval</code> exactly as in QC.</p>
+
+<h4>Critic learning</h4>
+<p>Forward the Transformer once on <code>(s_t, a_{t:t+H})</code> to get all <code>H</code> prefix-Q predictions; regress
+each to its per-horizon target; average the <code>H</code> squared errors. Both ensemble members regress to the same
+(min-aggregated) target. <code>valid[:,h]</code> masks horizons that cross an episode boundary.</p>
+
+<h4>Target computation</h4>
+<p>Expected-prefix-max (Eq. 19): at each of the <code>H</code> next-states sample <code>N</code> flow-BC chunks, score
+the <code>N&times;H</code> prefixes with the critic, take <code>min</code> over <code>K</code> then <code>max</code> over
+<code>(n,k)</code>. Default bootstrap = online critic with <code>stop_gradient</code> (paper); a Polyak
+<code>target_critic</code> path is available via <code>use_target_critic=True</code>.</p>
+
+<h4>Chunk sampling strategy (the adaptive part)</h4>
+<p>At deployment/bootstrap, draw <code>N</code> length-<code>H</code> chunks, evaluate all prefixes, take the joint
+arg-max <code>(n*, h*)</code>. <code>h*</code> is logged per step so the executed-chunk-size distribution (paper Fig. 3)
+falls out for free. A <code>adaptive_chunking=False</code> switch forces <code>h*=H</code> to recover a fixed-chunk
+Transformer-critic ablation (the paper's QT-QC-style control).</p>
+
+<h4>Evaluation procedure</h4>
+<p>Greedy adaptive rollout: <code>sample_actions</code> returns <code>(full_chunk, h*)</code>; the rollout loop executes
+the first <code>h*</code> actions, then replans. 50 episodes; success rate + mean/standard-deviation of <code>h*</code>
+reported. Offline protocol = average of last 3 eval epochs (800k/900k/1M); O2O = success at 1M and 2M.</p>
+
+<!-- ============================================================ -->
+<h2 id="files">5. Files Added / Modified</h2>
+<table>
+<tr><th>File</th><th>Action</th><th>Purpose</th></tr>
+<tr><td><code>qc/utils/transformer.py</code></td><td class="bad">new</td><td>Causal prefix critic + ensemble wrapper</td></tr>
+<tr><td><code>qc/agents/aqc.py</code></td><td class="bad">new</td><td>AQC agent + <code>get_config()</code></td></tr>
+<tr><td><code>qc/agents/__init__.py</code></td><td class="warn">modify</td><td>register <code>aqc=AQCAgent</code></td></tr>
+<tr><td><code>qc/evaluation.py</code></td><td class="warn">modify</td><td>handle <code>(chunk, h*)</code>; log adaptive chunk length (back-compatible)</td></tr>
+<tr><td><code>qc/main.py</code></td><td class="warn">modify</td><td>online loop handles adaptive return; log mean h*</td></tr>
+<tr><td><code>qc/scripts/aqc/*.sh</code></td><td class="bad">new</td><td>example offline + O2O OGBench commands</td></tr>
+<tr><td><code>qc/AQC.md</code></td><td class="bad">new</td><td>how AQC differs from QC, file map, run/eval guide</td></tr>
+</table>
+<p class="small">All QC entry points keep working unchanged; AQC is opt-in via <code>--agent agents/aqc.py</code>.</p>
+
+<!-- ============================================================ -->
+<h2 id="risks">6. Risks, Open Questions &amp; Design Decisions</h2>
+
+<div class="box dev">
+<b>DD-1 — Bootstrap target = online critic with stop-gradient (paper-faithful default).</b>
+App. B states ACSAC bootstraps from the online critic with the gradient stopped, relying on Pre-LayerNorm
+(SEEM) for stability; the &tau;=5e-3 in Table 2 is "(when used)" for the target-network baselines.
+<i>Decision:</i> default <code>use_target_critic=False</code> (faithful). <i>Impact / mitigation:</i> if a run
+shows value divergence, set <code>use_target_critic=True</code> for a Polyak target (machinery included). Pre-LN +
+final LayerNorm are always on.
+</div>
+
+<div class="box dev">
+<b>DD-2 — Shared output head across positions.</b> Prop. G.7 says "one output head per position"; the shared-backbone
+/ common-return-scale argument (§4.1) implies tied weights. <i>Decision:</i> a single <code>Dense(1)</code> head applied
+at every action token (as in TOP-ERL/T-SAC). <i>Impact:</i> fewer params, better cross-horizon calibration; matches the
+2.46M parameter count. Per-position heads can be added later if needed.
+</div>
+
+<div class="box dev">
+<b>DD-3 — Bootstrap at all H next-states (no horizon subsampling).</b> Eq. 6 sums targets over <code>h=1…H</code>, each
+bootstrapping at <code>s<sub>t+h</sub></code>. <i>Decision:</i> compute all H (faithful), batched into one
+<code>(B&middot;H&middot;N)</code> critic call. <i>Impact:</i> dominant compute cost; a documented
+<code>target_horizon_subsample</code> hook is left for future speed-ups but defaults to full.
+</div>
+
+<div class="box dev">
+<b>DD-4 — Config lives in <code>aqc.py:get_config()</code>, not a YAML.</b> The QC codebase configures agents through
+<code>ml_collections</code> + <code>config_flags</code>; an external <code>aqc.yaml</code> would fork the config system.
+<i>Decision:</i> keep the native pattern and ship example <code>.sh</code> launch scripts as the "example configuration".
+<i>Impact:</i> consistent with QC, switchable via <code>--agent agents/aqc.py --agent.* …</code>.
+</div>
+
+<div class="box warn">
+<b>OQ-1 — Positional embeddings.</b> The paper does not specify the positional scheme. <i>Assumption:</i> learned
+absolute positional embeddings over <code>L=H+1</code> tokens (standard; H is small). Revisit if cross-horizon
+calibration (Fig. 4) looks off.
+</div>
+<div class="box warn">
+<b>OQ-2 — Transformer MLP ratio &amp; activation.</b> Not given. <i>Assumption:</i> GELU, MLP hidden = 4&middot;n_embd = 512
+(coincides with the shared MLP-width hyperparameter), matching QC's <code>nn.gelu</code> MLPs.
+</div>
+<div class="box warn">
+<b>OQ-3 — Pixel observations.</b> Encoder plumbing is wired (encoder output becomes the state token) but AQC is validated
+on state-based OGBench. Pixel AQC is left as documented future work.
+</div>
+<div class="box ok">
+<b>Backward compatibility.</b> No QC behaviour changes: same files run the same way; the eval/online loops branch only on a
+tuple return, which QC agents never produce.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="run">7. How to Run (OGBench)</h2>
+<p>Run from <code>adaptive_q_chunking/qc/</code>. <code>--horizon_length</code> is the <b>max</b> chunk size H;
+<code>--agent.num_action_samples</code> is the rejection-sampling size N.</p>
+<h4>Offline + offline-to-online (cube-double, H=5, N=4)</h4>
+<pre>MUJOCO_GL=egl python main.py \
+  --agent agents/aqc.py \
+  --run_group=aqc --env_name=cube-double-play-singletask-task1-v0 \
+  --horizon_length=5 --agent.num_action_samples=4 \
+  --offline_steps=1000000 --online_steps=1000000</pre>
+<h4>Sparse domains (scene / puzzle add <code>--sparse=True</code>)</h4>
+<pre>MUJOCO_GL=egl python main.py --agent agents/aqc.py \
+  --env_name=scene-play-singletask-task1-v0 --sparse=True \
+  --horizon_length=5 --agent.num_action_samples=4</pre>
+<h4>Offline-only smoke test</h4>
+<pre>MUJOCO_GL=egl python main.py --agent agents/aqc.py \
+  --env_name=cube-double-play-singletask-task1-v0 \
+  --horizon_length=5 --agent.num_action_samples=4 \
+  --offline_steps=50000 --online_steps=0 --eval_episodes=10</pre>
+<p class="small">Evaluation runs automatically every <code>--eval_interval</code> steps inside <code>main.py</code> and reports
+success rate and the adaptive chunk-size distribution. See <code>AQC.md</code> for the full file map and the
+QC&hArr;AQC switch.</p>
+
+<hr/>
+<p class="small">This document is the implementation reference. Any further deviation from ACSAC will be appended here with
+rationale and expected impact, per the project's faithfulness requirement.</p>
+
+</div>
+</body>
+</html>
