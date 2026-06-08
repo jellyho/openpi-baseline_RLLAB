@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AQC · Distributional Critic Guide</title>
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['$','$'],['\\(','\\)']], displayMath: [['$$','$$'],['\\[','\\]']] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" async></script>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f6f8fa; --panel2:#eceff3; --ink:#1b2330; --muted:#5b6570;
+    --accent:#0f766e; --accent2:#4f46e5; --line:#e3e8ee; --code:#f4f6f9;
+    --kr:#fff8e6; --kr-bd:#d4a017; --tap:#ecfdf5; --tap-bd:#10b981;
+    --warn:#fef2f2; --warn-bd:#ef4444; --note:#eff6ff; --note-bd:#3b82f6;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans KR",Helvetica,Arial,sans-serif;}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:var(--code);color:#334155;padding:1px 5px;border-radius:4px;font-size:.86em;border:1px solid #e3e8ee}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;color:#334155;
+    font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.55}
+  pre code{background:none;border:none;padding:0;color:inherit}
+  .layout{display:flex;max-width:1400px;margin:0 auto}
+  nav.side{position:sticky;top:0;align-self:flex-start;height:100vh;width:300px;min-width:300px;
+    overflow-y:auto;padding:18px 14px 60px;border-right:1px solid var(--line);background:var(--panel)}
+  nav.side h1{font-size:15px;margin:4px 8px 4px;color:var(--accent)}
+  nav.side .sub{font-size:12px;color:var(--muted);margin:0 8px 12px}
+  nav.side input{width:100%;padding:8px 10px;margin:0 0 12px;border-radius:8px;border:1px solid var(--line);
+    background:#fff;color:var(--ink);font-size:13px}
+  nav.side a{display:block;color:var(--muted);padding:4px 8px;border-radius:6px;font-size:13px}
+  nav.side a:hover{background:var(--panel2);color:var(--ink);text-decoration:none}
+  nav.side a.h2{padding-left:18px;font-size:12.5px}
+  nav.side a.active{color:var(--accent);background:var(--panel2);font-weight:600}
+  nav.side .grp{margin:10px 8px 4px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#94a0b3}
+  main{flex:1;min-width:0;padding:30px 42px 120px;max-width:1040px}
+  h2.sec{font-size:25px;margin:46px 0 6px;padding-top:14px;border-top:1px solid var(--line);color:#111827}
+  h2.sec:first-of-type{border-top:none;margin-top:6px}
+  h3{font-size:19px;margin:30px 0 6px;color:var(--accent)}
+  h4{font-size:15.5px;margin:20px 0 4px;color:var(--accent2)}
+  .file{font-family:"JetBrains Mono",monospace;font-size:13px;color:#b45309}
+  p{margin:8px 0}
+  ul,ol{margin:8px 0 8px 0;padding-left:22px}
+  li{margin:3px 0}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#111827}
+  td code{font-size:.82em}
+  tr:nth-child(even) td{background:#f9fafb}
+  .box{border-radius:10px;padding:12px 16px;margin:14px 0;border-left:4px solid}
+  .kr{background:var(--kr);border-color:var(--kr-bd)}
+  .kr::before{content:"🇰🇷  한국어 설명";display:block;font-weight:700;color:#8a6d0b;margin-bottom:4px;font-size:13px}
+  .tap{background:var(--tap);border-color:var(--tap-bd)}
+  .tap::before{content:"🎯  Distributional tap";display:block;font-weight:700;color:#0f766e;margin-bottom:4px;font-size:13px}
+  .warn{background:var(--warn);border-color:var(--warn-bd)}
+  .warn::before{content:"⚠️  Gotcha";display:block;font-weight:700;color:#b91c1c;margin-bottom:4px;font-size:13px}
+  .note{background:var(--note);border-color:var(--note-bd)}
+  .note::before{content:"ℹ️  Note";display:block;font-weight:700;color:#1d4ed8;margin-bottom:4px;font-size:13px}
+  .box p{margin:5px 0}
+  .pill{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;
+    padding:1px 10px;font-size:12px;color:var(--muted);margin:0 4px 4px 0}
+  .lead{font-size:16px;color:var(--muted)}
+  .toc-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:14px 0}
+  hr{border:none;border-top:1px solid var(--line);margin:20px 0}
+  .small{font-size:12.5px;color:var(--muted)}
+  .tag{font-size:11px;padding:1px 7px;border-radius:5px;font-weight:600}
+  .tag.jax{background:#d1fae5;color:#065f46}
+  .tag.pt{background:#ffe4e6;color:#9f1239}
+  .tag.cfg{background:#e0e7ff;color:#3730a3}
+  .anchor{scroll-margin-top:20px}
+  .eqwrap{background:#f6f8fa;border:1px solid var(--line);border-radius:10px;padding:6px 14px;margin:12px 0;overflow-x:auto}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin:10px 0}
+  summary{cursor:pointer;color:var(--accent2);font-weight:600}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="side">
+  <h1>AQC · Distributional</h1>
+  <div class="sub">ACSAC critic → HL-Gauss, for the frozen-VLA offline setting</div>
+  <input id="filter" placeholder="filter sections…" oninput="filterNav()">
+
+  <div class="grp">Start here</div>
+  <a href="#howto">§0 · How to use</a>
+  <a href="#acsac">§1 · ACSAC in brief</a>
+  <a href="#concepts">§2 · Concept primer</a>
+
+  <div class="grp">The network</div>
+  <a href="#transformer">Transformer critic, explained ★</a>
+
+  <div class="grp">The modification</div>
+  <a href="#distributional">§3 · Distributional critic ★</a>
+  <a href="#codemap">§4 · Code map</a>
+
+  <div class="grp">Use it</div>
+  <a href="#training">§5 · Training setup</a>
+  <a href="#configs">§6 · Configs &amp; running</a>
+  <a href="#verify">§7 · Verification ★</a>
+  <a href="#glossary">§8 · Glossary</a>
+</nav>
+<main>
+
+<!-- ===================================================== §0 -->
+<section id="howto" class="anchor">
+<h2 class="sec">§0 · How to use this guide</h2>
+<p class="lead">This explains how our <b>ACSAC (Adaptive Q-Chunking) critic</b> is turned into a
+<b>distributional critic</b> (HL-Gauss), and how it is trained in our <b>offline, frozen-VLA</b>
+setting on the RSS-2026 challenge data. Equations are rendered with LaTeX; code is cited as
+<code>file:line</code> and the paper as <code>Eq./§</code>.</p>
+
+<div class="toc-card">
+<b>Reading order</b>
+<ol>
+<li><a href="#acsac">§1 ACSAC in brief</a> — the base method &amp; its four equations.</li>
+<li><a href="#concepts">§2 concept primer</a> — prefix values, expected-prefix-max, why distributional.</li>
+<li><a href="#distributional">§3 the distributional critic ★</a> — HL-Gauss, the per-prefix cross-entropy loss. <b>The core of this doc.</b></li>
+<li><a href="#training">§5 training setup</a> — frozen VLA, 2048-D latent input, reward &amp; value support, precomputed chunks, the \((s,a,r,s',a')\) mapping.</li>
+<li><a href="#verify">§7 verification ★</a> — concrete checks (several already run).</li>
+</ol>
+</div>
+
+<p><span class="pill">★ = read first</span>
+<span class="pill"><span class="tag jax">code</span> our JAX code</span>
+<span class="pill"><span class="tag pt">paper</span> ACSAC / DEAS</span>
+<span class="pill"><span class="tag cfg">config</span> a flag</span></p>
+
+<div class="box kr">
+이 문서는 우리의 ACSAC critic을 <b>분포형(distributional) critic</b> (HL-Gauss)으로 바꾼 내용과,
+<b>frozen VLA 기반 offline</b> 세팅에서 어떻게 학습하는지를 설명합니다. 수식은 LaTeX로 렌더링되며,
+코드 위치(<code>파일:줄</code>)와 논문 위치(<code>Eq./§</code>)를 함께 표기했습니다. §3(분포형 critic)이
+핵심이고, §5(학습 세팅)와 §7(검증)을 꼭 보세요.
+</div>
+<div class="box note">
+The equations render via the MathJax CDN, so the math needs an internet connection the first time
+you open the file. The text/structure work offline regardless.
+</div>
+</section>
+
+<!-- ===================================================== §1 -->
+<section id="acsac" class="anchor">
+<h2 class="sec">§1 · ACSAC in brief</h2>
+<p class="lead">ACSAC learns a critic that scores <b>every prefix</b> of an action chunk and selects the
+execution horizon per state. Four equations carry the whole method.</p>
+
+<p>An action chunk of length \(H\) is \(a_{t:t+H}=(a_t,\dots,a_{t+H-1})\); its length-\(h\) <b>prefix</b>
+is \(a_{t:t+h}\). The prefix value is the return of executing \(h\) actions open-loop then following the
+policy — for every \(h\) it is "total discounted return from \(s_t\)", which is what makes the values
+<b>comparable across horizons</b> (ACSAC Thm G.9):</p>
+<div class="eqwrap">$$ Q^\pi(s_t,\,a_{t:t+h}) \;=\; \underbrace{\sum_{\tau=0}^{h-1}\gamma^\tau r_{t+\tau}}_{r^{(h)}_t}\;+\;\gamma^h\,V^\pi(s_{t+h}). $$</div>
+
+<p><b>Per-horizon target</b> (ACSAC Eq. 5): one target per prefix length, bootstrapping at the matching
+next state \(s_{t+h}\):</p>
+<div class="eqwrap">$$ G_h \;=\; \sum_{\tau=0}^{h-1}\gamma^\tau r_{t+\tau} \;+\; \gamma^h\,\bar Q\!\big(s_{t+h},\,\pi^\star(s_{t+h})\big). $$</div>
+
+<p><b>Multi-step TD loss</b> (ACSAC Eq. 6) — the \(H\) squared errors are averaged at the <i>gradient</i>
+level (the \(\tfrac1H\)), which reduces variance while preserving sparse-reward signal:</p>
+<div class="eqwrap">$$ \mathcal{L}_{\text{reg}}(\phi) \;=\; \mathbb{E}\!\left[\frac{1}{H}\sum_{h=1}^{H}\big(Q_\phi(s_t,a_{t:t+h})-G_h\big)^2\right]. $$</div>
+
+<p><b>Expected-prefix-max bootstrap</b> (ACSAC Eq. 19) — a generalization of EMaQ: sample \(N\) chunks from
+the behavior policy at \(s'\), take the max over all \(N\times H\) prefixes, with a \(\min\) over the
+\(K\)-critic ensemble:</p>
+<div class="eqwrap">$$ V^\star(s') \;=\; \max_{n\in[N],\;k\in[H]}\;\min_{j\in[K]}\;Q_{\phi,j}\!\big(s',\,\tilde a^{(n)}_{s':s'+k}\big). $$</div>
+
+<p><b>Adaptive extraction</b> (ACSAC Eq. 8) — the same rule for the bootstrap action and for deployment;
+the executed horizon \(h^\star\) is state-dependent:</p>
+<div class="eqwrap">$$ (n^\star,h^\star)=\arg\max_{n\in[N],\,h\in[H]} Q_\phi\!\big(s_t,a^{(n)}_{t:t+h}\big),\qquad \pi^\star(s_t)=a^{(n^\star)}_{t:t+h^\star}. $$</div>
+
+<div class="box kr">
+ACSAC는 ① 모든 prefix의 가치 \(Q(s,a_{1:h})\)를 학습하고(같은 단위라 비교 가능), ② horizon별 target
+\(G_h\)로 회귀하며(\(\tfrac1H\) 평균), ③ bootstrap은 \(N\times H\) prefix에 대한 max(앙상블은 min),
+④ 배포 시 \((n,h)\) joint arg-max로 \(h^\star\)만 실행합니다.
+</div>
+</section>
+
+<!-- ===================================================== §2 -->
+<section id="concepts" class="anchor">
+<h2 class="sec">§2 · Concept primer</h2>
+
+<h3>2.1 · Why distributional?</h3>
+<p>Instead of regressing a scalar \(Q\), a <b>distributional</b> critic predicts a categorical distribution
+over a fixed value support and is trained by <b>classification</b> (cross-entropy). "Stop Regressing"
+(Farebrother et al., 2024) shows this is more stable and scales better than MSE for value learning — the
+bounded, normalized targets behave better than raw regression, especially with deep nets and long horizons.
+Our reference repo <span class="file">DEAS-FQL</span> uses exactly this (HL-Gauss).</p>
+
+<h3>2.2 · HL-Gauss (histogram loss with a Gaussian)</h3>
+<p>Fix a support \([v_{\min},v_{\max}]\) with \(M\) bins, edges \(z_0<\dots<z_M\) and centers
+\(c_i=\tfrac{z_i+z_{i+1}}{2}\). The critic outputs logits \(\ell_\phi\in\mathbb{R}^M\); the predicted
+distribution and its scalar value are</p>
+<div class="eqwrap">$$ p_\phi=\operatorname{softmax}(\ell_\phi),\qquad Q_\phi=\sum_{i=1}^{M} p_{\phi,i}\,c_i \quad(\texttt{transform\_from\_probs}). $$</div>
+<p>A <i>scalar</i> target \(y\) is turned into a <b>soft</b> two-hot label by integrating a Gaussian
+\(\mathcal{N}(y,\sigma^2)\) over each bin (\(\Phi\) = standard normal CDF):</p>
+<div class="eqwrap">$$ p^{\text{tgt}}_i(y) \;=\; \frac{\Phi\!\big(\tfrac{z_{i+1}-y}{\sqrt2\,\sigma}\big)-\Phi\!\big(\tfrac{z_{i}-y}{\sqrt2\,\sigma}\big)}{\Phi\!\big(\tfrac{z_{M}-y}{\sqrt2\,\sigma}\big)-\Phi\!\big(\tfrac{z_{0}-y}{\sqrt2\,\sigma}\big)}\quad(\texttt{transform\_to\_probs}). $$</div>
+<p>The denominator renormalizes over the truncated support. This is implemented numerically-stably in
+<span class="file">utils/distributional.py</span> (ported from DEAS's <span class="file">utils/hlg.py</span>).</p>
+
+<div class="box warn">
+HL-Gauss trains a <b>categorical representation of a scalar regression target</b> — the target is the scalar
+\(G_h\) turned into a soft histogram, <i>not</i> a full distributional Bellman backup (no projecting the
+next-state distribution through \(\gamma\) and \(r\)). This is exactly what DEAS does and what we asked for;
+it keeps the bootstrap a single scalar \(V^\star\) and reuses ACSAC's machinery unchanged.
+</div>
+<div class="box kr">
+분포형 critic은 스칼라 \(Q\) 대신 고정 support 위의 categorical 분포를 출력하고 <b>cross-entropy(분류)</b>로
+학습합니다. HL-Gauss는 스칼라 target \(y\)를 가우시안으로 부드럽게 만든 히스토그램(\(p^{\text{tgt}}\))으로 바꾸고,
+값은 \(\sum_i p_i c_i\)로 읽습니다. 이는 DEAS와 동일한 방식이며, target은 여전히 스칼라 \(G_h\)라 ACSAC 파이프라인을
+그대로 재사용합니다.
+</div>
+</section>
+
+<!-- ===================================================== Transformer -->
+<section id="transformer" class="anchor">
+<h2 class="sec">The Transformer critic, explained ★ <span class="small">(no prior transformer experience needed)</span></h2>
+<p class="lead">Our critic is a small <b>causal Transformer</b> (<span class="file">utils/transformer.py</span>). This
+section builds it up from zero — what a transformer is, why we use one here, and a line-by-line read of the code.</p>
+
+<h3>Why a transformer at all?</h3>
+<p>We want one network that, given a state and an action chunk \(a_{t:t+H}\), outputs the value of <b>every prefix</b>
+\(Q(s,a_{t:t+h})\) for \(h=1,\dots,H\) <b>at once</b>, with one hard requirement: the value for prefix \(h\) must
+depend only on the first \(h\) actions — <b>not</b> on the actions that come after. A plain MLP fed the whole chunk
+violates this (its output for "the first 3 actions" would secretly depend on actions 4..H). A transformer with a
+<b>causal mask</b> enforces it by construction. That property — <b>prefix consistency</b> — is what makes comparing
+values across horizons (and the adaptive \(h^\star\) selection) valid.</p>
+<div class="box kr">
+우리는 한 번의 forward로 모든 prefix의 가치 \(Q(s,a_{1:h})\)를 출력하되, prefix \(h\)의 값이 <b>앞쪽 \(h\)개
+행동에만</b> 의존해야 합니다(뒤 행동에 의존하면 안 됨). 일반 MLP는 이걸 보장하지 못하지만, <b>causal mask</b>를 쓴
+Transformer는 구조적으로 보장합니다. 이 성질(prefix consistency)이 horizon 간 값 비교와 적응적 \(h^\star\) 선택을
+가능하게 합니다.
+</div>
+
+<h3>A transformer in four ideas</h3>
+<table>
+<tr><th>Idea</th><th>What it means here</th></tr>
+<tr><td><b>1. Tokens</b></td><td>We turn each input piece into a vector ("token"). Here: the state \(s\) becomes one token, and <i>each</i> action \(a_{t+i}\) becomes one token. So the sequence is \([\,s\,|\,a_t\,|\,a_{t+1}\,|\dots|\,a_{t+H-1}\,]\), length \(L=H+1\). A learned <b>positional embedding</b> is added so the model knows each token's slot.</td></tr>
+<tr><td><b>2. Attention</b></td><td>The core operation. Each token produces a <b>query</b>, and every token a <b>key</b> and a <b>value</b>. A token "attends" to others by comparing its query to their keys (dot-product → softmax weights), then takes the weighted average of their values. Intuition: a soft, learnable <i>lookup</i> — each token pulls in information from the tokens most relevant to it.</td></tr>
+<tr><td><b>3. Causal mask</b></td><td>We forbid a token from attending to <i>later</i> tokens — token \(i\) may only look at tokens \(0,\dots,i\). So the action-\(h\) token can see the state and actions \(1..h\), but never \(h{+}1..H\).</td></tr>
+<tr><td><b>4. Blocks</b></td><td>We stack a few identical <b>blocks</b>, each = (attention) + (a small per-token MLP), wrapped with <b>LayerNorm</b> (normalizes a vector) and <b>residual</b> add (output = input + sublayer, which stabilizes training). Two blocks here.</td></tr>
+</table>
+
+<h3>The picture</h3>
+<pre><code>tokens:     [   s   |  a_t  | a_{t+1} | a_{t+2} | ... | a_{t+H-1} ]      length L = H+1
+position:       0       1       2        3              H
+                                  causal attention (who can look at whom)
+        s        : ■
+        a_t      : ■  ■
+        a_{t+1}  : ■  ■  ■
+        a_{t+2}  : ■  ■  ■  ■                ■ = allowed,  blank = masked (future)
+        ...
+        a_{t+H-1}: ■  ■  ■  ■  ...  ■
+                                  read one value head at each ACTION token:
+        token a_{t+h-1}  has seen { s, a_t, ..., a_{t+h-1} }  ->  Q(s, a_{t:t+h})</code></pre>
+<p>Because the \(h\)-th action token only ever mixed in the state and the first \(h\) actions, the value we read there
+is a clean function of the length-\(h\) prefix — exactly the prefix consistency we needed.</p>
+
+<h3>The code, line by line</h3>
+<p><span class="file">utils/transformer.py</span> · <code>CausalPrefixCritic.__call__</code> (<code>:62–121</code>):</p>
+<pre><code>n_embd  = num_heads * head_dim          # token width = 8 * 16 = 128
+seq_len = H + 1                          # 1 state token + H action tokens
+
+# 1) TOKENIZE  (:78-82)
+chunk        = actions.reshape(..., H, action_dim)     # split the flat chunk back into H actions
+state_token  = Dense(n_embd)(observations)[..., None, :]   # state -> 1 token   (.., 1, 128)
+action_tokens= Dense(n_embd)(chunk)                        # each action -> a token (.., H, 128)
+x = concat([state_token, action_tokens], axis=-2)          # the sequence       (.., L, 128)
+
+# 2) POSITION  (:85-87)  — learned vector per slot so order is known
+x = x + pos_emb                                            # pos_emb: (L, 128)
+
+# 3) CAUSAL MASK  (:90)  — token i may attend only to j <= i
+mask = make_causal_mask(ones(..., L))                      # lower-triangular
+
+# 4) BLOCKS x num_layers  (:93-106)  — Pre-LayerNorm, attention, MLP, residual
+for _ in range(num_layers):
+    h = LayerNorm(x)                                       # normalize first (Pre-LN)
+    x = x + MultiHeadDotProductAttention(heads=8)(h, h, mask=mask)   # attention + residual
+    h = LayerNorm(x)
+    x = x + Dense(n_embd)(gelu(Dense(mlp_dim)(h)))         # per-token MLP + residual
+x = LayerNorm(x)                                           # final norm  (:111)
+
+# 5) READ HEADS  (:114-121)  — one output per ACTION token (drop the state token)
+action_hidden = x[..., 1:, :]                              # (.., H, 128)  positions 1..H
+q = Dense(num_atoms)(action_hidden)                        # (.., H, num_atoms)  or (.., H) if num_atoms==1</code></pre>
+
+<table>
+<tr><th>Step</th><th>Shape</th><th>Line</th></tr>
+<tr><td>state + action tokens</td><td>\((..,1,128)\) + \((..,H,128)\)</td><td><code>:78–82</code></td></tr>
+<tr><td>+ positional embedding</td><td>\((..,L,128)\)</td><td><code>:85</code></td></tr>
+<tr><td>causal mask</td><td>\((..,1,L,L)\)</td><td><code>:90</code></td></tr>
+<tr><td>2 Pre-LN blocks</td><td>\((..,L,128)\)</td><td><code>:93–106</code></td></tr>
+<tr><td>read head @ action tokens</td><td>\((..,H)\) or \((..,H,M)\)</td><td><code>:114–121</code></td></tr>
+</table>
+
+<h4>Sizes &amp; the ensemble</h4>
+<p>Two attention layers, 8 heads, head-dim 16 → token width \(128\); the per-token MLP is width 512. The whole critic
+is tiny (that is why ACSAC has the smallest parameter count of all baselines — one shallow shared backbone serves
+every prefix length). <code>PrefixValue</code> (<span class="file">transformer.py:144</span>) wraps this with
+<code>ensemblize(K)</code> to make \(K{=}2\) independent critics in one vmapped call, so every output above gains a
+leading ensemble axis \((K,\dots)\); we take the \(\min\) over \(K\) for the target/extraction.</p>
+
+<div class="box warn">
+<b>Read the value off the action token, not the state token.</b> The code slices <code>x[..., 1:, :]</code>
+(<code>:114</code>) — dropping position 0 (the state token) — so the head at position \(p\in\{1..H\}\) gives
+\(Q(s,a_{t:t+p})\). An off-by-one here would silently shift every horizon.
+</div>
+<div class="box tap">
+The distributional change (§3) touches <b>only the last line</b>: <code>Dense(num_atoms)</code> instead of
+<code>Dense(1)</code>. Everything in this section — tokens, attention, causal mask, blocks — is shared by both the
+regression and distributional critics, and by the OGBench and frozen-VLA settings alike.
+</div>
+<div class="box kr">
+구현 요약: ① state·action을 각각 토큰(벡터)으로 만들고 위치 임베딩을 더함 → ② causal mask를 쓴 attention + MLP
+블록을 2번 통과(Pre-LN, residual) → ③ <b>각 action 토큰</b>에서 출력 head를 읽어 prefix별 \(Q\)를 얻습니다.
+분포형 critic은 마지막 head만 <code>Dense(1)</code>→<code>Dense(num_atoms)</code>로 바꾼 것뿐이고, 나머지(토큰·어텐션·
+마스크·블록)는 전부 동일합니다. 앙상블은 <code>PrefixValue</code>가 \(K{=}2\)로 감쌉니다.
+</div>
+</section>
+
+<!-- ===================================================== §3 -->
+<section id="distributional" class="anchor">
+<h2 class="sec">§3 · The distributional critic ★</h2>
+<p class="lead">The one modification, precisely: swap the per-prefix <b>head</b> and the <b>loss</b>; everything
+else (transformer backbone, expected-prefix-max, extraction) is untouched.</p>
+
+<h4>What changes in the network</h4>
+<p>The causal Transformer still emits one output per action token, but that output becomes \(M\) logits
+instead of a scalar. So the critic returns, per prefix \(h\),</p>
+<div class="eqwrap">$$ \ell_\phi(s_t,a_{t:t+h})\in\mathbb{R}^{M}\quad\text{(shape } (K,B,H,M)\text{)}\qquad\text{vs. regression } Q_\phi\in\mathbb{R}\ \ (K,B,H). $$</div>
+<p class="small">Code: one line — <code>Dense(num_atoms)</code> at each action token, squeezed to scalar only when
+<code>num_atoms==1</code>. <span class="file">utils/transformer.py</span> <code>:118–121</code>.</p>
+
+<h4>What changes in the loss</h4>
+<p>The target is the <b>same scalar</b> \(G_h\) (Eq. 5), but the prediction is now matched by cross-entropy
+against its HL-Gauss soft label, still averaged over horizons:</p>
+<div class="eqwrap">$$ \mathcal{L}_{\text{dist}}(\phi)=\mathbb{E}\!\left[\frac{1}{H}\sum_{h=1}^{H}\operatorname{CE}\!\Big(p^{\text{tgt}}(G_h),\,\ell_\phi(s_t,a_{t:t+h})\Big)\right],\quad \operatorname{CE}(p,\ell)=-\sum_{i=1}^{M}p_i\log\operatorname{softmax}(\ell)_i. $$</div>
+<p class="small">Code: <span class="file">agents/aqc.py</span> <code>critic_loss():128</code>, distributional branch <code>:153–156</code>
+(<code>target_probs = _scalar_to_probs(G_h)</code>, <code>ce = categorical_cross_entropy(pred, target_probs)</code>).</p>
+
+<h4>What stays the same (and why it just works)</h4>
+<p>The bootstrap and extraction operate on <b>expected values</b>, so they are identical to regression once we
+read \(Q_\phi=\sum_i p_{\phi,i}c_i\). The expected-prefix-max becomes</p>
+<div class="eqwrap">$$ V^\star(s')=\max_{n,k}\;\min_{j}\;\sum_{i=1}^{M}\operatorname{softmax}\!\big(\ell_{\phi,j}(s',\tilde a^{(n)}_{:k})\big)_i\,c_i. $$</div>
+<p class="small">Code: a single helper <span class="file">agents/aqc.py</span> <code>_prefix_values():60</code> returns the
+expected scalar for <i>either</i> critic type; <code>_expected_prefix_max</code>, <code>sample_actions</code>, and
+<code>sample_actions_with_info</code> all call it, so none of them needed branching.</p>
+
+<table>
+<tr><th>Piece</th><th>Regression</th><th>Distributional</th><th>Code</th></tr>
+<tr><td>head</td><td><code>Dense(1)</code> → \((K,B,H)\)</td><td><code>Dense(M)</code> → \((K,B,H,M)\)</td><td><span class="file">transformer.py:118</span></td></tr>
+<tr><td>prediction loss</td><td>\((Q_\phi-G_h)^2\)</td><td>\(\operatorname{CE}(p^{\text{tgt}}(G_h),\ell_\phi)\)</td><td><span class="file">aqc.py:153</span></td></tr>
+<tr><td>scalar value</td><td>\(Q_\phi\) directly</td><td>\(\sum_i p_{\phi,i}c_i\)</td><td><span class="file">aqc.py:60</span></td></tr>
+<tr><td>target \(G_h\)</td><td colspan="2">identical scalar (Eq. 5)</td><td><span class="file">aqc.py:146</span></td></tr>
+<tr><td>bootstrap / extraction</td><td colspan="2">identical (run on expected values)</td><td><span class="file">aqc.py:98,253</span></td></tr>
+</table>
+
+<div class="box tap">
+The flag is <code>--agent.critic_type {regression, distributional}</code>. <code>regression</code> is bit-identical
+to the original ACSAC; <code>distributional</code> turns on the \(M\)-atom head + CE loss and requires
+<code>v_min</code>/<code>v_max</code>. Both reuse the exact same per-prefix transformer and adaptive selection.
+</div>
+<div class="box kr">
+바뀌는 건 딱 두 곳: <b>head</b>(스칼라→\(M\)개 logits)와 <b>loss</b>(MSE→cross-entropy). target \(G_h\)는 스칼라
+그대로이고, bootstrap·extraction은 기대값 \(\sum_i p_i c_i\) 위에서 동작하므로 코드가 그대로 재사용됩니다.
+<code>--agent.critic_type</code>로 전환하며, regression은 기존 ACSAC와 완전히 동일합니다.
+</div>
+</section>
+
+<!-- ===================================================== §4 -->
+<section id="codemap" class="anchor">
+<h2 class="sec">§4 · Code map</h2>
+<table>
+<tr><th>File</th><th>Role</th></tr>
+<tr><td><span class="file">utils/distributional.py</span></td><td><b>new.</b> HL-Gauss transforms (<code>hl_gauss_transform:58</code> → <code>transform_to_probs:75</code>, <code>transform_from_probs:87</code>) + <code>categorical_cross_entropy:95</code>. Ported from DEAS <span class="file">utils/hlg.py</span>.</td></tr>
+<tr><td><span class="file">utils/transformer.py</span></td><td><code>CausalPrefixCritic</code> gains <code>num_atoms</code> (<code>:60</code>); head is <code>Dense(num_atoms)</code> (<code>:118</code>), scalar only if <code>num_atoms==1</code> (<code>:119</code>). <code>PrefixValue</code> threads it (<code>:147,162</code>).</td></tr>
+<tr><td><span class="file">agents/aqc.py</span></td><td><code>critic_type</code> flag; HL-Gauss transforms built in <code>create()</code> (<code>:430</code>); helpers <code>_prefix_values:60</code>, <code>_scalar_to_probs:73</code>; loss branch <code>:153</code>; config <code>:469–473</code>.</td></tr>
+</table>
+<details><summary>Why a single <code>_prefix_values</code> helper instead of branching everywhere</summary>
+<p>The bootstrap and both extraction methods only ever need the <i>expected scalar</i> value. Funnelling them
+through one helper that converts logits→expected (distributional) or passes through (regression) means the
+distributional change touched the <b>loss only</b>; the ~120 lines of selection/bootstrap logic were unchanged.</p>
+</details>
+</section>
+
+<!-- ===================================================== §5 -->
+<section id="training" class="anchor">
+<h2 class="sec">§5 · Training setup (offline, frozen VLA)</h2>
+<p class="lead">This is where our setting differs from the ACSAC paper. The paper <i>jointly</i> trains the flow-BC
+policy and the critic online. We have a <b>frozen VLA</b> (Pi0.5) and train <b>critic-only</b>, offline, from
+precomputed data.</p>
+
+<h4>The mapping to ACSAC</h4>
+<table>
+<tr><th>ACSAC</th><th>Our offline / frozen-VLA setting</th></tr>
+<tr><td>flow-BC policy \(\pi_\theta\)</td><td>the <b>frozen VLA</b> (Pi0.5 flow-matching); not trained, only sampled from</td></tr>
+<tr><td>state \(s_t\)</td><td>\(s_t=\text{latent}\in\mathbb{R}^{2048}\) — the RL-token embedding, which now fuses the 3 cameras <b>and</b> proprioception (the VAE ingests proprio), so the critic input is the latent <b>only</b> (no separate proprio token)</td></tr>
+<tr><td>behavior chunk \(a_{t:t+H}\)</td><td>the dataset <code>action</code> sequence over the next \(H{=}50\) frames (14-D bimanual)</td></tr>
+<tr><td>bootstrap proposals \(\tilde a^{(n)}\)</td><td><b>precomputed</b> \(N\) VLA chunks per state (no flow sampling at train time)</td></tr>
+<tr><td>online interaction</td><td>none — pure offline from the LeRobot dataset</td></tr>
+</table>
+
+<p>So the transition \((s,a,r,s',a')\) maps as: \(s=\text{latent}_t\);
+\(a=a_{t:t+H}\) (the executed behavior chunk); \(r=\sum_{\tau} r_{t+\tau}\) (per-step rewards summed; ACSAC uses the
+discounted \(r^{(h)}_t\) per prefix); \(s'=s_{t+h}\) (the per-prefix next-state latents); and \(a'\) = the
+precomputed VLA candidate chunks at \(s'\).</p>
+
+<h4>Reward &amp; value support \([v_{\min},v_{\max}]\)</h4>
+<p>The reward is sparse-style: a <b>success</b> trajectory is \(r=-1,-1,\dots,-1,0\) (the \(0\) at the success
+step); a <b>failure</b> trajectory is \(r=-1,\dots,-1,-C_{\text{fail}}\) with a large penalty \(C_{\text{fail}}>0\)
+at the failure step. Rewards are then normalized so the value lands in \([-1,0]\). Hence for the distributional
+critic we set</p>
+<div class="eqwrap">$$ v_{\max}=0\quad(\text{best: immediate success}),\qquad v_{\min}=-1\quad(\text{worst: normalized failure return}). $$</div>
+<p>so the HL-Gauss support is \([-1,0]\) (a small margin, e.g. \([-1.0,\,0.0]\) with \(M{=}101\) atoms, is fine).</p>
+<div class="box note">
+<b>No discount (\(\gamma=1\)), following RECAP.</b> RECAP (\(\pi^\star_{0.6}\), Physical Intelligence) defines the
+return as the <i>undiscounted</i> sum \(R(\tau)=\sum_{t=0}^{T} r_t\) ("we do not use a discount factor") and a
+<b>distributional</b> value over \(B{=}201\) bins trained by cross-entropy — the same family as our HL-Gauss. So for
+this setting we set <code>--discount=1.0</code>, <code>v_min=-1</code>, <code>v_max=0</code>, and (to match RECAP)
+<code>num_atoms=201</code>. The return is bounded because episodes terminate (the <code>done</code> flag zeroes the
+bootstrap), and is normalized into \([-1,0]\).
+</div>
+<div class="box warn">
+<b>\(\gamma=1\) trades away the contraction guarantee — prefer \(\gamma=0.9999\).</b> ACSAC's contraction proof
+(Thm G.13) needs \(\gamma&lt;1\). With \(\gamma=1\) and a TD bootstrap this is lost. The clean fix is
+<code>--discount=0.9999</code>: the effective horizon \(1/(1-\gamma){=}10{,}000\) steps \(\gg\) the ~2000-step episodes,
+so it is <b>effectively undiscounted</b> over an episode (matching RECAP) yet the Bellman backup is a proper
+\(\gamma\)-contraction. The \([-1,0]\) support is unaffected (discounting only makes returns <i>less</i> negative).
+Use \(\gamma=1.0\) for an exact RECAP match, or \(0.99\) if you want stronger stability. Either way, HL-Gauss puts
+<i>zero</i> mass outside \([v_{\min},v_{\max}]\), so verify with the return-histogram check (§7) that &lt;1% is clipped.
+</div>
+<div class="box note">
+<b>Why TD, not Monte-Carlo.</b> RECAP trains its value by MC (target = empirical return-to-end). That cannot drive
+adaptive chunking: the MC return-to-end from \(t\) is the <i>same</i> regardless of prefix length \(h\) (the trajectory
+already continued under the behavior policy), so \(Q(s_t,a_{t:t+h})\) would be identical for all \(h\) — no \(h^\star\)
+signal. ACSAC's per-prefix \(G_h=r^{(h)}_t+V^\star(s_{t+h})\) is exactly RECAP's <i>advantage</i> n-step term
+\(\sum_{t'=t}^{t+N-1}r_{t'}+V(o_{t+N})\), made per-prefix and action-conditioned. The advantage
+\(A=Q(s,a_{t:t+h})-V(s)\) is the bridge to RECAP-style advantage-conditioning for downstream VLA policy extraction.
+</div>
+
+<h4>Critic-only objective</h4>
+<p>Since the VLA is frozen, there is <b>no actor / flow-BC loss</b> — we minimize only the (distributional)
+per-prefix TD loss of §3. The bootstrap reads the precomputed candidates instead of integrating a flow:</p>
+<div class="eqwrap">$$ \min_\phi\; \mathbb{E}_{\text{offline}}\!\left[\frac{1}{H}\sum_{h=1}^{H}\operatorname{CE}\!\Big(p^{\text{tgt}}(G_h),\,\ell_\phi(s_t,a_{t:t+h})\Big)\right],\qquad G_h = r^{(h)}_t+\gamma^h V^\star(s_{t+h}), $$</div>
+<p>with \(V^\star(s_{t+h})\) the expected-prefix-max over the <b>precomputed</b> candidates at \(s_{t+h}\).</p>
+
+<h4>Assumed per-frame data schema (to confirm with the data team)</h4>
+<pre><code>latent      float32 [2048]       # RL-token: 3 cams + proprio fused (state input, latent-only)
+reward      float32 []           # per-frame reward (sparse: -1/step, 0 success, -C_fail failure; normalized)
+action      float32 [14]         # executed behavior action at this frame -> builds a_{t:t+H}  (standard LeRobot field)
+done        bool/float []        # episode-end flag
+vla_chunks  float32 [N=32, 50, 14]  # frozen-VLA candidate chunks at this state (bootstrap a')
+(+ episode_index / frame_index)</code></pre>
+<p class="small">Per your note, each HF transition carries <code>latent</code>, <code>reward</code>, and the 32
+<code>vla_chunks</code>; we additionally rely on the standard LeRobot <code>action</code> (the executed behavior
+chunk) for the prediction side — confirm it is retained.</p>
+
+<div class="box warn">
+<b>Value support \([v_{\min},v_{\max}]\) must cover the realized return range.</b> HL-Gauss puts zero mass
+outside the support, so if returns can fall below \(v_{\min}\) (or above \(v_{\max}\)) the critic cannot
+represent them. We estimate \([v_{\min},v_{\max}]\) from the dataset's discounted returns (a small setup
+script) once the reward column is available.
+</div>
+<div class="box warn">
+<b>Bootstrap N vs precomputed 32.</b> We precompute 32 chunks/state (deploy can use best-of-32), but the
+<i>training</i> bootstrap uses <code>num_action_samples</code> (default 8) of them — the ACSAC ablation shows
+\(N\ge6\) saturates, and full 32 at \(H{=}50\) is ~4× slower. Configurable.
+</div>
+<div class="box kr">
+세팅 차이: 논문은 flow-BC와 critic을 온라인에서 함께 학습하지만, 우리는 <b>frozen VLA</b>로 <b>critic만</b> offline
+학습합니다. 상태는 <b>latent(2048)만</b> 사용합니다(proprio가 이제 VAE에 들어가 latent에 포함됨), 행동은 14-D,
+\(H{=}50\). bootstrap 후보 chunk는 학습 중 VLA를 호출하지 않고 <b>미리 계산해 저장한 것</b>을 사용합니다. 보상은
+성공 \(-1,\dots,-1,0\) / 실패 \(-1,\dots,-1,-C_{\text{fail}}\)이며 정규화 후 value가 \([-1,0]\)에 들어가므로
+\(v_{\min}=-1,\,v_{\max}=0\). support는 실제 return 범위를 반드시 덮어야 합니다(§7 히스토그램 확인).
+</div>
+</section>
+
+<!-- ===================================================== §6 -->
+<section id="configs" class="anchor">
+<h2 class="sec">§6 · Configs &amp; running</h2>
+
+<div class="box tap">
+<b>Locked settings for the frozen-VLA challenge critic</b> (RECAP-aligned):
+<table style="margin-top:6px">
+<tr><th>Setting</th><th>Value</th><th>Why</th></tr>
+<tr><td><code>critic_type</code></td><td><code>distributional</code></td><td>HL-Gauss (DEAS) + RECAP distributional value</td></tr>
+<tr><td><code>discount</code></td><td><b>0.9999</b></td><td>≈ undiscounted (RECAP \(\gamma{=}1\)) yet contractive; <code>1.0</code> exact / <code>0.99</code> safer</td></tr>
+<tr><td><code>v_min, v_max</code></td><td><b>−1, 0</b></td><td>normalized return support (success \(=0\), failure \(=-1\))</td></tr>
+<tr><td><code>num_atoms</code></td><td><b>201</b></td><td>matches RECAP's 201 value bins</td></tr>
+<tr><td>state input</td><td><b>latent 2048</b></td><td>proprio is inside the VAE/latent → latent-only</td></tr>
+<tr><td>behavior chunk</td><td>executed <code>action</code></td><td>ACSAC-faithful; 32 <code>vla_chunks</code> = bootstrap \(a'\)</td></tr>
+<tr><td><code>horizon_length</code> \(H\)</td><td><b>50</b></td><td>VLA action horizon</td></tr>
+<tr><td><code>num_action_samples</code> \(N\)</td><td><b>8</b></td><td>bootstrap size (32 precomputed; ablation saturates \(\ge6\))</td></tr>
+</table>
+</div>
+
+<table>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><code>--agent.critic_type</code></td><td><code>regression</code></td><td><code>regression</code> (scalar MSE) or <code>distributional</code> (HL-Gauss CE)</td></tr>
+<tr><td><code>--agent.num_atoms</code></td><td><code>101</code></td><td>categorical atoms \(M\)</td></tr>
+<tr><td><code>--agent.v_min / --agent.v_max</code></td><td>—</td><td>value support (required for distributional; estimate from returns)</td></tr>
+<tr><td><code>--agent.hl_gauss_sigma</code></td><td><code>0.75</code></td><td>Gaussian smoothing in bin-width units</td></tr>
+<tr><td><code>--horizon_length</code></td><td><code>5</code> (OGBench) / <code>50</code> (VLA)</td><td>max chunk size \(H\)</td></tr>
+<tr><td><code>--agent.num_action_samples</code></td><td><code>4</code> / <code>8</code></td><td>bootstrap &amp; extraction \(N\)</td></tr>
+</table>
+<h4>Example (distributional, OGBench — runnable today)</h4>
+<pre><code>python main.py --agent agents/aqc.py \
+  --agent.critic_type=distributional --agent.num_atoms=101 \
+  --agent.v_min=-100 --agent.v_max=0 \
+  --env_name=cube-double-play-singletask-task1-v0 \
+  --horizon_length=5 --agent.num_action_samples=4</code></pre>
+<h4>Target config (frozen-VLA challenge data — RECAP-aligned)</h4>
+<pre><code>python main.py --agent agents/aqc.py \
+  --agent.critic_type=distributional --agent.num_atoms=201 \   # 201 bins (RECAP)
+  --agent.v_min=-1 --agent.v_max=0 \                           # normalized return support
+  --discount=0.9999 \                                          # near-undiscounted (RECAP) + contractive; 1.0 exact / 0.99 safer
+  --horizon_length=50 --agent.num_action_samples=8             # H=50; bootstrap N (32 precomputed)</code></pre>
+<p class="small">The frozen-VLA / latent-input data path (\(H{=}50\), precomputed candidates, latent-only state) is implemented
+against the schema in §5 and validated on synthetic data; the real LeRobot reader is wired once the data team confirms
+the format.</p>
+</section>
+
+<!-- ===================================================== §7 -->
+<section id="verify" class="anchor">
+<h2 class="sec">§7 · Verification ★</h2>
+<p class="lead">How to convince yourself the distributional critic is correct. ✅ = already run during
+implementation; ☐ = to run on real data / hardware.</p>
+<table>
+<tr><th></th><th>Check</th><th>Expectation</th></tr>
+<tr><td>✅</td><td><b>HL-Gauss round-trip</b>: scalar \(y\to p^{\text{tgt}}(y)\to\sum_i p_i c_i\)</td><td>recovers \(y\) (we saw \(-9.3,-5,-1.2\to\) same); \(\sum_i p_i=1\)</td></tr>
+<tr><td>✅</td><td><b>Shapes</b> at real sizes (\(H{=}50\), latent 2048, \(M{=}101\))</td><td>logits \((K,B,50,101)\); expected value \((K,B,50)\); CE \((K,B,50)\)</td></tr>
+<tr><td>✅</td><td><b>Both types train end-to-end</b> (create→update→extract)</td><td>finite losses; <code>regression</code> bit-identical to before; <code>distributional</code> \(q\_mean\) inside \([v_{\min},v_{\max}]\)</td></tr>
+<tr><td>✅</td><td><b>Prefix consistency</b> (causal mask) — inherited from the backbone</td><td>changing \(a_{h:H}\) leaves \(Q(\cdot,a_{1:h})\) bit-unchanged</td></tr>
+<tr><td>☐</td><td><b>Support coverage</b>: histogram of dataset returns vs \([v_{\min},v_{\max}]\)</td><td>&lt;1% mass clipped at the edges</td></tr>
+<tr><td>☐</td><td><b>Calibration</b>: binned predicted \(\hat Q\) vs realized Monte-Carlo return \(\hat G\)</td><td>points track the diagonal (ACSAC Fig. 4)</td></tr>
+<tr><td>☐</td><td><b>Distributional ≈ regression</b> control on the same data</td><td>expected values agree within noise; distributional usually steadier</td></tr>
+<tr><td>☐</td><td><b>Critic ↔ task success</b> correlation</td><td>higher \(Q\) for success rollouts than failures (offline metric)</td></tr>
+</table>
+<div class="box tap">
+The quickest "is it learning?" signal: watch <code>critic/q_mean</code> and <code>critic/v_next_mean</code>
+stay inside \([v_{\min},v_{\max}]\) and converge, and the predicted-distribution entropy shrink over training
+(peaked histograms = confident value). If \(q\_mean\) pins to an edge, widen the support.
+</div>
+<div class="box kr">
+검증 순서: ① HL-Gauss 왕복(스칼라→분포→스칼라) ② shape ③ 두 critic 타입 모두 학습되는지 ④ support가 return
+범위를 덮는지 ⑤ calibration(예측값 vs 실제 MC return이 대각선) ⑥ 성공/실패 rollout 간 \(Q\) 차이. ①~④는 이미
+확인했고, ⑤·⑥은 실제 데이터에서 수행합니다.
+</div>
+</section>
+
+<!-- ===================================================== §8 -->
+<section id="glossary" class="anchor">
+<h2 class="sec">§8 · Glossary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>ACSAC / AQC</td><td>Adaptive (Chunk Size) Q-Chunking — per-prefix critic + adaptive horizon \(h^\star\)</td></tr>
+<tr><td>distributional critic</td><td>predicts a categorical value distribution; trained by cross-entropy, not MSE</td></tr>
+<tr><td>HL-Gauss</td><td>histogram-loss with a Gaussian: scalar target \(\to\) soft two-hot label over \(M\) bins</td></tr>
+<tr><td>support / atoms</td><td>fixed value grid \([v_{\min},v_{\max}]\) with \(M\) bins; centers \(c_i\)</td></tr>
+<tr><td>\(p^{\text{tgt}}(y)\)</td><td><code>transform_to_probs</code>: scalar \(y\to\) soft histogram</td></tr>
+<tr><td>\(\sum_i p_i c_i\)</td><td><code>transform_from_probs</code>: distribution \(\to\) scalar expected value</td></tr>
+<tr><td>expected-prefix-max</td><td>bootstrap = \(\max\) over \(N\times H\) prefixes of expected values, \(\min\) over ensemble</td></tr>
+<tr><td>frozen VLA</td><td>Pi0.5 flow-matching policy; our ACSAC "flow-BC", not trained — only sampled (precomputed)</td></tr>
+<tr><td>latent / RL-token</td><td>2048-D embedding fusing the 3 cameras + proprio; the critic's state input</td></tr>
+<tr><td>\(N\) / \(H\)</td><td>candidate count (bootstrap 8, precomputed 32) / max chunk size (50 for the VLA)</td></tr>
+</table>
+<hr/>
+<p class="small">Companion docs: <span class="file">implementation_plan.html</span> (as-designed plan + deviations),
+<span class="file">aqc_reading_guide.html</span> (code↔paper review of the base regression critic). Code refs point at
+the source at the time of writing — re-verify line numbers if they drift. Open first: §3 (distributional critic)
+and §5 (training setup).</p>
+</section>
+
+</main>
+</div>
+<script>
+const links = [...document.querySelectorAll('nav.side a')];
+const map = {};
+links.forEach(a=>{const id=a.getAttribute('href').slice(1); map[id]=a;});
+const obs = new IntersectionObserver((entries)=>{
+  entries.forEach(e=>{
+    if(e.isIntersecting){
+      links.forEach(l=>l.classList.remove('active'));
+      const a = map[e.target.id];
+      if(a) a.classList.add('active');
+    }
+  });
+},{rootMargin:'-10% 0px -80% 0px',threshold:0});
+document.querySelectorAll('section[id]').forEach(s=>obs.observe(s));
+function filterNav(){
+  const q = document.getElementById('filter').value.toLowerCase();
+  links.forEach(a=>{
+    if(a.classList.contains('grp')) return;
+    a.style.display = a.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+  document.querySelectorAll('nav.side .grp').forEach(g=>g.style.display = q ? 'none' : '');
+}
+</script>
+</body>
+</html>

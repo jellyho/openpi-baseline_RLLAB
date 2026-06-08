@@ -1,0 +1,16 @@
+__pycache__/
+.vscode/
+dist/
+*.py[cod]
+*$py.class
+*.egg-info/
+.DS_Store
+.idea/
+.ruff_cache/
+exp/
+
+# AQC: generated training artifacts (not committed)
+scripts/aqc/sweep/logs/
+scripts/aqc/sweep/jobs_*.txt
+slurm-*.out
+*.mp4
