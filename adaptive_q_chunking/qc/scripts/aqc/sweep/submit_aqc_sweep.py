@@ -41,7 +41,8 @@ def build_jobs(cfg, ts):
                         for seed in sweep["seed"]:
                             rg = f"{prefix}_{env_id}_{critic_type}"
                             if critic_type == "distributional":
-                                rg += f"_a{num_atoms}_sup-{support}"
+                                rg += f"_a{num_atoms}"
+                                rg += "_rnorm" if fixed.get("reward_normalize", False) else f"_sup-{support}"
                             rg += f"_H{H}"
                             a = [
                                 f"--agent={fixed['agent']}",
@@ -65,6 +66,7 @@ def build_jobs(cfg, ts):
                                 f"--wandb_entity={fixed['wandb_entity']}",
                                 f"--wandb_project={fixed['wandb_project']}",
                                 f"--support_type={support}",
+                                f"--reward_normalize={str(fixed.get('reward_normalize', False))}",
                             ]
                             if critic_type == "distributional":
                                 a.append(f"--agent.num_atoms={num_atoms}")

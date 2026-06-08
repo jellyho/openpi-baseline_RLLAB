@@ -44,6 +44,11 @@ flags.DEFINE_string('support_type', 'data',
                     "Value support: 'data' (return-to-go percentiles, DEAS-d), "
                     "'universal' (theoretical r/(1-gamma), DEAS-u), or 'custom' (use --agent.v_min/v_max).")
 flags.DEFINE_float('support_margin', 0.05, 'Margin (fraction of p99-p1) added to the data support.')
+flags.DEFINE_bool('reward_normalize', False,
+                  "Scale dense rewards so the discounted return-to-go lands in [-1, 0] "
+                  "(scale derived from the data's return bounds). Forces a fixed value "
+                  "support v_min=-1, v_max=0 for the distributional critic. Applied to both "
+                  "the offline dataset and online-collected rewards.")
 
 flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
@@ -173,22 +178,42 @@ def main(_):
         return ds
     
     train_dataset = process_train_dataset(train_dataset)
+
+    # Optional reward normalization: scale rewards so the discounted return-to-go lands in
+    # [-1, 0], then use a fixed value support. Decouples num_atoms/sigma from the task's
+    # reward magnitude and matches the eventual VLA reward scale.
+    reward_scale = 1.0
+    if FLAGS.reward_normalize:
+        from utils.distributional import compute_reward_scale
+        reward_scale, g_low, g_high = compute_reward_scale(
+            np.asarray(train_dataset['rewards']), np.asarray(train_dataset['terminals']),
+            discount=discount, margin=FLAGS.support_margin)
+        ds_dict = {k: v for k, v in train_dataset.items()}
+        ds_dict['rewards'] = np.asarray(train_dataset['rewards']) * reward_scale
+        train_dataset = Dataset.create(**ds_dict)
+        print(f"[reward_normalize] scale={reward_scale:.6g} (return-to-go [{g_low:.2f}, {g_high:.2f}] "
+              f"-> [{g_low*reward_scale:.3f}, {g_high*reward_scale:.3f}])", flush=True)
+
     example_batch = train_dataset.sample(())
 
-    # Distributional value support: estimate from data (DEAS-style) unless 'custom'.
+    # Distributional value support: fixed [-1, 0] if reward-normalized, else data/universal (DEAS-style).
     if ('critic_type' in config) and (config['critic_type'] == 'distributional') and FLAGS.support_type != 'custom':
-        from utils.distributional import estimate_value_support, universal_value_support
-        ds_rewards = np.asarray(train_dataset['rewards'])
-        if FLAGS.support_type == 'data':
-            vmin, vmax = estimate_value_support(
-                ds_rewards, np.asarray(train_dataset['terminals']),
-                discount=discount, margin=FLAGS.support_margin)
-        elif FLAGS.support_type == 'universal':
-            vmin, vmax = universal_value_support(float(ds_rewards.min()), float(ds_rewards.max()), discount)
+        if FLAGS.reward_normalize:
+            config['v_min'], config['v_max'] = -1.0, 0.0
+            print(f"[support] reward_normalize -> fixed v_min=-1.000, v_max=0.000", flush=True)
         else:
-            raise ValueError(f"unknown support_type: {FLAGS.support_type}")
-        config['v_min'], config['v_max'] = float(vmin), float(vmax)
-        print(f"[support] type={FLAGS.support_type} -> v_min={config['v_min']:.3f}, v_max={config['v_max']:.3f}", flush=True)
+            from utils.distributional import estimate_value_support, universal_value_support
+            ds_rewards = np.asarray(train_dataset['rewards'])
+            if FLAGS.support_type == 'data':
+                vmin, vmax = estimate_value_support(
+                    ds_rewards, np.asarray(train_dataset['terminals']),
+                    discount=discount, margin=FLAGS.support_margin)
+            elif FLAGS.support_type == 'universal':
+                vmin, vmax = universal_value_support(float(ds_rewards.min()), float(ds_rewards.max()), discount)
+            else:
+                raise ValueError(f"unknown support_type: {FLAGS.support_type}")
+            config['v_min'], config['v_max'] = float(vmin), float(vmax)
+            print(f"[support] type={FLAGS.support_type} -> v_min={config['v_min']:.3f}, v_max={config['v_max']:.3f}", flush=True)
 
     agent_class = agents[config['agent_name']]
     agent = agent_class.create(
@@ -332,6 +357,9 @@ def main(_):
         if FLAGS.sparse:
             assert int_reward <= 0.0
             int_reward = (int_reward != 0.0) * -1.0
+
+        # Match the offline reward scale so online transitions live on the same value support.
+        int_reward = int_reward * reward_scale
 
         transition = dict(
             observations=ob,

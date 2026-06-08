@@ -1,9 +1,6 @@
 """HL-Gauss distributional value utilities for the AQC critic.
 
-Ported (lightly adapted) from the DEAS-FQL reference implementation
-(``third_party/DEAS-FQL/utils/hlg.py``), which itself follows "Stop Regressing: Training
-Value Functions via Classification for Scalable Deep RL" (Farebrother et al., 2024,
-arXiv:2403.03950).
+
 
 A distributional critic predicts a categorical distribution over ``num_bins`` fixed atoms
 on a value support ``[v_min, v_max]`` instead of a single scalar. A *scalar* regression
@@ -135,6 +132,27 @@ def estimate_value_support(rewards, terminals, discount, p_low=1.0, p_high=99.0,
     hi = float(np.percentile(rtg, p_high))
     delta = margin * (hi - lo + 1e-8)
     return lo - delta, hi + delta
+
+
+def compute_reward_scale(rewards, terminals, discount, p_low=1.0, margin=0.05):
+    """Scale factor mapping the dataset's discounted return-to-go into ``[-1, 0]``.
+
+    For negative dense-cost rewards (return-to-go in ``[G_min, ~0]``), returns a single
+    scalar ``s`` such that ``s * reward`` gives returns whose span lands in ``[-1, 0]``:
+    ``s = 1 / (|G_low| * (1 + margin))`` where ``G_low`` is the ``p_low`` percentile of the
+    return-to-go (robust to a few outlier episodes; the fixed ``[-1, 0]`` support's edge bin
+    absorbs any tail beyond ``-1``). Use with a fixed support ``v_min=-1, v_max=0``.
+
+    Returns:
+        ``(scale, g_low, g_high)`` — the scale and the (unscaled) return-to-go bounds used.
+    """
+    import numpy as np
+    rtg = compute_return_to_go(rewards, terminals, discount)
+    g_low = float(np.percentile(rtg, p_low))
+    g_high = float(np.percentile(rtg, 100.0))
+    span = max(abs(g_low), abs(g_high), 1e-8)
+    scale = 1.0 / (span * (1.0 + margin))
+    return scale, g_low, g_high
 
 
 def universal_value_support(r_min, r_max, discount):
