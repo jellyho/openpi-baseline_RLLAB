@@ -26,6 +26,8 @@ that many actions.
 | Action selection | best-of-`N` chunks | **best-of-`N×H`** (candidate × prefix), joint arg-max (Eq. 8) |
 | Bootstrap value | `max_n` | **`max_{n,h}`** expected-prefix-max (Eq. 19) |
 | Ensemble agg. | mean | **min** (K=2) |
+| Output head | single scalar head | **one head per prefix position** (Prop. G.7); shared head optional |
+| Critic | scalar regression | **regression or distributional** (HL-Gauss); selectable |
 | Target network | Polyak (`τ`) | **online critic, stop-grad** (Pre-LN stability); Polyak optional |
 | Deployment | fixed `H` actions / replan | **adaptive `h*` actions / replan** |
 | Policy | flow-BC (+ optional distill) | flow-BC + rejection sampling (reused from QC) |
@@ -40,9 +42,10 @@ and config system are **reused unchanged** from QC.
 ### Added
 | File | Purpose |
 |---|---|
-| `utils/transformer.py` | `CausalPrefixCritic` (causal Transformer emitting all `H` prefix Q-values) + `PrefixValue` (encoder + K-ensemble wrapper). |
-| `agents/aqc.py` | `AQCAgent`: per-horizon multi-step TD loss, expected-prefix-max target, flow-BC actor loss, adaptive `(n*, h*)` extraction, `get_config()`. |
-| `scripts/aqc/*.sh` | Example launch commands (offline, offline-to-online, smoke, cube-quadruple-100M). |
+| `utils/transformer.py` | `CausalPrefixCritic` (causal Transformer emitting all `H` prefix Q-values; per-position output heads, scalar or `num_atoms`-way categorical) + `PrefixValue` (encoder + K-ensemble wrapper). |
+| `utils/distributional.py` | HL-Gauss transform + categorical cross-entropy and the value-support estimators (`data` / `universal`) for the distributional critic. |
+| `agents/aqc.py` | `AQCAgent`: per-horizon multi-step TD loss (regression MSE or distributional CE), expected-prefix-max target, flow-BC actor loss, adaptive `(n*, h*)` extraction, `get_config()`. |
+| `scripts/aqc/*.sh`, `scripts/aqc/sweep/` | Example launch commands + the `cfg.json -> manifest -> array` sweep launcher. |
 | `AQC.md` | This document. |
 
 ### Modified (backward-compatible — QC behaviour is unchanged)
@@ -84,6 +87,17 @@ MUJOCO_GL=egl python main.py --agent agents/aqc.py \
 ### Offline only
 ```bash
 bash scripts/aqc/offline.sh cube-double-play-singletask-task1-v0 0 False
+```
+
+### Distributional critic (HL-Gauss)
+Swap the scalar regression critic for a categorical (HL-Gauss) one with `--agent.critic_type`.
+The value support (bin range) is set by `--support_type`: `data` (p1/p99 of dataset
+return-to-go + margin), `universal` (`r/(1-γ)` bounds), or `custom` (`--agent.v_min/v_max`).
+```bash
+MUJOCO_GL=egl python main.py --agent agents/aqc.py \
+  --env_name=cube-double-play-singletask-task1-v0 \
+  --horizon_length=5 --agent.num_action_samples=4 \
+  --agent.critic_type=distributional --agent.num_atoms=101 --support_type=data
 ```
 
 ### Quick smoke test (real env, a few thousand steps)
@@ -132,8 +146,13 @@ To reproduce the paper's exact numbers:
 | `--agent.use_target_critic` | `False` | Paper default = online critic with stopped gradient. Set `True` for a Polyak target (`τ=5e-3`) if you observe value divergence. |
 | `--agent.q_agg` | `min` | Ensemble aggregation (ACSAC uses `min`). |
 | `--agent.num_qs` | 2 | Critic ensemble size `K`. |
+| `--agent.per_position_head` | `True` | One output head per prefix position (paper, Prop. G.7). `False` = a single tied head shared across positions. |
 | `--agent.transformer_num_layers / _num_heads / _head_dim` | 2 / 8 / 16 | Causal Transformer (`n_embd = heads × head_dim = 128`). |
 | `--agent.flow_steps` | 10 | Euler steps `F` for the flow-BC policy. |
+| `--agent.critic_type` | `regression` | `regression` (scalar MSE) or `distributional` (HL-Gauss categorical CE). |
+| `--agent.num_atoms` | 101 | Categorical atoms (distributional only). |
+| `--agent.hl_gauss_sigma` | 0.75 | HL-Gauss label smoothing, in bin-width units (distributional only). |
+| `--support_type` (CLI) | `data` | Value-support range for the distributional critic: `data` / `universal` / `custom` (the last uses `--agent.v_min/v_max`). |
 
 ### Switching between QC and AQC
 * **QC** (fixed chunk, rejection sampling): `python main.py --agent agents/acfql.py --agent.actor_type=best-of-n --agent.actor_num_samples=32 --horizon_length=5 …`

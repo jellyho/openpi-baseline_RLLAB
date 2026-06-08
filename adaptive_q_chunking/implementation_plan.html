@@ -209,13 +209,18 @@ Polyak target available as a fallback flag.</li>
   CausalPrefixCritic(nn.Module)      # one critic: (obs, flat_chunk) -> (..., H) prefix Q-values
     - Dense state-token + Dense action-token embeddings, learned positional embeddings
     - n_layer Pre-LN Transformer blocks (MultiHeadDotProductAttention + GELU MLP), causal mask
-    - final LayerNorm, shared Dense(1) head read at each of the H action positions
+    - final LayerNorm, one output head per position (H heads, Prop. G.7); shared head optional
+    - head emits a scalar (regression) or num_atoms categorical logits (distributional / HL-Gauss)
   PrefixValue(nn.Module)             # mirrors networks.Value: optional encoder + ensemblize(K)
-    - __call__(obs, actions) -> (K, ..., H)
+    - __call__(obs, actions) -> (K, ..., H) scalar   or   (K, ..., H, num_atoms) logits
+
+utils/distributional.py
+  hl_gauss_transform, categorical_cross_entropy        # HL-Gauss target + CE loss
+  estimate_value_support (data) / universal_value_support  # v_min/v_max from data or r/(1-gamma)
 
 agents/aqc.py
   AQCAgent(flax.struct.PyTreeNode)
-    critic_loss      # per-horizon multi-step TD (Eq. 6), expected-prefix-max target (Eq. 5/19)
+    critic_loss      # per-horizon multi-step TD (Eq. 6): regression MSE or distributional CE; expected-prefix-max target (Eq. 5/19)
     actor_loss       # flow-BC matching loss only (Eq. 7)
     _target_values   # batched V*(s') = max over N x H prefixes, min over K  (Eq. 19)
     sample_actions   # adaptive (n*,h*) extraction -> (full_chunk, h*)       (Eq. 8)
@@ -284,8 +289,9 @@ reported. Offline protocol = average of last 3 eval epochs (800k/900k/1M); O2O =
 <h2 id="files">5. Files Added / Modified</h2>
 <table>
 <tr><th>File</th><th>Action</th><th>Purpose</th></tr>
-<tr><td><code>qc/utils/transformer.py</code></td><td class="bad">new</td><td>Causal prefix critic + ensemble wrapper</td></tr>
-<tr><td><code>qc/agents/aqc.py</code></td><td class="bad">new</td><td>AQC agent + <code>get_config()</code></td></tr>
+<tr><td><code>qc/utils/transformer.py</code></td><td class="bad">new</td><td>Causal prefix critic (per-position heads, scalar or categorical) + ensemble wrapper</td></tr>
+<tr><td><code>qc/utils/distributional.py</code></td><td class="bad">new</td><td>HL-Gauss transform, categorical CE, value-support estimators (data / universal)</td></tr>
+<tr><td><code>qc/agents/aqc.py</code></td><td class="bad">new</td><td>AQC agent (regression or distributional critic) + <code>get_config()</code></td></tr>
 <tr><td><code>qc/agents/__init__.py</code></td><td class="warn">modify</td><td>register <code>aqc=AQCAgent</code></td></tr>
 <tr><td><code>qc/evaluation.py</code></td><td class="warn">modify</td><td>handle <code>(chunk, h*)</code>; log adaptive chunk length (back-compatible)</td></tr>
 <tr><td><code>qc/main.py</code></td><td class="warn">modify</td><td>online loop handles adaptive return; log mean h*</td></tr>
@@ -307,10 +313,23 @@ final LayerNorm are always on.
 </div>
 
 <div class="box dev">
-<b>DD-2 — Shared output head across positions.</b> Prop. G.7 says "one output head per position"; the shared-backbone
-/ common-return-scale argument (§4.1) implies tied weights. <i>Decision:</i> a single <code>Dense(1)</code> head applied
-at every action token (as in TOP-ERL/T-SAC). <i>Impact:</i> fewer params, better cross-horizon calibration; matches the
-2.46M parameter count. Per-position heads can be added later if needed.
+<b>DD-2 — One output head per prefix position (paper-faithful).</b> Prop. G.7 states "one output head per
+position". <i>Decision:</i> <code>per_position_head=True</code> (default) — a distinct
+<code>(n_embd&rarr;num_atoms)</code> projection at each of the <code>H</code> action positions, implemented as a single
+batched <code>einsum</code>. <i>Impact:</i> each prefix length gets its own readout while sharing the Transformer
+backbone; a tied/shared head remains available via <code>per_position_head=False</code> for ablation. (Earlier drafts
+used a shared head for parameter economy; switched to per-position to match the paper.)
+</div>
+
+<div class="box dev">
+<b>DD-2b — Distributional critic (HL-Gauss), selectable.</b> Beyond the scalar regression critic, a categorical
+value head is available via <code>critic_type=distributional</code> (HL-Gauss: scalar target &rarr; truncated-Gaussian
+soft histogram over <code>num_atoms</code> bins, cross-entropy loss, expected value = &Sigma; p<sub>i</sub>c<sub>i</sub>).
+The per-prefix categorical naturally fits the per-position heads (DD-2). <i>Value support</i> (<code>v_min/v_max</code>)
+is set principledly via <code>--support_type</code>: <code>data</code> (p1/p99 of dataset return-to-go + margin),
+<code>universal</code> (<code>r/(1-&gamma;)</code> bounds), or <code>custom</code>. <i>Decision:</i> default
+<code>regression</code> (matches the paper's critic); distributional is opt-in for the VLA/offline setting where a
+bounded return scale helps. See <code>aqc_distributional_guide.html</code> for the full derivation.
 </div>
 
 <div class="box dev">
