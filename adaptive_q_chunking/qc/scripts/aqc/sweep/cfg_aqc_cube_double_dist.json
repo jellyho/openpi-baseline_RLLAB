@@ -1,0 +1,40 @@
+{
+  "_comment": "Distributional critic (HL-Gauss, num_atoms=201, support=data), dense reward (sparse=false), H=5, target=False. cube-double task2..task5 x 2 seeds = 8 jobs (task1 already covered by the 1633568 dense sweep). Each task -> its own W&B group (only seed varies).",
+  "fixed": {
+    "tag": "dense",
+    "agent": "agents/aqc.py",
+    "use_target_critic": false,
+    "num_action_samples": 4,
+    "discount": 0.99,
+    "offline_steps": 500000,
+    "online_steps": 0,
+    "eval_interval": 50000,
+    "eval_episodes": 30,
+    "video_episodes": 1,
+    "save_interval": 0,
+    "wandb_entity": "gwanwoo-yonsei-university",
+    "wandb_project": "AQC",
+    "support_type": "data"
+  },
+  "sweep": {
+    "critic_type": [
+      "distributional"
+    ],
+    "num_atoms": [
+      201
+    ],
+    "horizon_length": [
+      5
+    ],
+    "seed": [
+      0,
+      1
+    ]
+  },
+  "envs": {
+    "cube-double-play-singletask-task2-v0": { "sparse": false, "v_min": -220, "v_max": 0 },
+    "cube-double-play-singletask-task3-v0": { "sparse": false, "v_min": -220, "v_max": 0 },
+    "cube-double-play-singletask-task4-v0": { "sparse": false, "v_min": -220, "v_max": 0 },
+    "cube-double-play-singletask-task5-v0": { "sparse": false, "v_min": -220, "v_max": 0 }
+  }
+}

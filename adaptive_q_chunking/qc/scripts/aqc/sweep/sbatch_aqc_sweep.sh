@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --requeue
-#SBATCH --exclude=node16,node19,node08,node31,node04,node05,node18
+#SBATCH --exclude=node16,node19,node08,node31,node04,node05,node18,cs-gpu-01
 #
 # AQC sweep array worker. Reads its arg-line from the manifest produced by
 # submit_aqc_sweep.py (line number = SLURM_ARRAY_TASK_ID + 1) and runs main.py.
