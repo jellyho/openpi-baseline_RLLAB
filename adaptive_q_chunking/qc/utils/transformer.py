@@ -21,9 +21,12 @@ Design choices (documented in implementation_plan.html):
   * Pre-LayerNorm before every attention/MLP sublayer + a final LayerNorm. The bounded NTK
     from LayerNorm (SEEM, ref. [43]) is what lets ACSAC bootstrap from the online critic
     with a stopped gradient instead of a Polyak target network.
-  * A single shared ``Dense(1)`` output head read at each action-token position (tied
-    weights), consistent with the shared-backbone / common-return-scale argument and with
-    the paper's small parameter count.
+  * One output head per prefix position (``per_position_head=True``, the default), following
+    the paper's "one output head per position" (Prop. G.7): a distinct
+    ``(n_embd -> num_atoms)`` projection at each of the ``H`` action-token positions. A shared
+    (tied-weights) head is available via ``per_position_head=False``.
+  * ``num_atoms`` selects the critic head: ``1`` -> a scalar (regression) Q-value;
+    ``>1`` -> per-prefix categorical logits for the distributional (HL-Gauss) critic.
   * Learned absolute positional embeddings over ``L = H + 1`` tokens (H is small).
 """
 
@@ -114,7 +117,7 @@ class CausalPrefixCritic(nn.Module):
 
         # --- Read prefix Q-values from the action-token hidden states -------------------
         # Action token at position p (1..H) has attended to {s_t, a_t, ..., a_{t+p-1}},
-        # so reading a shared head there yields Q(s_t, a_{t:t+p}).
+        # so reading a head there yields Q(s_t, a_{t:t+p}).
         action_hidden = x[..., 1:, :]                                 # (..., H, n_embd)
         if self.per_position_head:
             # One output head per prefix position h (paper: "one output head per position").

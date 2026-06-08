@@ -25,6 +25,8 @@ def build_jobs(cfg, ts):
     default_support = fixed.get("support_type", "data")  # 'data' (DEAS-d) / 'universal' / 'custom'
     jobs = []
     for env, env_cfg in envs.items():
+        # Short, stable per-task id so each task is its own W&B group (only seed varies).
+        env_id = env.replace("-play-singletask", "").replace("-v0", "")
         for critic_type in sweep["critic_type"]:
             # num_atoms & support_type only matter for the distributional critic.
             if critic_type == "distributional":
@@ -37,7 +39,7 @@ def build_jobs(cfg, ts):
                 for support in support_list:
                     for H in sweep["horizon_length"]:
                         for seed in sweep["seed"]:
-                            rg = f"{prefix}_{critic_type}"
+                            rg = f"{prefix}_{env_id}_{critic_type}"
                             if critic_type == "distributional":
                                 rg += f"_a{num_atoms}_sup-{support}"
                             rg += f"_H{H}"

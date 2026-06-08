@@ -346,7 +346,7 @@ output head read at action token p (1..H)  →  Q(s_t, a_{t:t+p})        (transf
 <tr><td>positional emb</td><td>learned absolute, <code>(L,n_embd)</code></td><td><code>:85</code></td><td>(unspecified → OQ-1)</td></tr>
 <tr><td>causal mask</td><td><code>nn.make_causal_mask</code></td><td><code>:90</code></td><td>Prop G.7</td></tr>
 <tr><td>blocks</td><td><b>Pre-LN</b> attn + GELU MLP, residual</td><td><code>:93–106</code></td><td>App B (Pre-LN)</td></tr>
-<tr><td>read heads</td><td>shared <code>Dense(1)</code> at action tokens 1..H</td><td><code>:114–115</code></td><td>§4.1 (shared backbone)</td></tr>
+<tr><td>read heads</td><td>one head per position (H heads), scalar or <code>num_atoms</code> logits, at action tokens 1..H</td><td><code>:119–129</code></td><td>Prop G.7 (one head / position)</td></tr>
 <tr><td>ensemble</td><td><code>PrefixValue</code> wraps with <code>ensemblize(K)</code></td><td><code>:119,:144</code></td><td>App B (K=2)</td></tr>
 </table>
 
@@ -669,7 +669,8 @@ anchor, and what to check. This is the section to read with the paper open.</p>
 <table>
 <tr><th>ID</th><th>Deviation</th><th>Why it's OK</th></tr>
 <tr><td>DD-1</td><td>default = online-critic target (Polyak optional)</td><td>this <i>is</i> the paper's choice (App B); fallback flag exists</td></tr>
-<tr><td>DD-2</td><td>single shared output head across positions</td><td>shared-backbone / common-scale argument; matches small param count</td></tr>
+<tr><td>DD-2</td><td>one output head per position (default; shared head optional)</td><td>paper-faithful (Prop G.7, "one output head per position")</td></tr>
+<tr><td>DD-2b</td><td>optional distributional (HL-Gauss) critic + data/universal value support</td><td>opt-in; default stays scalar regression (the paper's critic)</td></tr>
 <tr><td>DD-3</td><td>bootstrap at all H next-states (no subsampling)</td><td>faithful to Eq. 6; it's the cost, not an approximation</td></tr>
 <tr><td>OQ-1</td><td>learned absolute positional emb</td><td>paper unspecified; standard choice, H is tiny</td></tr>
 </table>
