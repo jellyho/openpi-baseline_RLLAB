@@ -1,12 +1,12 @@
 {
-  "_comment": "num_atoms tuning on a FIXED task (cube-double task3), distributional + reward_normalize (fixed [-1,0] support so atoms is the sole resolution knob), dense, H=5, target=False. atoms in {51,101} x 2 seeds = 4 jobs. The a201 point is already running in array 1633875 (same config), reuse it as the third datapoint.",
+  "_comment": "num_atoms tuning on a FIXED task (cube-double task3), distributional + reward_normalize (fixed [-1,0] support so atoms is the sole resolution knob), dense, H=5, target=False, OFFLINE 1M steps. atoms in {51,101,201} x 2 seeds = 6 jobs. Self-contained (all three atom counts run fresh at 1M).",
   "fixed": {
     "tag": "dense",
     "agent": "agents/aqc.py",
     "use_target_critic": false,
     "num_action_samples": 4,
     "discount": 0.99,
-    "offline_steps": 500000,
+    "offline_steps": 1000000,
     "online_steps": 0,
     "eval_interval": 50000,
     "eval_episodes": 30,
@@ -23,7 +23,8 @@
     ],
     "num_atoms": [
       51,
-      101
+      101,
+      201
     ],
     "horizon_length": [
       5
