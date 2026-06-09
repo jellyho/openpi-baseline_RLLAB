@@ -85,6 +85,16 @@ def save_state(
     }
     checkpoint_manager.save(step, items)
 
+    # Make the params/ folder self-contained for inference: also write the norm
+    # stats INSIDE the committed params item, so deploying params/ alone carries
+    # normalization.  Done AFTER the save lands — writing during the save races with
+    # orbax's atomic temp→final rename of the params dir (FileExistsError).
+    data_config = data_loader.data_config()
+    if data_config.norm_stats is not None and data_config.asset_id is not None:
+        checkpoint_manager.wait_until_finished()
+        params_dir = epath.Path(checkpoint_manager.directory) / str(step) / "params" / data_config.asset_id
+        _normalize.save(params_dir, data_config.norm_stats)
+
 
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,

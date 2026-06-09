@@ -908,6 +908,12 @@ _CONFIGS = [
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
+            # Reuse the BC fine-tune's norm stats (identical dataset + transforms) so
+            # RLT training does NOT recompute them.  Loaded from <assets_dir>/<asset_id>.
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_generalist_bc_ft",
+                asset_id="jellyho/phase1_combined",
+            ),
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
             "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
@@ -934,6 +940,12 @@ _CONFIGS = [
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
+            # Reuse the BC fine-tune's norm stats (identical dataset + transforms) so
+            # RLT training does NOT recompute them.  Loaded from <assets_dir>/<asset_id>.
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_generalist_bc_ft",
+                asset_id="jellyho/phase1_combined",
+            ),
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
             "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"

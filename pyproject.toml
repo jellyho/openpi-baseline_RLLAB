@@ -39,6 +39,7 @@ dependencies = [
     "polars>=1.30.0",
     "tabletop-sim",
     "pymupdf>=1.27.2.3",
+    "pytest>=8.3.5",
 ]
 
 
