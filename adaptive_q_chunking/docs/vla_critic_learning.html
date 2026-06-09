@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>VLA Critic Learning (AQC-TD on frozen-VLA data)</title>
+<script>
+  window.MathJax = { tex: { inlineMath: [['\\(','\\)']], displayMath: [['$$','$$']] } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{ --fg:#1c2330; --muted:#5b6776; --bg:#ffffff; --soft:#f5f7fa; --line:#e2e8f0;
+         --accent:#2563eb; --good:#127a3d; --warn:#b4690e; --bad:#b42318; }
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+       color:var(--fg); background:var(--bg); max-width:920px; margin:0 auto; padding:32px 24px 80px;
+       line-height:1.6; font-size:16px;}
+  h1{font-size:28px; margin:0 0 4px; letter-spacing:-.2px;}
+  h2{font-size:21px; margin:34px 0 10px; padding-top:14px; border-top:1px solid var(--line);}
+  h3{font-size:17px; margin:22px 0 6px;}
+  .sub{color:var(--muted); margin:0 0 18px;}
+  code{background:var(--soft); padding:1px 6px; border-radius:5px; font-size:90%;
+       font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  pre{background:var(--soft); border:1px solid var(--line); border-radius:10px; padding:14px 16px;
+      overflow-x:auto; font-size:13.5px; line-height:1.5;}
+  pre code{background:none; padding:0;}
+  table{border-collapse:collapse; width:100%; margin:12px 0; font-size:14.5px;}
+  th,td{border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top;}
+  th{background:var(--soft);}
+  .box{border:1px solid var(--line); border-left:4px solid var(--accent); background:var(--soft);
+       border-radius:8px; padding:12px 16px; margin:14px 0;}
+  .box.good{border-left-color:var(--good)} .box.warn{border-left-color:var(--warn)}
+  .tag{display:inline-block; font-size:12px; padding:1px 8px; border-radius:999px;
+       background:#eef2ff; color:var(--accent); border:1px solid #dbe3ff; margin-left:6px;}
+  .muted{color:var(--muted)} .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  ul{margin:8px 0 8px 4px; padding-left:22px;} li{margin:3px 0;}
+</style>
+</head>
+<body>
+
+<h1>VLA Critic Learning <span class="tag">AQC-TD on frozen-VLA data</span></h1>
+<p class="sub">Adaptive Q-Chunking (ACSAC) critic trained on the <code>insert-mouse-battery_annotated</code>
+LeRobot dataset, using precomputed VLA latents and candidate action chunks. Companion to
+<a href="implementation_plan.html">implementation_plan.html</a> and
+<a href="aqc_distributional_guide.html">aqc_distributional_guide.html</a>.</p>
+
+<h2>1. Goal &amp; setting</h2>
+<p>We verified the ACSAC critic on OGBench; now we move to the real target: an <b>offline</b> critic
+over a <b>frozen VLA</b> (Pi0.5). The policy is fixed; we only learn a value/critic that scores
+action chunks, for adaptive chunk-size selection and value-guided ranking. There is <b>no environment
+rollout</b> and <b>no flow-BC actor</b> — every action chunk we ever score is precomputed in the data.</p>
+
+<h2>2. The data</h2>
+<p>LeRobot v3.0, robot <code>yam</code> (bimanual, 14-DoF), <b>1119 episodes / 3.08M frames @ 60 fps</b>,
+one task. Local copy under <code>config.json</code>'s <code>local</code> path. Per-frame columns we use:</p>
+<table>
+<tr><th>column</th><th>shape</th><th>role</th></tr>
+<tr><td><code>rl_token</code></td><td>(2048,)</td><td>frozen-VLA latent → <b>critic state token</b></td></tr>
+<tr><td><code>action</code></td><td>(14,)</td><td>executed (behaviour) action → the chunk the trained <code>Q</code> conditions on</td></tr>
+<tr><td><code>base_action</code></td><td>(32, 50, 14)</td><td><b>32 candidate chunks</b> (H=50) sampled from the fine-tuned policy → the <b>N candidates</b> for the bootstrap max</td></tr>
+<tr><td><code>reward</code></td><td>()</td><td>cost: −1e-4 living penalty/step + <b>−0.5 terminal penalty on failure</b>; range [−0.5, 0]</td></tr>
+<tr><td><code>mc_return</code></td><td>()</td><td>discounted return-to-go, <b>γ = 0.995</b> (verified <code>mc_t = r_t + 0.995·mc_{t+1}</code>); range [−0.5, 0]</td></tr>
+<tr><td><code>episode_index</code>, <code>observation.commander_state</code></td><td>—</td><td>episode boundaries; <code>teleop</code> (expert) vs <code>inference</code> (policy rollouts incl. failures)</td></tr>
+</table>
+<div class="box good"><b>Value support is [−0.5, 0]</b> (the exact <code>mc_return</code> range from <code>meta/stats.json</code>),
+far tighter than OGBench. With 51 atoms the bin width is 0.01.</div>
+
+<h2>3. The critic update (paper-faithful ACSAC)</h2>
+<p>For a transition starting at <code>t</code>, the per-prefix multi-step TD target (Eq. 6) for prefix
+length <code>h</code> is</p>
+$$ G_h \;=\; \sum_{j=0}^{h-1}\gamma^{j} r_{t+j} \;+\; \gamma^{h}\,\big[\, \text{valid}_h \cdot V(s_{t+h})\,\big] $$
+<p>where the bootstrap value is the EMaQ-style <b>joint max over the N candidate chunks and the H prefix
+lengths</b> (Eq. 19), aggregated by the ensemble min:</p>
+$$ V(s') \;=\; \min_{k\in[K]} \; \max_{n\in[N],\, h'\in[H]} \; Q_{\bar\phi}\!\big(s',\, a^{(n)}_{1:h'}\big),
+\qquad a^{(n)} = \texttt{base\_action}(s')^{(n)} $$
+<p>The critic predicts all <code>H</code> prefix values in one pass and is trained with HL-Gauss
+cross-entropy against the soft histogram of <code>G_h</code> over the fixed support.</p>
+
+<h3>Two data-specific touches</h3>
+<ul>
+<li><b>Candidates are precomputed.</b> ACSAC <i>samples</i> N chunks from the policy at \(s'\); here
+<code>base_action(s')</code> already holds 32 such samples — so the joint max is computed directly on
+them, with no online sampling / flow rollout.</li>
+<li><b>Terminal next-states.</b> At the episode's last frame (the −0.5 failure penalty) there is no
+future, so we set \(V(s') = \texttt{mc\_return}(s')\) (= the terminal reward) instead of the candidate
+max. This is what teaches the critic that states near a failure are low-value.</li>
+</ul>
+
+<div class="box warn"><b>Why the max (and not one chunk).</b> Using a single chunk for the target would be
+SARSA — pure evaluation of the behaviour policy, identical to regressing to <code>mc_return</code>, with
+no improvement. The max over the 32 candidates is the only place the learned value can exceed BC; it is
+a γ-contraction whose fixed point is \(Q^{\pi^\star}\) (Appendix G), and it stays in-distribution
+(we only ever score policy-proposed chunks, never OOD actions).</div>
+
+<h2>4. Cost &amp; the prefix-subsample knob</h2>
+<p>H=50, N=32 makes the bootstrap the dominant cost: faithfully bootstrapping at <i>all</i> H next-states
+is <code>32×50 = 1600</code> candidate-prefix critic evals per transition. We therefore bootstrap on a
+<b>coarse prefix grid</b> <code>prefixes = [1, 10, 25, 50]</code> (configurable) instead of all 50 — the
+critic still predicts all H prefixes, but the TD loss/bootstrap is only computed at the grid. This keeps
+the γ-contraction intent while cutting cost ≈ H/|grid|×. N can also be capped if memory is tight (the
+paper uses all 32).</p>
+
+<h2>5. Model capacity</h2>
+<p>The OGBench critic was tiny (<code>n_embd = 128</code>, 2 layers, ~2.5M params) for ~tens-of-dims states.
+The VLA state is a 2048-d latent, so we scale up the defaults:</p>
+<table>
+<tr><th>knob</th><th>OGBench</th><th>VLA default</th></tr>
+<tr><td><code>head_dim</code> → <code>n_embd</code></td><td>16 → 128</td><td><b>48 → 384</b></td></tr>
+<tr><td><code>num_layers</code></td><td>2</td><td><b>4</b></td></tr>
+<tr><td><code>mlp_dim</code></td><td>512</td><td><b>1024</b></td></tr>
+<tr><td><code>num_atoms</code> / support</td><td>101 / data</td><td>51 / fixed [−0.5, 0]</td></tr>
+<tr><td><code>state_encoder_dims</code></td><td>() (linear)</td><td><b>() (linear)</b> — ACSAC-faithful default</td></tr>
+</table>
+<p class="muted">Bigger ≠ automatically better for value learning (overestimation/instability scale too),
+so width/depth should be a small sweep, not a fixed pick. Capacity is fully config-driven.</p>
+<p><b>State token: linear by default (ACSAC-faithful).</b> The 2048-d <code>rl_token</code> becomes
+the state token via a single linear <code>Dense(2048 → n_embd)</code> — exactly how ACSAC embeds the
+state in state-based tasks. (ACSAC's states are ~tens of dims, an <i>expansion</i>; here it's a 5×
+<i>compression</i>, so an MLP encoder <i>may</i> help — that's the opt-in <code>vla_aqc_td_a51_stateenc</code>
+preset with <code>state_encoder_dims=(512,)</code>, to be confirmed against the linear baseline rather
+than assumed.)</p>
+
+<h2>6. Code map</h2>
+<table>
+<tr><th>file</th><th>what</th></tr>
+<tr><td><code>vla_data.py</code></td><td><code>VLALeRobotDataset</code>: row-group-streaming loader.
+<code>iter_batches</code> = MC batches (state, executed chunk, <code>mc_return</code>).
+<code>iter_bootstrap_batches</code> = AQC-TD batches (per-prefix <code>cum_reward</code>, next latents,
+<code>base_action</code> candidates at next states, <code>term</code>/<code>valid</code> masks, prefix grid),
+with episode/terminal handling.</td></tr>
+<tr><td><code>vla_aqc.py</code></td><td><code>VLACriticConfig</code> + <code>VLACriticTrainer</code>: builds the
+<code>PrefixValue</code> critic, computes the candidate-fed expected-prefix-max, the per-prefix HL-Gauss
+TD loss, and a jitted train step.</td></tr>
+<tr><td><code>utils/transformer.py</code></td><td><code>PrefixValue</code> causal-Transformer critic (per-position heads, categorical output).</td></tr>
+<tr><td><code>utils/distributional.py</code></td><td>HL-Gauss transform + cross-entropy.</td></tr>
+<tr><td><code>utils/networks.py</code></td><td><code>distrax</code> made optional (actor-only); the critic path is distrax-free → runs in the shared openpi <code>uv</code>.</td></tr>
+</table>
+
+<h2>7. Environment</h2>
+<p>Runs in the <b>shared openpi <code>uv</code></b> (<code>openpi-baseline_RLLAB/.venv</code>, jax 0.5.3,
+flax 0.10.2) — the same env that loads the LeRobot data (lerobot/polars/pyarrow). No separate critic env:
+the OGBench-only deps (ogbench, mujoco, jax 0.6, numpy 2) are not needed offline. On a CPU/login node
+prefix <code>JAX_PLATFORMS=cpu</code>.</p>
+
+<h2>8. Configuration &amp; run management</h2>
+<p>Modelled on openpi's <code>training/config.py</code>: a frozen, fully-typed
+<code>VLAAQCConfig</code> with nested groups, a named <code>CONFIGS</code> registry of documented
+presets, and a self-documenting run directory. Defined in <code>vla_config.py</code>; driven by
+<code>vla_train.py</code> (tyro CLI).</p>
+
+<h3>Every "think-carefully" hyperparameter, grouped</h3>
+<table>
+<tr><th>group</th><th>fields</th></tr>
+<tr><td><code>ArchConfig</code> (capacity)</td><td><code>num_layers</code>, <code>num_heads</code>, <code>head_dim</code> (→ <code>n_embd</code>), <code>mlp_dim</code>, <code>num_ensembles</code> (K), <code>per_position_head</code>, <b><code>state_encoder_dims</code></b> (MLP on the 2048 latent)</td></tr>
+<tr><td><code>DistConfig</code> (distributional RL)</td><td><code>num_atoms</code>, <code>hl_gauss_sigma_frac</code>, <code>support_mode</code> (<code>fixed</code>/<code>reward_norm</code>/<code>data</code>), <code>v_min</code>, <code>v_max</code></td></tr>
+<tr><td><code>TDConfig</code> (MC-return / bootstrap)</td><td><code>discount</code> (0.995), <code>target_kind</code> (<code>td</code>/<code>mc</code>), <code>num_candidates</code> (N=32), <code>prefixes</code> (subsample grid), <code>use_target_critic</code>, <code>tau</code>, <code>terminal_uses_mc</code></td></tr>
+<tr><td><code>RewardConfig</code></td><td><code>reward_normalize</code>, <code>support_margin</code></td></tr>
+<tr><td><code>OptimConfig</code></td><td><b><code>batch_size</code></b> (256), <code>lr</code>, <code>num_train_steps</code>, <code>warmup_steps</code>, <code>weight_decay</code>, <code>max_grad_norm</code></td></tr>
+<tr><td>run-level</td><td><code>seed</code>, <code>commander_filter</code>, intervals (<code>log/eval/save</code>), <code>keep_period</code>, <code>checkpoint_base_dir</code>, W&amp;B</td></tr>
+</table>
+
+<h3>Run identity &amp; storage</h3>
+<ul>
+<li><b>Self-documenting name.</b> <code>cfg.run_name</code> is auto-built from the load-bearing
+settings, e.g. <code>a51_sup-fixed_emb384x4L_N32_P4_b256_g0.995_s0</code> — atoms, support,
+capacity, N, prefix-grid, batch, discount, seed. So a run is identifiable from its name alone.</li>
+<li><b>Layout (on lustre, not home).</b> <code>checkpoint_base_dir =
+/lustre/gwanwoo13/rss_post_training/phase1/critic_learning</code>;
+<code>run_dir = base/&lt;name&gt;/&lt;exp_name&gt;</code> holds <code>config.json</code> (the full resolved
+config), <code>metrics.csv</code>, and <code>checkpoints/step_XXXXXXXX/</code>.</li>
+<li><b>Checkpoints</b> save params + target + optimizer state (flax msgpack) + step; pruned by
+<code>keep_period</code>; <code>--resume</code> restarts from the latest.</li>
+<li><b>Logging</b> = CSV + optional W&amp;B (project <code>AQC-VLA</code>, group = config name).</li>
+</ul>
+
+<h3>Named presets</h3>
+<table>
+<tr><th>name</th><th>what it is</th></tr>
+<tr><td><code>vla_aqc_td_a51</code></td><td>default: TD, 32-candidate joint-max, a51, fixed [−0.5,0], n_embd 384/4L (~15.5M)</td></tr>
+<tr><td><code>vla_mc_baseline</code></td><td>MC regression to <code>mc_return</code> (no bootstrap) — stable reference</td></tr>
+<tr><td><code>vla_aqc_td_a51_small</code> / <code>_large</code></td><td>capacity brackets (~5M / ~35M) for the sweep</td></tr>
+<tr><td><code>vla_aqc_td_a51_stateenc</code></td><td>default + MLP state-encoder (512,) — ablation vs the linear default</td></tr>
+<tr><td><code>vla_aqc_td_a51_rnorm</code></td><td>reward-normalized to [−1,0] (support_mode=reward_norm)</td></tr>
+</table>
+<pre>python vla_train.py --config vla_aqc_td_a51 --exp_name run1      # train a preset
+python vla_train.py --config vla_aqc_td_a51 --timing_steps 100   # throughput probe (no ckpts)</pre>
+
+<h2>9. Open items</h2>
+<ul>
+<li>Confirm with the data team: critic conditions on the <b>executed</b> chunk <code>action[t:t+H]</code>
+(current assumption) vs. one of the <code>base_action</code> candidates.</li>
+<li>Train split: use all episodes, or filter by <code>commander_state</code> (teleop vs inference)?</li>
+<li>Loader efficiency: <code>base_action</code> is the ~138 GB column; v1 reads it per row-group. If random
+access becomes a bottleneck, pre-pack the needed columns.</li>
+<li>Tune the prefix grid and critic capacity once the full dataset finishes downloading.</li>
+</ul>
+
+</body>
+</html>

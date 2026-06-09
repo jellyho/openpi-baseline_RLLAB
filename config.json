@@ -1,0 +1,7 @@
+{
+    "pahse1_insert-mouse-battery": 
+    {
+    "local": "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/insert-mouse-battery_annotated",
+    "hg": "https://huggingface.co/datasets/jellyho/insert-mouse-battery_annotated"
+    }
+}

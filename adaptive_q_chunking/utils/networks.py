@@ -1,8 +1,15 @@
 from typing import Any, Optional, Sequence
 
-import distrax
 import flax.linen as nn
 import jax.numpy as jnp
+
+# distrax is only needed by the Gaussian/flow actor below; the prefix-critic path
+# (transformer.py -> default_init/ensemblize) is distrax-free. Import it optionally so
+# critic-only environments (e.g. the shared openpi uv) don't need distrax installed.
+try:
+    import distrax
+except ModuleNotFoundError:
+    distrax = None
 
 
 def default_init(scale=1.0):
@@ -91,11 +98,12 @@ class LogParam(nn.Module):
         return jnp.exp(log_value)
 
 
-class TransformedWithMode(distrax.Transformed):
-    """Transformed distribution with mode calculation."""
+if distrax is not None:
+    class TransformedWithMode(distrax.Transformed):
+        """Transformed distribution with mode calculation."""
 
-    def mode(self):
-        return self.bijector.forward(self.distribution.mode())
+        def mode(self):
+            return self.bijector.forward(self.distribution.mode())
 
 
 class Actor(nn.Module):

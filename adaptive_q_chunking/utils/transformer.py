@@ -62,6 +62,8 @@ class CausalPrefixCritic(nn.Module):
     layer_norm: bool = True
     num_atoms: int = 1   # 1 -> scalar (regression); >1 -> distributional logits (HL-Gauss)
     per_position_head: bool = True   # paper: "one output head per position" (Prop G.7)
+    state_encoder_dims: Sequence[int] = ()   # MLP hidden dims applied to the obs before the
+                                             # state token; helps digest a high-dim latent (2048)
 
     @nn.compact
     def __call__(self, observations, actions):
@@ -83,7 +85,12 @@ class CausalPrefixCritic(nn.Module):
 
         # --- Tokenize ------------------------------------------------------------------
         chunk = actions.reshape(actions.shape[:-1] + (self.horizon, self.action_dim))
-        state_token = nn.Dense(n_embd, kernel_init=default_init())(observations)
+        # Optional MLP encoder on the observation (e.g. to digest a 2048-d VLA latent) before
+        # projecting to the single state token.
+        s = observations
+        for hdim in self.state_encoder_dims:
+            s = nn.gelu(nn.Dense(hdim, kernel_init=default_init())(s))
+        state_token = nn.Dense(n_embd, kernel_init=default_init())(s)
         state_token = state_token[..., None, :]                       # (..., 1, n_embd)
         action_tokens = nn.Dense(n_embd, kernel_init=default_init())(chunk)  # (..., H, n_embd)
         x = jnp.concatenate([state_token, action_tokens], axis=-2)    # (..., L, n_embd)
@@ -160,6 +167,7 @@ class PrefixValue(nn.Module):
     layer_norm: bool = True
     num_atoms: int = 1   # 1 -> scalar critic; >1 -> distributional (HL-Gauss) logits
     per_position_head: bool = True   # paper: one output head per position
+    state_encoder_dims: Sequence[int] = ()   # obs-encoder MLP hidden dims
     encoder: nn.Module = None
 
     def setup(self):
@@ -176,6 +184,7 @@ class PrefixValue(nn.Module):
             layer_norm=self.layer_norm,
             num_atoms=self.num_atoms,
             per_position_head=self.per_position_head,
+            state_encoder_dims=self.state_encoder_dims,
         )
 
     def __call__(self, observations, actions):
