@@ -785,8 +785,8 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
         repo_id=f"jellyho/{task}_rl_224",
         base_config=DataConfig(
             prompt_from_task=True,
-            local_files_path=f"/home/yonsei_jell/{task}",
-            # local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
+            # local_files_path=f"/home/yonsei_jell/{task}",
+            local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
@@ -839,12 +839,12 @@ _CONFIGS = [
             repo_id="jellyho/phase1_combined",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_files_path="/home/yonsei_jell/dualyam_combined",
+                local_files_path="/data5/jellyho/PFR_RSS/dataset/phase1_combined",
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/NHNHOME/WORKSPACE/0526040008_A/jellyho/ckpts_rss/pi05_rss2026_multitask/199999/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_rss2026_multitask/199999/params"),
         num_train_steps=100_000,
         batch_size=128,
         num_workers=32,
@@ -900,6 +900,32 @@ _CONFIGS = [
         model=pi0_rlt.Pi0RLTConfig(pi05=True),
         # Generalist: RLT on the merged 3-task dataset, frozen on the generalist BC base
         # (mirror pi05_generalist_bc_ft's data; load from its trained checkpoint).
+        data=DualYamDataConfig(
+            repo_id="jellyho/phase1_combined",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_path="/home/yonsei_jell/dualyam_combined",
+            ),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
+        ),
+        lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
+        num_train_steps=100_000,
+        batch_size=256,
+        num_workers=64,
+        save_interval=20_000,
+    ),
+    # Single-forward RLT (language INCLUDED in the RL token): the token is sourced
+    # from the image-token hidden states of the SAME full π_vla forward used for
+    # action sampling, removing the separate language-free backbone pass at
+    # annotation/inference.  Token becomes language-conditioned (fine for a
+    # generalist); NOT checkpoint-compatible with the vanilla Pi0RLT — train fresh.
+    TrainConfig(
+        name="pi05_generalist_rlt_joint",
+        model=pi0_rlt.Pi0RLTJointConfig(pi05=True),
         data=DualYamDataConfig(
             repo_id="jellyho/phase1_combined",
             base_config=DataConfig(

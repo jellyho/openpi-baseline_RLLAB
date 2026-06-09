@@ -406,3 +406,113 @@ class Pi0RLT(Pi0):
             "rlt/target_abs_mean": jnp.mean(jnp.abs(z)),
         }
         return total, aux
+
+
+# ===========================================================================
+# Pi0RLTJoint — single-forward variant (language INCLUDED in the RL token)
+# ===========================================================================
+#
+# The base Pi0RLT runs the backbone TWICE per state during annotation/inference:
+# an image-only pass for the RL token, and the full π_vla pass (image+language+
+# state) for action sampling.  Pi0RLTJoint removes the extra pass by sourcing the
+# RL token from the IMAGE-token hidden states of the SAME full forward used for
+# sampling.  Because the full prefix is bidirectional, those image embeddings are
+# now LANGUAGE-conditioned (the token is no longer language-invariant) — which is
+# fine, and arguably better, for a generalist whose instruction varies.  This
+# changes the token definition, so a Joint model must be trained from scratch and
+# is NOT checkpoint-compatible with a vanilla Pi0RLT.
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0RLTJointConfig(Pi0RLTConfig):
+    """Pi0RLT with a single (language-included) backbone forward for the RL token."""
+
+    @override
+    def create(self, rng: at.KeyArrayLike) -> "Pi0RLTJoint":
+        return Pi0RLTJoint(self, rngs=nnx.Rngs(rng))
+
+
+class Pi0RLTJoint(Pi0RLT):
+    """Pi0RLT whose RL token comes from the full (image+language) prefix forward."""
+
+    def _num_image_tokens(self, observation: _model.Observation, prefix_len: int) -> int:
+        """Image tokens are the FIRST tokens of ``embed_prefix`` (language follows)."""
+        n_lang = observation.tokenized_prompt.shape[1] if observation.tokenized_prompt is not None else 0
+        return prefix_len - n_lang
+
+    @override
+    def _prefix_embeddings(self, observation: _model.Observation):
+        """Full prefix (image+language) → backbone ONCE → image-token hidden states.
+
+        Returns (z, img_mask) with z = sg(image hidden states) — same shape as the
+        parent's image-only z, but LANGUAGE-conditioned (image tokens attended to
+        the language tokens in the bidirectional prefix).  Used by ``compute_loss``
+        and ``extract_rl_token``, so the token is trained and extracted on the same
+        with-language embeddings.
+        """
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        outs, _ = self.PaliGemma.llm([prefix_tokens, None], mask=attn_mask, positions=positions)
+        n_img = self._num_image_tokens(observation, prefix_tokens.shape[1])
+        z = jax.lax.stop_gradient(outs[0][:, :n_img].astype(jnp.float32))  # [b, n_img, W]
+        return z, prefix_mask[:, :n_img]
+
+    def extract_token_and_base_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_samples: int,
+        num_steps: int = 10,
+    ) -> tuple[at.Float[at.Array, "b t"], at.Float[at.Array, "b n ah ad"]]:
+        """SINGLE backbone forward → (z_rl, base-action chunks).
+
+        The joint win: the full π_vla prefix (image+language+state) is run once and
+        reused for BOTH the RL token (image hidden states) and base-action sampling
+        (KV cache) — no separate language-free pass.  Use this in annotation /
+        inference instead of ``extract_rl_token`` + ``sample_base_actions``.
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        b = observation.state.shape[0]
+        dt = -1.0 / num_steps
+
+        # One full prefix forward → hidden states (for the token) + KV cache (for sampling).
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        outs, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=attn_mask, positions=positions)
+
+        # (a) RL token from the image-token hidden states (language-conditioned).
+        n_img = self._num_image_tokens(observation, prefix_tokens.shape[1])
+        z = jax.lax.stop_gradient(outs[0][:, :n_img].astype(jnp.float32))
+        z_rl = self._encode_rl_token(z, prefix_mask[:, :n_img], observation.state)
+
+        # (b) base-action chunks from the SAME KV cache (action-expert denoising, vmapped).
+        def denoise(noise):
+            def step(carry):
+                x_t, time = carry
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    observation, x_t, jnp.broadcast_to(time, b)
+                )
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                prefix_attn = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn = jnp.concatenate([prefix_attn, suffix_attn_mask], axis=-1)
+                pos = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+                (_, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens], mask=full_attn, positions=pos,
+                    kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+                )
+                v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+                return x_t + dt * v_t, time + dt
+
+            def cond(carry):
+                return carry[1] >= -dt / 2
+
+            x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            return x_0
+
+        noises = jax.random.normal(rng, (num_samples, b, self.action_horizon, self.action_dim))
+        chunks = jax.vmap(denoise)(noises)                 # [n, b, H, D]
+        base = jnp.transpose(chunks, (1, 0, 2, 3))          # [b, n, H, D]
+        return z_rl, base

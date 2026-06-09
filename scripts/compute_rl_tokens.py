@@ -310,6 +310,17 @@ def main():
     N, S = args.num_action_samples, args.num_flow_steps
     extract_token = nnx.jit(lambda m, obs: m.extract_rl_token(obs))
     sample_actions = nnx.jit(lambda m, rng, obs: m.sample_base_actions(rng, obs, num_samples=N, num_steps=S))
+    # Joint RLT (Pi0RLTJoint): the RL token comes from the image-token hidden states
+    # of the SAME full π_vla forward used for sampling → one backbone pass instead of
+    # two, when both columns are requested.  Falls back to the separate calls for the
+    # vanilla Pi0RLT or when only one column is computed.
+    use_combined = args.rl_tokens and args.base_actions and hasattr(model, "extract_token_and_base_actions")
+    extract_both = (
+        nnx.jit(lambda m, rng, obs: m.extract_token_and_base_actions(rng, obs, num_samples=N, num_steps=S))
+        if use_combined else None
+    )
+    if use_combined:
+        print("Joint RLT: single-forward token + base_action.")
     to_raw_actions = _build_action_decoder(data_config) if args.base_actions else None
     base_rng = jax.random.key(args.seed)
 
@@ -384,15 +395,22 @@ def main():
             for batch in tqdm.tqdm(loader, total=n_batches, desc=f"file{k}"):
                 obs = _model.Observation.from_dict(batch)
                 B = int(obs.state.shape[0])
-                if args.rl_tokens:
-                    z = np.asarray(jax.device_get(extract_token(model, obs)), np.float32)
-                    buf_z.extend(z)
-                if args.base_actions:
-                    # RNG keyed by ABSOLUTE row (not loop step) → identical across resumes.
-                    a = np.asarray(jax.device_get(
-                        sample_actions(model, jax.random.fold_in(file_rng, row), obs)), np.float32)  # [B,N,H,Dm]
-                    a = to_raw_actions(a, np.asarray(obs.state)).astype(np.float16)                  # [B,N,H,14]
-                    buf_a.extend(a)
+                if use_combined:
+                    # One backbone forward → token + base actions (RNG keyed by absolute row).
+                    z_dev, a_dev = extract_both(model, jax.random.fold_in(file_rng, row), obs)
+                    buf_z.extend(np.asarray(jax.device_get(z_dev), np.float32))
+                    a = np.asarray(jax.device_get(a_dev), np.float32)                                # [B,N,H,Dm]
+                    buf_a.extend(to_raw_actions(a, np.asarray(obs.state)).astype(np.float16))        # [B,N,H,14]
+                else:
+                    if args.rl_tokens:
+                        z = np.asarray(jax.device_get(extract_token(model, obs)), np.float32)
+                        buf_z.extend(z)
+                    if args.base_actions:
+                        # RNG keyed by ABSOLUTE row (not loop step) → identical across resumes.
+                        a = np.asarray(jax.device_get(
+                            sample_actions(model, jax.random.fold_in(file_rng, row), obs)), np.float32)  # [B,N,H,Dm]
+                        a = to_raw_actions(a, np.asarray(obs.state)).astype(np.float16)                  # [B,N,H,14]
+                        buf_a.extend(a)
                 row += B
                 if (len(buf_z) if args.rl_tokens else len(buf_a)) >= _CHECKPOINT_ROWS:
                     save_part(flush_start, buf_z, buf_a)
@@ -405,13 +423,20 @@ def main():
             raise RuntimeError(f"file{k}: checkpointed {_count_done(partial)} rows != {rows}.")
         zs, bas = [], []
         for pf in sorted(partial.glob("part_*.npz")):
-            d = np.load(pf)
-            if args.rl_tokens: zs.append(d["z"])
-            if args.base_actions: bas.append(d["ba"])
+            # `with` closes the NpzFile handle (and .copy() detaches from the lazy zip)
+            # BEFORE the rmtree below.  On network FS (NFS/Lustre), deleting a still-open
+            # file silly-renames it to a hidden .nfsXXXX placeholder, which then makes
+            # rmtree's final rmdir fail with "Directory not empty".
+            with np.load(pf) as d:
+                if args.rl_tokens: zs.append(d["z"].copy())
+                if args.base_actions: bas.append(d["ba"].copy())
         z_arr = np.concatenate(zs, axis=0) if args.rl_tokens else None
         ba_arr = np.concatenate(bas, axis=0) if args.base_actions else None
         _write_data_file(path, args.column_name, z_arr, args.base_action_column, ba_arr)
-        shutil.rmtree(partial)
+        # Data is already written atomically above; cleanup must NEVER crash the run
+        # (lingering network-FS .nfs* placeholders), else the shard exits non-zero and
+        # feature registration gets skipped.  ignore_errors makes a failed rmdir a no-op.
+        shutil.rmtree(partial, ignore_errors=True)
         print(f"file{k}: done ({rows} rows).")
 
     for k in my_files:

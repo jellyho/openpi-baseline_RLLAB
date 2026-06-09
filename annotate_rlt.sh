@@ -9,15 +9,15 @@
 set -e
 source setup_env.sh
 
-CONFIG=pi05_insert-mouse-battery_rlt
-CKPT=/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_insert-mouse-battery_rlt/pi05_insert-mouse-battery_rlt/99999
-SRC=/home/yonsei_jell/insert-mouse-battery
-OUT=/NHNHOME/WORKSPACE/0526040008_A/jellyho/insert-mouse-battery_annotated   # roomy Lustre disk (4.5TB)
+CONFIG=pi05_seal-water-bottle-cap_rlt
+CKPT=/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_seal-water-bottle-cap_rlt/pi05_seal-water-bottle-cap_rlt/99999
+SRC=/data5/jellyho/.cache/huggingface/lerobot/jellyho/seal-water-bottle-cap_rl_224   # v3.0 source (read-only; HF copy)
+OUT=/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/annotated/seal-water-bottle-cap_annotated   # roomy Lustre disk (4.5TB)
 
 N=32          # base action samples per frame
 BATCH=128     # raise as GPU memory allows (B200 = 183GB); bigger = faster
 WORKERS=16     # per process (x4 = 32 cores)
-GPUS=(0 1 2 3)
+GPUS=(0 1 2 7)
 NUM_SHARDS=${#GPUS[@]}
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
