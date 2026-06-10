@@ -32,4 +32,4 @@ LOG_FILE="logs/${CONFIG}_$(date +%Y%m%d-%H%M%S).log"
 uv run scripts/train.py "$CONFIG" \
     --exp-name="$CONFIG" \
     --fsdp-devices=1 \
-    --overwrite
+    --resume

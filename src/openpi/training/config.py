@@ -785,8 +785,8 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
         repo_id=f"jellyho/{task}_rl_224",
         base_config=DataConfig(
             prompt_from_task=True,
-            # local_files_path=f"/home/yonsei_jell/{task}",
-            local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
+            local_files_path=f"/home/yonsei_jell/{task}",
+            # local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
