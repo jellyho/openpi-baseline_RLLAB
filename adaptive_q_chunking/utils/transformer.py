@@ -10,6 +10,15 @@ prefix-conditioned Q-values
 
     [ Q(s_t, a_{t:t+1}), Q(s_t, a_{t:t+2}), ..., Q(s_t, a_{t:t+H}) ].
 
+**Macro-action grouping** (``macro_group_size > 1``): for long chunks (e.g. H=50 at 60 Hz)
+it is wasteful to have 50 separate action tokens — most fine-grained prefix choices are
+indistinguishable in value and the long attention tail hurts efficiency. With
+``macro_group_size=10`` the 50 per-step actions are grouped into 5 macro-action tokens,
+each embedding 10 consecutive steps (``Dense(10*d → n_embd)``). The sequence becomes
+``[s_t, m_1, m_2, m_3, m_4, m_5]`` (6 tokens, same length as the OGBench critic), and
+the 5 prefix outputs correspond to replanning after 10/20/30/40/50 real steps. This cuts
+the attention budget 85× and the bootstrap cost 10×.
+
 A causal attention mask guarantees that the ``h``-th output depends only on
 ``(s_t, a_{t:t+h})`` and not on the suffix ``a_{t+h:t+H}`` (prefix consistency,
 Proposition G.7). Because all ``H`` heads share a single backbone and are trained
@@ -64,6 +73,8 @@ class CausalPrefixCritic(nn.Module):
     per_position_head: bool = True   # paper: "one output head per position" (Prop G.7)
     state_encoder_dims: Sequence[int] = ()   # MLP hidden dims applied to the obs before the
                                              # state token; helps digest a high-dim latent (2048)
+    macro_group_size: int = 1   # group this many consecutive per-step actions into one token.
+                                # 1 = standard (one token per step); 10 for H=50 gives 5 tokens.
 
     @nn.compact
     def __call__(self, observations, actions):
@@ -72,30 +83,35 @@ class CausalPrefixCritic(nn.Module):
         Args:
             observations: ``(..., obs_dim)`` (already encoded if an encoder is used).
             actions: ``(..., H * action_dim)`` flattened action chunk. The chunk is
-                reshaped internally to ``(..., H, action_dim)``.
+                reshaped internally to ``(..., macro_H, macro_group_size * action_dim)``
+                where ``macro_H = H // macro_group_size``.
 
         Returns:
-            If ``num_atoms == 1``: ``(..., H)`` scalar prefix Q-values, where the ``h``-th
-            entry (0-indexed) is ``Q(s, a_{t:t+h+1})``.
-            If ``num_atoms > 1``: ``(..., H, num_atoms)`` per-prefix categorical logits for
-            the distributional (HL-Gauss) critic.
+            If ``num_atoms == 1``: ``(..., macro_H)`` scalar prefix Q-values.
+            If ``num_atoms > 1``: ``(..., macro_H, num_atoms)`` per-prefix categorical logits.
+            The ``k``-th output (0-indexed) is ``Q(s, a_{t:t+(k+1)*macro_group_size})``.
         """
         n_embd = self.num_heads * self.head_dim
-        seq_len = self.horizon + 1  # 1 state token + H action tokens.
+        assert self.horizon % self.macro_group_size == 0, \
+            f"horizon {self.horizon} must be divisible by macro_group_size {self.macro_group_size}"
+        macro_H = self.horizon // self.macro_group_size
+        seq_len = macro_H + 1  # 1 state token + macro_H macro-action tokens.
+        group_d = self.macro_group_size * self.action_dim  # input dim per macro-action token
 
         # --- Tokenize ------------------------------------------------------------------
-        chunk = actions.reshape(actions.shape[:-1] + (self.horizon, self.action_dim))
+        # Reshape to (..., macro_H, group_d) then embed each macro-action to n_embd.
+        chunk = actions.reshape(actions.shape[:-1] + (macro_H, group_d))
         # Optional MLP encoder on the observation (e.g. to digest a 2048-d VLA latent) before
         # projecting to the single state token.
         s = observations
         for hdim in self.state_encoder_dims:
             s = nn.gelu(nn.Dense(hdim, kernel_init=default_init())(s))
         state_token = nn.Dense(n_embd, kernel_init=default_init())(s)
-        state_token = state_token[..., None, :]                       # (..., 1, n_embd)
-        action_tokens = nn.Dense(n_embd, kernel_init=default_init())(chunk)  # (..., H, n_embd)
-        x = jnp.concatenate([state_token, action_tokens], axis=-2)    # (..., L, n_embd)
+        state_token = state_token[..., None, :]                        # (..., 1, n_embd)
+        action_tokens = nn.Dense(n_embd, kernel_init=default_init())(chunk)  # (..., macro_H, n_embd)
+        x = jnp.concatenate([state_token, action_tokens], axis=-2)    # (..., seq_len, n_embd)
 
-        # Learned absolute positional embeddings.
+        # Learned absolute positional embeddings over seq_len = macro_H + 1 positions.
         pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02),
                              (seq_len, n_embd))
         x = x + pos_emb
@@ -122,24 +138,22 @@ class CausalPrefixCritic(nn.Module):
         if self.layer_norm:
             x = nn.LayerNorm()(x)
 
-        # --- Read prefix Q-values from the action-token hidden states -------------------
-        # Action token at position p (1..H) has attended to {s_t, a_t, ..., a_{t+p-1}},
-        # so reading a head there yields Q(s_t, a_{t:t+p}).
-        action_hidden = x[..., 1:, :]                                 # (..., H, n_embd)
+        # --- Read prefix Q-values from macro-action-token hidden states -----------------
+        # Macro-action token k (1..macro_H) has attended to {s_t, m_1, ..., m_k},
+        # representing the prefix a_{t : t + k*macro_group_size}.
+        action_hidden = x[..., 1:, :]                                 # (..., macro_H, n_embd)
         if self.per_position_head:
-            # One output head per prefix position h (paper: "one output head per position").
-            # A distinct (n_embd -> num_atoms) projection for each of the H positions, via einsum.
+            # One output head per macro-prefix position (paper: "one output head per position").
             head_w = self.param('head_kernel', default_init(),
-                                (self.horizon, n_embd, self.num_atoms))
+                                (macro_H, n_embd, self.num_atoms))
             head_b = self.param('head_bias', nn.initializers.zeros,
-                                (self.horizon, self.num_atoms))
-            q = jnp.einsum('...hd,hda->...ha', action_hidden, head_w) + head_b  # (..., H, atoms)
+                                (macro_H, self.num_atoms))
+            q = jnp.einsum('...hd,hda->...ha', action_hidden, head_w) + head_b  # (..., macro_H, atoms)
         else:
-            # Shared head (tied weights across positions).
             q = nn.Dense(self.num_atoms, kernel_init=default_init())(action_hidden)
         if self.num_atoms == 1:
-            return q.squeeze(-1)                                      # (..., H) scalar critic
-        return q                                                      # (..., H, num_atoms) logits
+            return q.squeeze(-1)                                       # (..., macro_H) scalar
+        return q                                                       # (..., macro_H, num_atoms)
 
 
 class PrefixValue(nn.Module):
@@ -168,6 +182,7 @@ class PrefixValue(nn.Module):
     num_atoms: int = 1   # 1 -> scalar critic; >1 -> distributional (HL-Gauss) logits
     per_position_head: bool = True   # paper: one output head per position
     state_encoder_dims: Sequence[int] = ()   # obs-encoder MLP hidden dims
+    macro_group_size: int = 1   # consecutive per-step actions grouped into one token
     encoder: nn.Module = None
 
     def setup(self):
@@ -185,13 +200,15 @@ class PrefixValue(nn.Module):
             num_atoms=self.num_atoms,
             per_position_head=self.per_position_head,
             state_encoder_dims=self.state_encoder_dims,
+            macro_group_size=self.macro_group_size,
         )
 
     def __call__(self, observations, actions):
         """Return prefix-conditioned outputs for the ensemble.
 
-        ``(K, ..., H)`` scalar Q-values if ``num_atoms == 1``; otherwise
-        ``(K, ..., H, num_atoms)`` categorical logits.
+        ``(K, ..., macro_H)`` scalar Q-values if ``num_atoms == 1``; otherwise
+        ``(K, ..., macro_H, num_atoms)`` categorical logits,
+        where ``macro_H = horizon // macro_group_size``.
         """
         if self.encoder is not None:
             observations = self.encoder(observations)

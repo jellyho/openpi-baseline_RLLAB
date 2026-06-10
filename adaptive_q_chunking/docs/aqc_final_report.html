@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Adaptive Q-Chunking + Distributional Critic — Final Report (OGBench)</title>
+<script>window.MathJax={tex:{inlineMath:[['\\(','\\)']]}};</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{--fg:#1c2330;--muted:#5b6776;--bg:#fff;--soft:#f5f7fa;--line:#e2e8f0;--accent:#2563eb;--good:#127a3d;--warn:#b4690e;--bad:#b42318;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);max-width:940px;margin:0 auto;padding:32px 24px 80px;line-height:1.6;}
+  h1{font-size:27px;margin:0 0 2px;letter-spacing:-.2px} h2{font-size:21px;margin:34px 0 10px;padding-top:14px;border-top:1px solid var(--line)} h3{font-size:16.5px;margin:20px 0 6px}
+  .sub{color:var(--muted);margin:0 0 16px}
+  code{background:var(--soft);padding:1px 6px;border-radius:5px;font-size:90%;font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow-x:auto;font-size:13px}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px} th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top} th{background:var(--soft)}
+  .box{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--soft);border-radius:8px;padding:12px 16px;margin:14px 0}
+  .good{border-left-color:var(--good)} .warn{border-left-color:var(--warn)} .bad{border-left-color:var(--bad)}
+  .win{color:var(--good);font-weight:600} .lose{color:var(--bad);font-weight:600}
+  .muted{color:var(--muted)} ul{margin:6px 0 6px 2px;padding-left:22px} li{margin:3px 0}
+  .k{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:90%}
+</style>
+</head>
+<body>
+
+<h1>Adaptive Q-Chunking + Distributional Critic — Final Report</h1>
+<p class="sub">OGBench (cube-double) verification of the ACSAC critic and its HL-Gauss distributional
+variant. Companion docs: <a href="../implementation_plan.html">implementation_plan</a> ·
+<a href="aqc_distributional_guide.html">distributional guide</a> ·
+<a href="../aqc_reading_guide.html">reading guide</a> ·
+<a href="vla_critic_learning.html">VLA critic learning</a>.</p>
+
+<div class="box"><b>요약 (Korean).</b> ACSAC critic와 HL-Gauss distributional critic를 OGBench cube-double에서 검증.
+핵심 결과 — (1) <b>논문 충실 설정(target network 제거 + position마다 output head)</b>이 결정적: regression이 0.43→<b>0.98</b>로 회복.
+(2) <b>num_atoms는 적을수록 좋았다</b>: task3에서 a51=<b>0.90</b> ≫ a101=0.37 ≫ a201=0.27 (a51 distributional이 regression 0.62보다도 높음).
+(3) <b>distributional ≈ regression</b> (task4/5에서 비슷), reward-norm ≈ 이론적 support[-200,0].
+(4) <b>sparse에서는 data-centric support만 살아남음</b> (universal은 chunk가 h=1로 붕괴).
+아래에 config·결과·코드 리뷰 위치 정리.</p>
+
+<h2>1. Setup</h2>
+<p><b>Method.</b> Causal-Transformer prefix critic that scores every prefix \(Q(s,a_{1:h})\) for
+\(h=1..H\) in one pass; deployment picks the prefix maximizing the critic (adaptive chunk size).
+The distributional variant replaces the scalar head with an HL-Gauss categorical head over a value
+support \([v_{min},v_{max}]\) and trains with cross-entropy. See the
+<a href="aqc_distributional_guide.html">distributional guide</a> for the math.</p>
+<p><b>Common config</b> (held fixed unless noted): env cube-double (state-based), <span class="k">discount=0.99</span>,
+<span class="k">batch_size=256</span>, <span class="k">horizon_length H=5</span>, <span class="k">num_action_samples N=4</span>,
+ensemble <span class="k">K=2</span> (min-agg), flow-BC actor, <b><span class="k">use_target_critic=False</span></b> (paper),
+<b>per-position output head</b> (paper, Prop G.7), Adam <span class="k">lr=3e-4</span>, offline 500k–1M steps,
+30 eval episodes. Env: conda <span class="k">deas_real</span> (jax 0.6), SLURM sweeps.</p>
+
+<h3 id="support">1.1 Value support \((v_{min}, v_{max})\) — how it was set in every distributional run</h3>
+<p>The HL-Gauss critic needs a fixed value support. We always set it one of four ways (the exact
+runtime values are printed per run as <span class="k">[support] ...</span> in the logs):</p>
+<table>
+<tr><th>support mode</th><th>\(v_{min}, v_{max}\)</th><th>how derived</th></tr>
+<tr><td><b>data</b> (DEAS-d)</td><td>per-task; dense cube-double ≈ <b>[−210, 0]</b>, sparse ≈ <b>[−100, 0]</b></td><td>p1 / p99 of the dataset's discounted return-to-go + 5% margin, estimated at runtime (<span class="k">estimate_value_support</span>)</td></tr>
+<tr><td><b>universal</b> (DEAS-u)</td><td>\([r_{min}/(1{-}\gamma),\, r_{max}/(1{-}\gamma)]\); sparse (γ=0.99) = <b>[−100, 0]</b></td><td>theoretical return bound from the per-step reward range (<span class="k">universal_value_support</span>)</td></tr>
+<tr><td><b>custom [−200, 0]</b></td><td><b>v_min=−200, v_max=0</b></td><td>manual = theoretical \(r_{min}/(1{-}\gamma)\) (r_min≈−2, γ=0.99); the <span class="k">_theo</span> runs</td></tr>
+<tr><td><b>reward-norm [−1, 0]</b></td><td><b>v_min=−1, v_max=0</b></td><td>rewards scaled so return-to-go lands in [−1,0]; support then fixed (<span class="k">compute_reward_scale</span>)</td></tr>
+</table>
+<p class="muted">In every results table below, the support mode is named next to each distributional row; refer
+here for its exact \((v_{min},v_{max})\). Regression rows have no value support (scalar critic).</p>
+
+<h2>2. Experiments run (configs)</h2>
+<p>Each sweep config = one W&amp;B group, seeds varying. Config files: <span class="k">scripts/aqc/sweep/cfg_*.json</span>.</p>
+<table>
+<tr><th>axis tested</th><th>values</th><th>config / notes</th></tr>
+<tr><td>Critic type</td><td>regression vs distributional</td><td>the headline comparison</td></tr>
+<tr><td><b>num_atoms</b></td><td>51 / 101 / 201</td><td><span class="k">cfg_aqc_atoms_task3</span> (task3, 1M)</td></tr>
+<tr><td>Value support</td><td>data (DEAS-d) / universal (DEAS-u) / custom[-200,0] / reward-norm[-1,0]</td><td><span class="k">cfg_aqc_support_*</span>, <span class="k">_theo</span>, <span class="k">_rnorm</span></td></tr>
+<tr><td>Reward density</td><td>dense vs sparse</td><td>cube-double is dense in the paper</td></tr>
+<tr><td>Horizon H</td><td>3 vs 5</td><td>most runs H=5</td></tr>
+<tr><td><b>Discount γ</b></td><td>0.99 / 0.999 / 0.9995 / 0.9999</td><td>task4/5, a51, 1M (§3.6)</td></tr>
+<tr><td>Target network</td><td>on vs <b>off</b></td><td>early bug-hunt; off is paper-faithful</td></tr>
+<tr><td>Output head</td><td>shared vs <b>per-position</b></td><td>per-position is paper-faithful</td></tr>
+<tr><td>Tasks × seeds</td><td>task1–5 × {0,1} or {0,41,44,49}</td><td>500k (2 seeds) and 1M (4 seeds) runs</td></tr>
+</table>
+
+<h2>3. Results (final-eval success rate)</h2>
+<p class="muted">Success = fraction of eval episodes solved (last eval epoch, mean over seeds). <span class="k">chunk</span> = mean executed chunk size (≈1.0 ⇒ adaptive selection collapsed to h=1).</p>
+
+<h3>3.1 Paper-faithful corrections — the biggest lever (task1, dense, 500k)</h3>
+<table>
+<tr><th>setting</th><th>critic</th><th>H</th><th>success</th><th>chunk</th></tr>
+<tr><td>target=ON / shared-head (early)</td><td>regression</td><td>5</td><td class="lose">0.43</td><td>1.67</td></tr>
+<tr><td>target=ON / shared-head (early)</td><td>dist a201</td><td>5</td><td class="lose">0.10</td><td>2.38</td></tr>
+<tr><td><b>target=OFF / per-position (paper)</b></td><td>regression</td><td>5</td><td class="win">0.98</td><td>1.99</td></tr>
+<tr><td><b>target=OFF / per-position (paper)</b></td><td>regression</td><td>3</td><td>0.87</td><td>1.74</td></tr>
+<tr><td><b>target=OFF / per-position (paper)</b></td><td>dist a201 (data)</td><td>5</td><td class="win">0.83</td><td>3.08</td></tr>
+<tr><td><b>target=OFF / per-position (paper)</b></td><td>dist a201 (data)</td><td>3</td><td>0.55</td><td>1.53</td></tr>
+</table>
+<div class="box good"><b>Finding 1.</b> Removing the Polyak target network and using one output head per position
+recovered regression from <b>0.43 → 0.98</b> and distributional from <b>~0.10 → 0.83</b>. The paper's
+no-target choice is load-bearing: a lagging target cripples the fast value propagation that chunking
+provides.</div>
+
+<h3>3.2 num_atoms — fewer bins won (task3, dense, 1M, reward-norm)</h3>
+<table>
+<tr><th>num_atoms</th><th>bin width</th><th>success</th><th>chunk</th></tr>
+<tr><td><b>51</b></td><td>0.020</td><td class="win">0.90</td><td>1.84</td></tr>
+<tr><td>101</td><td>0.010</td><td>0.37</td><td>1.54</td></tr>
+<tr><td>201</td><td>0.005</td><td>0.27</td><td>1.35</td></tr>
+</table>
+<div class="box good"><b>Finding 2.</b> On task3, <b>a51 ≫ a101 ≫ a201</b>, and a51 distributional (0.90) <b>beat regression</b>
+(0.62, §3.4). Counterintuitive but robust: too-fine bins make the per-prefix soft targets nearly
+one-hot and the cross-horizon advantages sub-bin-width, which hurts both learning and the adaptive
+\(h^\*\) selection. <b>51 is the chosen default.</b></div>
+
+<h3>3.3 Critic type &amp; value support — task4/5 (1M, 4 seeds, a51)</h3>
+<table>
+<tr><th>task</th><th>regression</th><th>dist a51 reward-norm[-1,0]</th><th>dist a51 custom[-200,0]</th></tr>
+<tr><td>task4 (hard)</td><td>0.29</td><td>0.33</td><td>0.28</td></tr>
+<tr><td>task5</td><td>0.80</td><td>0.76</td><td>0.74</td></tr>
+</table>
+<div class="box"><b>Finding 3.</b> On task4/5, <b>distributional ≈ regression</b> (no consistent winner), and
+<b>reward-norm[-1,0] ≈ theoretical support[-200,0]</b>. So the distributional win on task3 is task-dependent,
+not universal; and the value-support choice barely matters once it brackets the returns.</div>
+
+<h3>3.4 Per-task regression (dense, H5, 500k) &amp; dense-vs-sparse</h3>
+<table>
+<tr><th>task</th><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td></tr>
+<tr><th>regression success</th><td>0.98</td><td>0.72</td><td>0.62</td><td>0.27</td><td>0.72</td></tr>
+</table>
+<p>Sparse cube-double is much harder than dense (task1: regression <b>0.42 sparse vs 0.98 dense</b>;
+dist <b>0.17 vs 0.83</b>) — consistent with the paper using dense rewards for cube tasks. task4 is the
+hardest across the board (~0.3 for every method).</p>
+
+<h3>3.5 Value support on sparse — data vs universal (500k)</h3>
+<table>
+<tr><th>reward</th><th>support</th><th>atoms</th><th>success</th><th>chunk</th></tr>
+<tr><td>dense</td><td>data</td><td>101</td><td>0.13</td><td>2.12</td></tr>
+<tr><td>dense</td><td>universal</td><td>101</td><td>0.20</td><td>2.26</td></tr>
+<tr><td>sparse</td><td>data</td><td>101</td><td>0.12</td><td>2.39</td></tr>
+<tr><td>sparse</td><td><b>universal</b></td><td>101</td><td class="lose">0.00</td><td><b>1.02</b></td></tr>
+<tr><td>sparse</td><td><b>universal</b></td><td>201</td><td class="lose">0.05</td><td><b>1.07</b></td></tr>
+</table>
+<div class="box warn"><b>Finding 4.</b> On <b>sparse</b>, the <b>universal</b> support (\(r/(1-\gamma)\)) collapses —
+chunk size falls to ~1.0, i.e. the adaptive selection degenerates to h=1 and success →0 — while the
+<b>data-centric</b> support survives (0.12). The universal bound is far too wide for sparse returns, so
+almost all probability mass lands in a couple of bins. On dense they're comparable. <b>Use data-centric
+(or a tight fixed) support</b>, not universal.</div>
+
+<h3>3.6 Discount sweep — γ ∈ {0.999, 0.9995, 0.9999} (task4/5, dense, a51, 1M, 2 seeds)</h3>
+<p class="muted">Run on top of the chosen a51 config (the §3.3 runs are the γ=0.99 reference point).</p>
+<table>
+<tr><th>task</th><th>critic</th><th>γ=0.999</th><th>γ=0.9995</th><th>γ=0.9999</th></tr>
+<tr><td>task4</td><td>regression</td><td>0.07</td><td>0.08</td><td>—</td></tr>
+<tr><td>task4</td><td>dist a51 (data)</td><td>0.03</td><td class="win">0.13</td><td>0.00</td></tr>
+<tr><td>task4</td><td>dist a51 (reward-norm)</td><td>0.07</td><td class="win">0.13</td><td>0.03</td></tr>
+<tr><td>task5</td><td>regression</td><td>0.82</td><td>0.68</td><td>—</td></tr>
+<tr><td>task5</td><td>dist a51 (data)</td><td>0.70</td><td class="win">0.85</td><td>0.60</td></tr>
+<tr><td>task5</td><td>dist a51 (reward-norm)</td><td>0.72</td><td class="win">0.78</td><td>0.68</td></tr>
+</table>
+<div class="box good"><b>Finding 5.</b> <b>γ=0.9995 is the sweet spot</b> for the distributional critic — it
+peaks both tasks (best overall task5 = <b>dist-data @0.9995 = 0.85</b>, beating every γ=0.99 run). Pushing
+to <b>γ=0.9999 degrades</b> (task5 0.85→0.60; task4→0): the effective horizon \(1/(1-\gamma)=10\text{k}\)
+steps makes the value target too long/flat to fit. γ=0.99 (§3.3) and 0.999 are comparable and safe.
+Regression peaks at the lower γ (0.999). <span class="muted">(2 seeds — noisier than the 4-seed γ=0.99 runs;
+treat ±0.05 as within noise.)</span></div>
+
+<h2>4. What worked / what didn't — synthesis</h2>
+<h3 class="win">Worked</h3>
+<ul>
+<li><b>No target network + per-position head</b> (paper-faithful) — the single biggest factor (§3.1).</li>
+<li><b>Regression critic</b> is a strong, reliable baseline: ~0.98 on the easy dense task1, and the
+overall most consistent across tasks.</li>
+<li><b>Distributional with few atoms (51)</b> — can match or beat regression (task3: 0.90 vs 0.62), and
+is the configuration to carry forward.</li>
+<li><b>Data-centric value support</b> — robust on both dense and sparse.</li>
+<li><b>Discount γ=0.9995</b> — sweet spot for the distributional critic (best task5 = 0.85); γ=0.99–0.999 also safe.</li>
+<li><b>Dense rewards</b> for cube tasks (matches the paper).</li>
+</ul>
+<h3 class="lose">Didn't work / pitfalls</h3>
+<ul>
+<li><b>Polyak target network</b> — crippled the chunked critic (0.98→~0.6 in early runs). Removed.</li>
+<li><b>Many atoms (101/201)</b> — consistently worse than 51 (§3.2).</li>
+<li><b>Universal support on sparse</b> — degenerate (chunk→1, success→0) (§3.5).</li>
+<li><b>Unnormalized value scale</b> — early distributional runs had <span class="k">q_mean≈-95</span> because
+OGBench dense reward isn't in [-1,0]; fixed by estimating the support from data (or normalizing).</li>
+<li><b>Sparse cube-double</b> — low success for all methods; dense is the right setting.</li>
+<li><b>Discount γ=0.9999</b> — too high; degrades the value fit (task5 0.85→0.60, task4→0). Effective horizon 10k steps is too long/flat.</li>
+<li><b>Distributional is not a free win</b> — on task4/5 it only matched regression; gains are task-dependent.</li>
+</ul>
+
+<h2>5. Distributional RL — code review map</h2>
+<p>Where to look to review the distributional implementation (file : line). The math write-up is
+<a href="aqc_distributional_guide.html">aqc_distributional_guide.html</a>.</p>
+<h3>Core distributional utilities — <span class="k">utils/distributional.py</span></h3>
+<table>
+<tr><th>what</th><th>symbol</th><th>line</th></tr>
+<tr><td>HL-Gauss transform (scalar↔soft-histogram; builds <span class="k">to_probs/from_probs</span>)</td><td><span class="k">hl_gauss_transform</span></td><td>:55</td></tr>
+<tr><td>categorical cross-entropy loss</td><td><span class="k">categorical_cross_entropy</span></td><td>:168</td></tr>
+<tr><td>discounted return-to-go (for support / MC)</td><td><span class="k">compute_return_to_go</span></td><td>:92</td></tr>
+<tr><td>data-centric support (DEAS-d, p1/p99+margin)</td><td><span class="k">estimate_value_support</span></td><td>:119</td></tr>
+<tr><td>universal support (DEAS-u, r/(1-γ))</td><td><span class="k">universal_value_support</span></td><td>:158</td></tr>
+<tr><td>reward-normalization scale → [-1,0]</td><td><span class="k">compute_reward_scale</span></td><td>:137</td></tr>
+</table>
+<h3>OGBench AQC agent — <span class="k">agents/aqc.py</span></h3>
+<table>
+<tr><th>what</th><th>line</th></tr>
+<tr><td>expected value from logits (softmax · centers)</td><td><span class="k">_prefix_values</span> :60</td></tr>
+<tr><td>scalar target → HL-Gauss soft histogram</td><td><span class="k">_scalar_to_probs</span> :73</td></tr>
+<tr><td>per-prefix TD loss — <b>distributional CE branch</b></td><td><span class="k">critic_loss</span> :153–158</td></tr>
+<tr><td><b>distributional health diagnostics</b> (entropy, value-std, edge-mass, OOB-frac)</td><td>:177–194</td></tr>
+<tr><td>HL-Gauss setup from v_min/v_max/num_atoms</td><td><span class="k">create</span> :394–451</td></tr>
+</table>
+<h3>Critic network head — <span class="k">utils/transformer.py</span></h3>
+<table>
+<tr><th>what</th><th>line</th></tr>
+<tr><td><span class="k">num_atoms</span> field (1=scalar, &gt;1=categorical logits)</td><td>:63</td></tr>
+<tr><td>per-position output head → <span class="k">(...,H,num_atoms)</span> logits</td><td>:119–132</td></tr>
+</table>
+<h3>Support / normalization wiring — <span class="k">main.py</span></h3>
+<table>
+<tr><th>what</th><th>line</th></tr>
+<tr><td><span class="k">--support_type</span> (data/universal/custom), <span class="k">--reward_normalize</span> flags</td><td>:43, :47</td></tr>
+<tr><td>reward-normalize scaling + fixed [-1,0] support</td><td>:186–203</td></tr>
+<tr><td>data/universal support estimation before agent creation</td><td>:200–</td></tr>
+</table>
+<h3>VLA distributional critic (next phase) — <span class="k">vla_aqc.py</span></h3>
+<table>
+<tr><th>what</th><th>line</th></tr>
+<tr><td>HL-Gauss setup over [-0.5,0]</td><td>:53–54</td></tr>
+<tr><td>candidate-fed expected-prefix-max bootstrap</td><td><span class="k">_expected_prefix_max</span> :68</td></tr>
+<tr><td>distributional TD loss (per-prefix CE)</td><td><span class="k">critic_loss_td</span> :114–131</td></tr>
+</table>
+<div class="box"><b>Suggested review order:</b> (1) <span class="k">distributional.py:hl_gauss_transform</span> — the
+core scalar↔histogram math; (2) <span class="k">aqc.py:critic_loss :153</span> — how the per-prefix scalar TD
+target becomes a soft histogram and CE; (3) <span class="k">aqc.py:177</span> — the health diagnostics that
+told us when bins/support were misconfigured; (4) <span class="k">main.py:186–205</span> — how the support is
+chosen. The reading guide cross-references all of these.</div>
+
+<h2>6. Recommendation &amp; open items</h2>
+<ul>
+<li><b>Default config:</b> regression OR distributional <b>a51</b>, dense, target=OFF, per-position head,
+data-centric (or tight fixed) support, H=5.</li>
+<li><b>For the VLA phase:</b> carry forward a51 + fixed [-0.5,0] support (the <span class="k">mc_return</span> range);
+distributional is worth keeping but should earn its place per-task vs regression.</li>
+<li><b>Reproduce:</b> sweep configs in <span class="k">scripts/aqc/sweep/cfg_*.json</span>; raw per-run CSVs were in
+the OGBench working dir (also in W&amp;B project <span class="k">AQC</span>). Numbers here are final-eval, mean over seeds.</li>
+<li><b>Caveat:</b> 2 seeds for many 500k runs — treat single-config differences cautiously; the 1M task4/5
+runs used 4 seeds.</li>
+</ul>
+
+</body>
+</html>

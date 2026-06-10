@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Reward &amp; Value Range Design (γ=0.999)</title>
+<script>
+  window.MathJax = { tex: { inlineMath: [['\\(','\\)']], displayMath: [['$$','$$']] } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{--fg:#1c2330;--muted:#5b6776;--bg:#fff;--soft:#f5f7fa;--line:#e2e8f0;--accent:#2563eb;--good:#127a3d;--warn:#b4690e;--bad:#b42318;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);max-width:900px;margin:0 auto;padding:32px 24px 80px;line-height:1.7;}
+  h1{font-size:25px;margin:0 0 4px} h2{font-size:20px;margin:34px 0 8px;padding-top:14px;border-top:2px solid var(--line)} h3{font-size:16px;margin:18px 0 6px;color:#334155}
+  .sub{color:var(--muted);margin:0 0 18px}
+  .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;margin-left:6px;vertical-align:middle}
+  .badge.fixed{background:#dcfce7;color:var(--good)} .badge.changed{background:#fef9c3;color:#854d0e}
+  code{background:var(--soft);padding:1px 6px;border-radius:4px;font-size:89%;font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:13px}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left} th{background:var(--soft)}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  .box{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--soft);border-radius:8px;padding:12px 16px;margin:14px 0}
+  .box.good{border-left-color:var(--good)} .box.warn{border-left-color:var(--warn)} .box.bad{border-left-color:var(--bad)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<h1>Reward &amp; Value Range Design</h1>
+<p class="sub">VLA critic 학습용 reward / value support 설계. 목표: 모든 value가 <b>\([-1, 0]\)</b> 안에
+자연스럽게 fit + 평균 길이 성공 trajectory의 시작 value가 <b>−0.3 ~ −0.4</b> 형성. discount \(\gamma = 0.999\)
+(long-horizon task). MC return은 사용하지 않고 <b>TD bootstrap만</b> 사용.</p>
+
+<!-- ============================================================ -->
+<h2>0. 데이터 사실 (fixed)</h2>
+<table>
+<tr><th>항목</th><th>값</th></tr>
+<tr><td>episode 길이</td><td>1,069 ~ 5,039 step, 평균 ~2,500</td></tr>
+<tr><td>parquet row-group 크기</td><td>~1,000 행 (episode 하나가 2~3 group에 걸침)</td></tr>
+<tr><td>제어 주파수</td><td>60 Hz</td></tr>
+<tr><td>구성</td><td>teleop 831 (전부 성공) + inference 288 (124 failure)</td></tr>
+<tr><td>raw reward 인코딩</td><td>living = <code>−0.0001</code>, success terminal = <code>0.0</code>, failure terminal = <code>−0.5</code></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>1. Reward 정의 (RECAP-style)</h2>
+<p>매 step에 작은 living cost, terminal에서 성공/실패 구분:</p>
+$$
+r_t =
+\begin{cases}
+0 & t = T \text{ 이고 success} \\
+-C_{\text{fail}} & t = T \text{ 이고 failure} \\
+-r_{\text{step}} & \text{그 외 (평범한 state)}
+\end{cases}
+$$
+<p>우리가 <b>정해야 할 두 값</b>: 평범 state cost \(r_{\text{step}}\) 와 failure penalty \(C_{\text{fail}}\).</p>
+
+<!-- ============================================================ -->
+<h2>2. Value 정의 — discounted return-to-go</h2>
+<p>critic이 회귀하는 target은 시작 state 기준 <b>discounted return-to-go</b>:</p>
+$$
+V(s_0) \;=\; \sum_{k=0}^{T-1} \gamma^{k}\, r_{k} \;+\; \gamma^{T}\, r_{T}
+$$
+<p>이 식을 living 항과 terminal 항으로 분리하면:</p>
+$$
+V(s_0) \;=\; \underbrace{(-r_{\text{step}})\sum_{k=0}^{T-1}\gamma^{k}}_{\text{living cost}}
+\;+\; \underbrace{\gamma^{T}\,r_{T}}_{\text{terminal (discounted!)}}
+$$
+
+<div class="box warn"><b>핵심 1 — terminal 에도 \(\gamma^T\) discount가 붙는다.</b>
+failure penalty \(-C_{\text{fail}}\)는 episode <b>끝(\(T\) step 후)</b>에 있으므로, 시작점에서 보면
+\(\gamma^{T}\)만큼 약해진다. 즉 <b>실패가 멀수록(긴 traj) penalty가 작아진다.</b>
+$$\gamma^{T}\big|_{\gamma=0.999}:\quad \gamma^{100}=0.905,\ \ \gamma^{500}=0.606,\ \ \gamma^{1000}=0.368,\ \ \gamma^{3000}=0.050$$
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Living cost — geometric sum</h2>
+<p>등비급수 공식으로 living 항을 정리:</p>
+$$
+\sum_{k=0}^{T-1}\gamma^{k} \;=\; \frac{1-\gamma^{T}}{1-\gamma}
+\qquad\Longrightarrow\qquad
+V_{\text{living}}(s_0) \;=\; -\,r_{\text{step}}\cdot\frac{1-\gamma^{T}}{1-\gamma}
+$$
+<p>\(\dfrac{1-\gamma^{T}}{1-\gamma}\)는 <b>"discount 적용된 유효 step 수"</b>. \(\gamma=0.999\)에서
+\(\dfrac{1}{1-\gamma}=1000\) 이므로 유효 step 수 \(= (1-\gamma^{T})\times 1000\):</p>
+<table>
+<tr><th class="n">traj 길이 \(T\)</th><th class="n">\(\gamma^{T}\)</th><th class="n">유효 step 수 \(\frac{1-\gamma^T}{1-\gamma}\)</th></tr>
+<tr><td class="n">1,000</td><td class="n">0.368</td><td class="n">632</td></tr>
+<tr><td class="n">2,000</td><td class="n">0.135</td><td class="n">865</td></tr>
+<tr><td class="n">3,000</td><td class="n">0.050</td><td class="n">950</td></tr>
+<tr><td class="n">\(\infty\) (수렴)</td><td class="n">0</td><td class="n">1,000</td></tr>
+</table>
+<div class="box"><b>핵심 2 — effective horizon.</b> \(\gamma=0.999\)는 traj가 아무리 길어도
+<b>유효 1,000 step</b>까지만 센다. 그래서 평균 길이(~2,500) traj는 거의 수렴값에 도달.</div>
+
+<!-- ============================================================ -->
+<h2>4. \(r_{\text{step}}\) 결정 — 시작 value가 −0.3~−0.4 되도록</h2>
+<p>성공 traj는 terminal 항 \(=0\) 이므로 시작 value는 living cost만:</p>
+$$
+V_{\text{success}}(s_0) \;=\; -\,r_{\text{step}}\cdot\frac{1-\gamma^{T}}{1-\gamma}
+\;\xrightarrow[\;T\to\infty\;]{}\; -\,\frac{r_{\text{step}}}{1-\gamma}
+$$
+<p>수렴값(가장 음수)을 −0.4로 맞추려면:</p>
+$$
+-\frac{r_{\text{step}}}{1-\gamma} = -0.4
+\;\Longrightarrow\;
+r_{\text{step}} = 0.4\,(1-\gamma) = 0.4\times 0.001 = \mathbf{0.0004}
+$$
+<p><b>\(r_{\text{step}} = -0.0004\)</b> 일 때 길이별 시작 value:</p>
+<table>
+<tr><th class="n">성공 traj 길이 \(T\)</th><th class="n">유효 step</th><th class="n">시작 value</th></tr>
+<tr><td class="n">1,000</td><td class="n">632</td><td class="n">\(-0.0004\times632 = -0.25\)</td></tr>
+<tr><td class="n">2,000</td><td class="n">865</td><td class="n">\(-0.35\)</td></tr>
+<tr><td class="n">2,500 (평균)</td><td class="n">918</td><td class="n">\(-0.37\)</td></tr>
+<tr><td class="n">\(\infty\)</td><td class="n">1,000</td><td class="n">\(-0.40\)</td></tr>
+</table>
+<div class="box good">평균 길이(~2,500) 성공 traj의 시작 value ≈ <b>−0.35 ~ −0.40</b> ✅
+(raw \(r_{\text{step}}=-0.0001\)이면 수렴값이 −0.1뿐 → too small. loader에서 ×4 relabel.)</div>
+
+<!-- ============================================================ -->
+<h2>5. \(C_{\text{fail}}\) 결정</h2>
+<p>실패 traj의 시작 value (living + discounted failure):</p>
+$$
+V_{\text{fail}}(s_0)
+= -\,r_{\text{step}}\cdot\frac{1-\gamma^{T}}{1-\gamma}
+\;+\; \gamma^{T}\,(-C_{\text{fail}})
+$$
+<div class="box warn"><b>핵심 3 — 두 항은 trade-off다.</b>
+실패가 <b>늦으면</b>(\(T\)↑): living은 커지지만(\(\to -0.4\)) failure는 \(\gamma^T\)로 작아짐(\(\to 0\)).
+실패가 <b>빠르면</b>(\(T\)↓): living은 작지만(\(\to 0\)) failure는 거의 그대로(\(\to -C_{\text{fail}}\)).
+→ <b>둘이 동시에 max가 될 수 없어</b> 합이 \(-(r_{\text{step}}/(1-\gamma) + C_{\text{fail}})\)보다 항상 작다.</div>
+
+<p>\(r_{\text{step}}=-0.0004\), \(C_{\text{fail}}=0.5\) 기준 실패 value:</p>
+<table>
+<tr><th class="n">\(T\) (실패시점)</th><th class="n">\(\gamma^T\)</th><th class="n">living 항</th><th class="n">failure 항</th><th class="n">합산 value</th></tr>
+<tr><td class="n">1 (즉각)</td><td class="n">0.999</td><td class="n">~0.000</td><td class="n">−0.500</td><td class="n"><b>−0.50</b></td></tr>
+<tr><td class="n">500</td><td class="n">0.606</td><td class="n">−0.16</td><td class="n">−0.303</td><td class="n">−0.46</td></tr>
+<tr><td class="n">1,000</td><td class="n">0.368</td><td class="n">−0.25</td><td class="n">−0.184</td><td class="n">−0.43</td></tr>
+<tr><td class="n">2,500</td><td class="n">0.082</td><td class="n">−0.37</td><td class="n">−0.041</td><td class="n">−0.41</td></tr>
+</table>
+<div class="box good"><b>\(C_{\text{fail}}=0.5\)</b> — 즉각 실패 −0.50, 늦은 실패 −0.41 ~ −0.43.
+모든 failure value가 <b>−0.5 ~ −0.4</b> 범위 → \([-1,0]\) 안에 안전하게 fit ✅<br>
+<span class="muted">주의: 늦은 failure ≈ 긴 성공(−0.40)과 value가 거의 같다 — 이는 \(\gamma^T\)가 늦은 penalty를 충분히
+감소시키기 때문이며, 어떤 \(C_{\text{fail}}\)을 써도 개선되지 않는 discount의 근본 특성.</span></div>
+
+<!-- ============================================================ -->
+<h2>6. In-loader Reward Relabel <span class="badge changed">구현됨</span></h2>
+<p>parquet 재작성(181 GB) 없이 loader 안에서 <b>읽은 직후</b> 변환. 두 값의 스케일이 다르므로 따로 처리:</p>
+<pre>
+# raw 인코딩: living=-1e-4, success_terminal=0.0, failure_terminal=-0.5
+scale = relabel_living / -1e-4          # -4e-4 / -1e-4 = 4.0
+out   = rew * scale                     # living -1e-4 → -4e-4, success 0.0 → 0.0
+out   = where(rew &lt;= -0.05, relabel_fail, out)   # failure -0.5 → -0.5 (유지)
+</pre>
+<p>변환 후 <code>mc_return</code>과 <code>cum_reward</code>는 모두 이 값에서 재계산 → 별도 처리 불필요.</p>
+<table>
+<tr><th>raw</th><th>의미</th><th>after relabel</th></tr>
+<tr><td><code>−0.0001</code></td><td>living step</td><td><code>−0.0004</code> (×4)</td></tr>
+<tr><td><code>0.0</code></td><td>success terminal</td><td><code>0.0</code></td></tr>
+<tr><td><code>−0.5</code></td><td>failure terminal</td><td><code>−0.5</code> (유지)</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>7. False Terminal 버그 수정 <span class="badge fixed">버그 수정</span></h2>
+
+<div class="box bad"><b>발견된 버그 — row-group 경계를 terminal로 오인.</b><br>
+episode 하나(평균 2,500 frame)가 ~1,000행 row-group 2~3개에 걸쳐 있는데, 기존 코드는
+<code>end == last_idx_in_group</code> 조건으로 terminal을 판단했다. row-group 경계 frame도
+마지막 인덱스이므로 <b>chunk edge 2개 + 진짜 terminal 1개 → false terminal이 53%</b>였다.
+false terminal 위치의 <code>next_mc_return</code>은 living 값 −0.0004 → critic이 <i>"이 중간
+state가 value≈0인 terminal"</i>이라고 잘못 학습.</div>
+
+<p><b>수정:</b> chunk 위치 대신 <b>reward 값</b>으로 판단. 검증 결과
+<code>reward ∈ {0.0, −0.5}</code>는 <b>전체 3.08M frame 중 진짜 episode 끝에서만</b> 등장
+(success 368/368, failure 124/124 확인). living −0.0001은 절대 오탐 없음.</p>
+
+$$
+\text{is\_terminal}(i) \;=\; \bigl[\,r_i \ge -10^{-6}\bigr] \;\vee\; \bigl[\,r_i \le -0.05\bigr]
+$$
+
+<pre>
+# 기존 (버그)
+term = (end == last_idx_in_group) &amp; (valid > 0)   # row-group edge도 terminal로 오인
+
+# 수정
+is_term_frame = (rew &gt;= -1e-6) | (rew &lt;= -0.05)  # reward 값으로 판단
+term = (valid > 0) &amp; is_term_frame[end_c]          # false terminal 0개 확인
+</pre>
+
+<div class="box good">수정 후 검증: false terminal <b>9 → 0</b>. 남은 terminal은 전부
+<code>next_mc_return = −0.5</code> (진짜 failure). TD bootstrap signal 완전히 정상화. ✅</div>
+
+<!-- ============================================================ -->
+<h2>8. 최종 설계 요약</h2>
+<table>
+<tr><th>parameter</th><th>raw (on disk)</th><th class="n">학습 시 실제 값</th></tr>
+<tr><td>\(r_{\text{step}}\) (평범 state)</td><td>−0.0001</td><td class="n"><b>−0.0004</b> (loader relabel ×4)</td></tr>
+<tr><td>\(C_{\text{fail}}\) (failure terminal)</td><td>−0.5</td><td class="n"><b>−0.5</b> (유지)</td></tr>
+<tr><td>success terminal</td><td>0.0</td><td class="n">0.0</td></tr>
+<tr><td>discount \(\gamma\)</td><td>0.995 (precomputed col)</td><td class="n"><b>0.999</b> (TD bootstrap + mc_gamma)</td></tr>
+<tr><td>value support \([v_{\min}, v_{\max}]\)</td><td>−</td><td class="n"><b>[−1, 0]</b></td></tr>
+<tr><td>MC return</td><td>−</td><td class="n"><b>사용 안 함</b> (TD only)</td></tr>
+</table>
+
+<div class="box good"><b>결과 value 범위 (실측 확인):</b>
+$$
+\begin{aligned}
+V_{\text{success}} &\in [-0.40,\; 0] \quad(\text{episode 길이에 따라})\\
+V_{\text{fail}} &\in [-0.50,\; -0.40]\\
+\Longrightarrow\quad V &\in [-0.50,\; 0]\;\subset\; [-1, 0]\ \ \checkmark
+\end{aligned}
+$$
+<code>vla_data.py</code> 실측: <code>mc_return ∈ [-0.60, 0.0]</code> (γ=0.999 recompute 기준) — 전부 support 안에 fit.</div>
+
+<h3>핵심 요약</h3>
+<ol>
+<li><b>terminal에도 \(\gamma^T\) discount</b> → 늦은 failure는 value가 성공과 비슷해진다 (discount의 본질).</li>
+<li><b>유효 horizon = \(1/(1-\gamma) = 1{,}000\) step</b> → \(r_{\text{step}}=-0.0004\)이면 성공 시작 value ≈ −0.35~−0.40.</li>
+<li><b>living vs failure는 trade-off</b> → 동시에 최대가 될 수 없으므로 \(C_{\text{fail}}=0.5\)면 −1 절대 안 넘는다.</li>
+<li><b>TD bootstrap만 사용, MC return 미사용</b> → terminal은 reward 값으로 검출 (row-group 경계 오탐 0).</li>
+</ol>
+
+<p class="muted">코드: <code>vla_data.py</code> — <code>_relabel()</code>, <code>_bootstrap_samples_from_table()</code> terminal 판단.<br>
+설정: <code>vla_config.py</code> — <code>TDConfig.discount=0.999</code>, <code>TDConfig.mc_gamma=0.999</code>,
+<code>RewardConfig.relabel_living=-4e-4</code>, <code>RewardConfig.relabel_fail=-0.5</code>.</p>
+
+</body>
+</html>
