@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Bootstrap Target Aggregation — BoN(max) vs Softmax</title>
+<script>
+  window.MathJax = { tex: { inlineMath: [['\\(','\\)']], displayMath: [['$$','$$']] } };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{--fg:#1c2330;--muted:#5b6776;--bg:#fff;--soft:#f5f7fa;--line:#e2e8f0;--accent:#2563eb;--good:#127a3d;--warn:#b4690e;--bad:#b42318;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);max-width:940px;margin:0 auto;padding:32px 24px 80px;line-height:1.7;}
+  h1{font-size:25px;margin:0 0 4px} h2{font-size:20px;margin:34px 0 8px;padding-top:14px;border-top:2px solid var(--line)} h3{font-size:16px;margin:18px 0 6px;color:#334155}
+  .sub{color:var(--muted);margin:0 0 18px}
+  .badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;margin-left:6px;vertical-align:middle}
+  .badge.cur{background:#dcfce7;color:var(--good)} .badge.opt{background:#fef9c3;color:#854d0e} .badge.ach{background:#e0f2fe;color:#0369a1}
+  code{background:var(--soft);padding:1px 6px;border-radius:4px;font-size:89%;font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:12px 16px;overflow-x:auto;font-size:13px;line-height:1.5}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top} th{background:var(--soft)}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  .box{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--soft);border-radius:8px;padding:12px 16px;margin:14px 0}
+  .box.good{border-left-color:var(--good)} .box.warn{border-left-color:var(--warn)} .box.bad{border-left-color:var(--bad)}
+  .muted{color:var(--muted)}
+  .flow{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:14px 16px;line-height:1.7;white-space:pre}
+</style>
+</head>
+<body>
+<h1>Bootstrap Target Aggregation: BoN(max) vs Softmax</h1>
+<p class="sub">VLA AQC critic의 TD bootstrap target \(V(s')\)을 만들 때 <b>후보×prefix Q들을 어떻게 하나로 합치는가</b>.
+현재는 hard max(Best-of-N), conservatism을 위해 softmax/mellowmax로 바꾸는 안을 검토. ACH 논문(q_softmax.pdf)과 비교.</p>
+
+<!-- ============================================================ -->
+<h2>0. 어디 얘기인가 — <code>_expected_prefix_max</code></h2>
+<p>TD target은 \(\ \text{target} = R_{1:h} + \gamma^{h}\,V(s')\ \) 이고, 여기서 \(V(s')\)을 만드는 게
+<code>vla_aqc.py</code>의 <code>_expected_prefix_max</code>. 핵심은 마지막 한 줄:</p>
+<pre>
+qs = self._prefix_values(params, states, chunks)   # (K, M*N, macro_H)
+q  = qs.min(axis=0)                                 # ensemble-min -> (M*N, macro_H)
+return q.reshape(M, N * macro_H).max(axis=-1)       # (M,)  ← 이 max 가 논점
+</pre>
+<p>각 next-state \(s'\)마다 <b>N=32 후보 × macro_H=5 prefix = 160개 scalar Q</b>가 있고, 그 중 하나의 값으로
+\(V(s')\)을 정합니다.</p>
+
+<!-- ============================================================ -->
+<h2>1. softmax가 두 개라 헷갈림 — 먼저 구분</h2>
+<table>
+<tr><th></th><th>softmax ① (atoms)</th><th>softmax ② (aggregation, 제안)</th></tr>
+<tr><td><b>위치</b></td><td><code>_prefix_values</code> 안</td><td><code>.max(-1)</code> 자리</td></tr>
+<tr><td><b>무엇에</b></td><td>201개 atom (value bin)</td><td>160개 <b>Q값</b></td></tr>
+<tr><td><b>목적</b></td><td>분포 → scalar Q 1개</td><td>160개 Q → \(V(s')\) 1개로 집계</td></tr>
+<tr><td><b>온도 β</b></td><td>없음</td><td><b>β로 max↔mean 조절</b></td></tr>
+</table>
+<div class="flow">logits (…, 201 atoms)
+   │  softmax①(atoms) + from_probs     ← 이미 있음: 분포 → scalar Q
+   ▼
+160개 scalar Q  (32 후보 × 5 prefix)
+   │  ← 여기! max(-1) 를  softmax②(Q값들) 로 교체하는 안
+   ▼
+V(s')  (M,)</div>
+<div class="box warn">제안하는 softmax는 <b>②번</b> — <b>Q값을 다 구한 후, max 직전</b>에 그 Q값들 위에 적용.
+logit/atom 단계의 softmax①과는 완전히 별개.</div>
+
+<!-- ============================================================ -->
+<h2>2. 현재: max(BoN)가 의미하는 것 <span class="badge cur">current</span></h2>
+$$
+V(s') = \max_{n\in[N],\, h'\in[H]}\ Q_{\bar\phi}(s', a^{(n)}_{1:h'})
+$$
+<p>이건 <b>Bellman optimality backup</b> (\(\max_{a'}Q\))을 두 축에서 동시에 하는 것:</p>
+<ul>
+<li><b>후보 축 max = 행동 선택(policy improvement)</b>: frozen VLA의 32개 후보 중 best를 골라 \(\max_a Q\)를 근사 → <b>Best-of-N / EMaQ / BFN</b>.</li>
+<li><b>prefix 축 max = chunk length 선택</b>: 10~50 step 중 가치 최고 길이 선택.</li>
+</ul>
+<div class="box bad"><b>문제: optimistic bias.</b> Q에 추정 노이즈가 있으면 160개 중 max는
+<b>양의 노이즈 꼬리</b>를 집음 → 과대평가. offline에서 value가 \(v_{max}=0\)로 쏠리는 원인.
+(actor 없이 후보 max로 improvement하는 구조라 더 그럼.)</div>
+
+<!-- ============================================================ -->
+<h2>3. soft 대체 — 원리 <span class="badge opt">option</span></h2>
+<p>\(q_f = q.\text{reshape}(M, 160)\)일 때, <code>max</code>를 다음으로 교체:</p>
+
+<h3>(A) Softmax-weighted mean (Boltzmann, ACH 방식)</h3>
+$$
+V = \sum_j w_j q_j, \qquad w_j = \frac{e^{\beta q_j}}{\sum_k e^{\beta q_k}}
+$$
+<pre>V = (jax.nn.softmax(beta * qf, axis=-1) * qf).sum(-1)</pre>
+
+<h3>(B) Mellowmax (log-sum-exp, contraction 보장)</h3>
+$$
+\text{mm}_\beta(q) = \frac{1}{\beta}\log\!\Big(\frac{1}{J}\sum_j e^{\beta q_j}\Big)
+$$
+<pre>V = jax.scipy.special.logsumexp(beta*qf, -1)/beta - jnp.log(qf.shape[-1])/beta</pre>
+
+<div class="box"><b>원리 — "soft 정책의 가치".</b> max는 <i>"다음 state에서 무조건 best 하나 고름"</i>(greedy).
+softmax 기대값은 <i>"\(\pi(j)\propto e^{\beta q_j}\)인 확률적 정책으로 고를 때의 평균 가치"</i>.
+이게 soft Q-learning / max-entropy RL의 backup이고, ACH의 \(V=\mathbb{E}_{\ell\sim\pi_L}[Q]\)와 같은 원리.</div>
+
+<p>둘 다 보간이며 항상 \(\ \text{mean}(q)\le V_\beta \le \max(q)\ \), β에 대해 단조증가:</p>
+<table>
+<tr><th class="n">β</th><th>분포</th><th>V</th></tr>
+<tr><td class="n">\(\to\infty\)</td><td>argmax에 확률 1</td><td>= max (hard max 복원, 낙관)</td></tr>
+<tr><td class="n">중간</td><td>Q 높은 쪽 가중</td><td>max와 mean 사이</td></tr>
+<tr><td class="n">\(\to 0\)</td><td>균등</td><td>= mean (160개 평균, 보수)</td></tr>
+</table>
+<div class="box good"><b>왜 conservative.</b> 가중평균이라 항상 max 이하 + 운 좋은 outlier 하나를 나머지 159개로
+<b>희석</b> → overestimation 완화. target도 argmax가 후보 간에 튀지 않고 <b>매끄럽게</b> 변해 학습 안정.</div>
+
+<!-- ============================================================ -->
+<h2>4. β = inverse temperature (역온도)</h2>
+<p>β는 exp 안에서 Q에 곱해져 분포의 뾰족함을 조절. softmax는 <b>shift-invariant</b>라 절댓값이 아니라
+<b>Q 차이</b>만 중요하고, 실제 peakedness는 \(\ \beta\times(q_i-q_j)\ \)로 결정됨.</p>
+
+<h3>숫자 예시 (두 후보 \(q=[-0.2,-0.4]\), 차이 0.2)</h3>
+<table>
+<tr><th class="n">β</th><th class="n">β·차이</th><th>weights</th><th class="n">V</th><th>해석</th></tr>
+<tr><td class="n">→0</td><td class="n">0</td><td>[0.50, 0.50]</td><td class="n">−0.30</td><td>mean</td></tr>
+<tr><td class="n">1</td><td class="n">0.2</td><td>[0.55, 0.45]</td><td class="n">−0.29</td><td>거의 mean</td></tr>
+<tr><td class="n">5</td><td class="n">1.0</td><td>[0.73, 0.27]</td><td class="n">−0.25</td><td>약하게 max쪽</td></tr>
+<tr><td class="n">20</td><td class="n">4.0</td><td>[0.98, 0.02]</td><td class="n">−0.20</td><td>≈ max</td></tr>
+<tr><td class="n">→∞</td><td class="n">∞</td><td>[1, 0]</td><td class="n">−0.20</td><td>max</td></tr>
+</table>
+<div class="box warn"><b>핵심 — β는 Q차이 스케일에 맞춰야.</b> 우리 Q차이가 ~0.1–0.3이면 <b>β=1은 거의 mean</b>.
+의미 있는 soft-max를 하려면 <b>β≈10–50</b> sweep 필요. (절댓값 \([-1,0]\)은 무관, 차이만 영향)</div>
+
+<!-- ============================================================ -->
+<h2>5. ACH 논문의 softmax/β <span class="badge ach">q_softmax.pdf</span></h2>
+<p>ACH는 우리와 <b>다른 구조</b>: 별도 \(V(s)\) head를 두고 Q를 V로 bootstrap, V-target은 chunk length에 대한 softmax.</p>
+$$
+\pi_L(\ell) = \frac{\exp(\beta\, Q_\phi(s_t, a'_{t:t+\ell}))}{\sum_{n}\exp(\beta\, Q_\phi(s_t, a'_{t:t+n}))}
+\qquad V_\phi(s_t)\leftarrow \mathbb{E}_{\ell\sim\pi_L}[Q_{\bar\phi}(s_t, a'_{t:t+\ell})]
+$$
+<table>
+<tr><th></th><th>ACH</th><th>우리(AQC)</th></tr>
+<tr><td>softmax 대상</td><td>chunk length \(\ell\) (10개)</td><td>후보×prefix (160개)</td></tr>
+<tr><td>action 후보</td><td>단일 policy 샘플 a' (actor가 개선)</td><td>frozen VLA 32 후보 (BoN으로 개선)</td></tr>
+<tr><td>bootstrap</td><td>별도 V(s) head</td><td>Q→Q 직접 (V head 없음)</td></tr>
+<tr><td>β 값</td><td><b>1 고정</b></td><td>미정 (검토중)</td></tr>
+<tr><td>β 주목적</td><td><b>online 탐험</b> 분포 모양</td><td><b>offline conservatism</b></td></tr>
+</table>
+<div class="box"><b>ACH의 β=1은 우리 β=1과 다르다.</b> ACH Q차이 ~0.4(Fig.2) / \(|Q|\approx194\) → β=1이면 꽤 평평.
+근데 ACH엔 OK: (a) 탐험 목적이라 평평한 게 좋고, (b) eval은 greedy(argmax)라 β 무관, (c) 길이별 Q가 다
+모여있어 V가 β에 둔감. → <b>ACH에서 β의 역할은 value 보수성이 아니라 탐험 분포 모양</b>.</div>
+
+<!-- ============================================================ -->
+<h2>6. 우리의 default 결정</h2>
+<div class="box good"><b>β=1을 default 값으로 까되, default 동작은 max 유지.</b><br>
+β=1은 레퍼런스로 깔끔하지만, 우리 \([-1,0]\) 스케일에선 β=1 ≈ mean = <b>가장 보수적인 끝</b>
+(policy improvement 거의 없는 behavior-평균 bootstrap). "중립값"이 아니라 "강한 보수쪽"임을 인지.</div>
+
+<pre>
+# TDConfig
+agg_mode: Literal["max", "softmax", "mellowmax"] = "max"   # 동작 default = 검증된 max
+agg_beta: float = 1.0                                      # 값 default = 1 (soft 모드일 때만 효과)
+</pre>
+<ul>
+<li><b>default 동작 = <code>max</code></b> — 지금까지 검증한 것, 안 깨짐.</li>
+<li><b>default β = 1.0</b> — 깔끔한 레퍼런스로 박아둠 (soft 모드 켤 때만 사용).</li>
+<li>soft 켜면 β <b>sweep</b> (1 → 5 → 10 → 20 → 50). 우리 scale에선 β=1이 거의 mean이라
+"보수적이지만 improvement 살아있는" 지점은 β&gt;1일 가능성.</li>
+<li>terminal은 그대로 <code>mc_return</code> 사용 (집계와 무관).</li>
+</ul>
+
+<h3>요약 — 5줄</h3>
+<ol>
+<li>논점은 <code>_expected_prefix_max</code>의 <b>마지막 <code>max(-1)</code> 한 줄</b> (atom softmax①과 무관).</li>
+<li>max = Bellman optimality(BoN) → 낙관, offline overestimation 위험.</li>
+<li>soft(softmax/mellowmax) = "확률적 soft 정책의 가치" → max↔mean 보간, conservative.</li>
+<li>β = 역온도. <b>β×(Q차이)</b>가 효과를 정함 → 우리 \([-1,0]\) scale에선 β=1≈mean, β≈10–50 필요.</li>
+<li>default: 동작=max, β=1 박아두고 soft는 ablation으로 β sweep.</li>
+</ol>
+
+<p class="muted">코드: <code>vla_aqc.py</code> <code>_expected_prefix_max</code> (집계), <code>_prefix_values</code> (atom softmax).
+설정 추가 예정: <code>TDConfig.agg_mode</code>, <code>TDConfig.agg_beta</code>. 참고: <code>docs/q_softmax.pdf</code> (ACH 논문).</p>
+
+</body>
+</html>

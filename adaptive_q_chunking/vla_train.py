@@ -14,12 +14,14 @@ Quick throughput probe (no checkpoints):
 import dataclasses
 import json
 import pathlib
+import sys
 import time
 from typing import Optional
 
 import jax
 import numpy as np
 import flax.serialization as fs
+from tqdm import tqdm
 
 from vla_config import VLAAQCConfig, get_config
 from vla_data import VLALeRobotDataset
@@ -27,11 +29,10 @@ from vla_aqc import VLACriticTrainer, to_jax_batch
 
 
 # --------------------------------------------------------------------------- checkpoints
-def save_checkpoint(ckpt_dir: pathlib.Path, step: int, params, target_params, opt_state):
+def save_checkpoint(ckpt_dir: pathlib.Path, step: int, params, opt_state):
     d = ckpt_dir / f"step_{step:08d}"
     d.mkdir(parents=True, exist_ok=True)
     (d / "params.msgpack").write_bytes(fs.to_bytes(jax.device_get(params)))
-    (d / "target.msgpack").write_bytes(fs.to_bytes(jax.device_get(target_params)))
     (d / "opt_state.msgpack").write_bytes(fs.to_bytes(jax.device_get(opt_state)))
     (d / "meta.json").write_text(json.dumps({"step": step}))
     return d
@@ -43,12 +44,11 @@ def list_checkpoints(ckpt_dir: pathlib.Path):
     return sorted(int(p.name.split("_")[1]) for p in ckpt_dir.glob("step_*") if p.is_dir())
 
 
-def load_checkpoint(ckpt_dir: pathlib.Path, step: int, params, target_params, opt_state):
+def load_checkpoint(ckpt_dir: pathlib.Path, step: int, params, opt_state):
     d = ckpt_dir / f"step_{step:08d}"
     params = fs.from_bytes(params, (d / "params.msgpack").read_bytes())
-    target_params = fs.from_bytes(target_params, (d / "target.msgpack").read_bytes())
     opt_state = fs.from_bytes(opt_state, (d / "opt_state.msgpack").read_bytes())
-    return params, target_params, opt_state
+    return params, opt_state
 
 
 def prune_checkpoints(ckpt_dir: pathlib.Path, keep_period: Optional[int]):
@@ -94,6 +94,12 @@ class RunLogger:
         if self.wandb is not None:
             self.wandb.log(row, step=step)
 
+    def log_image(self, step, key, fig):
+        """Log a matplotlib figure to W&B (e.g. eval/value_curves). No local save."""
+        if self.wandb is not None:
+            import wandb
+            self.wandb.log({key: wandb.Image(fig)}, step=step)
+
     def close(self):
         self._f.close()
         if self.wandb is not None:
@@ -111,29 +117,8 @@ def reward_scale(cfg: VLAAQCConfig) -> float:
     return 1.0
 
 
-def make_eval_fn(trainer: VLACriticTrainer, cfg: VLAAQCConfig):
-    """Offline eval: critic loss + value-calibration (predicted full-prefix Q vs mc_return)."""
-    import jax.numpy as jnp
-    def evaluate(params, batches):
-        losses, qs, mcs = [], [], []
-        for b in batches:
-            jb, pf = to_jax_batch(b)
-            if cfg.td.target_kind == "mc":
-                loss, info = trainer.critic_loss_mc(params, jb)
-            else:
-                loss, info = trainer.critic_loss_td(params, params, jb, pf)
-            losses.append(float(info["critic_loss"]))
-            # calibration on the executed-chunk full-prefix value vs mc_return
-            logits = trainer.net.apply(params, jb["observations"], jb["action_chunks"])
-            qfull = trainer.from_probs(jax.nn.softmax(logits, -1))[:, :, -1].mean(0)  # (B,)
-            qs.append(np.asarray(qfull)); mcs.append(np.asarray(jb.get("mc_return",
-                                                       jb.get("next_mc_return"))[..., -1]
-                                                       if "mc_return" not in jb else jb["mc_return"]))
-        q = np.concatenate(qs); mc = np.concatenate(mcs)
-        corr = float(np.corrcoef(q, mc)[0, 1]) if len(q) > 2 else 0.0
-        return {"eval_loss": float(np.mean(losses)), "q_vs_mc_corr": corr,
-                "q_mean": float(q.mean()), "mc_mean": float(mc.mean())}
-    return evaluate
+# Offline eval = trajectory value-curve visualization (no env rollout): query the critic
+# along recorded success/failure episodes and compare to mc_return. See vla_eval.py.
 
 
 # --------------------------------------------------------------------------- train
@@ -146,18 +131,20 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     print(f"    critic params: {trainer.num_params()/1e6:.2f}M  (n_embd={cfg.arch.n_embd}, "
           f"{cfg.arch.num_layers}L)  target_kind={cfg.td.target_kind}")
     step_fn = trainer.make_train_step()
-    params, target_params, opt_state = trainer.params, trainer.target_params, trainer.opt_state
+    params, opt_state = trainer.params, trainer.opt_state
     start_step = 0
     if resume and list_checkpoints(cfg.checkpoint_dir):
         start_step = list_checkpoints(cfg.checkpoint_dir)[-1]
-        params, target_params, opt_state = load_checkpoint(
-            cfg.checkpoint_dir, start_step, params, target_params, opt_state)
+        params, opt_state = load_checkpoint(cfg.checkpoint_dir, start_step, params, opt_state)
         print(f"    resumed from step {start_step}")
 
     ds = VLALeRobotDataset(cfg.data_root, horizon=cfg.horizon,
                            commander_filter=set(cfg.commander_filter) if cfg.commander_filter else None,
                            include_base_action=(cfg.td.target_kind == "td"),
-                           shuffle_buffer_groups=cfg.shuffle_buffer_groups)
+                           shuffle_buffer_groups=cfg.shuffle_buffer_groups,
+                           mc_gamma=cfg.td.mc_gamma, discount=cfg.td.discount,
+                           relabel_living=cfg.reward.relabel_living,
+                           relabel_fail=cfg.reward.relabel_fail)
     print(f"    data: {ds.summary()}")
     rscale = reward_scale(cfg)
 
@@ -175,18 +162,34 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         return b
 
     logger = None if timing_steps else RunLogger(cfg)
-    evaluate = make_eval_fn(trainer, cfg)
+    # Build the fixed eval episode set ONCE (cached in RAM, ~a few episodes). Reused every
+    # eval_interval so the value curves are comparable across steps. Same dataset as training.
+    eval_set = None
+    if logger:
+        import vla_eval
+        eval_set = vla_eval.build_eval_set(ds, n_success=cfg.eval_n_success,
+                                           n_fail=cfg.eval_n_fail, seed=cfg.seed)
+        print(f"    eval set: {sum(not e['fail'] for e in eval_set)} success + "
+              f"{sum(e['fail'] for e in eval_set)} failure episodes (cached)")
 
     it = batch_iter(cfg.seed + start_step)
     n_steps = timing_steps or cfg.optim.num_train_steps
     t0 = time.time(); t_log = t0
-    for step in range(start_step, start_step + n_steps):
+    # Progress bar ONLY in an interactive terminal. In a SLURM .out (non-tty) the bar is
+    # disabled (its carriage-return refreshes would pile up as garbage) — instead we emit a
+    # concise heartbeat line every log_interval. The real metric record is metrics.csv / W&B;
+    # the .out is just for liveness. Make the .out sparser by raising cfg.log_interval.
+    is_tty = sys.stderr.isatty()
+    end_step = start_step + n_steps
+    pbar = tqdm(range(start_step, end_step), desc=cfg.name,
+                dynamic_ncols=True, smoothing=0.1, disable=not is_tty)
+    for step in pbar:
         try:
             b = scale_batch(next(it))
         except StopIteration:
             it = batch_iter(cfg.seed + step); b = scale_batch(next(it))
         jb, pf = to_jax_batch(b)
-        params, target_params, opt_state, info = step_fn(params, target_params, opt_state, jb, pf)
+        params, opt_state, info = step_fn(params, opt_state, jb, pf)
 
         if timing_steps and step == start_step:
             info["critic_loss"].block_until_ready()
@@ -194,23 +197,32 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         if logger and (step % cfg.log_interval == 0):
             sps = cfg.log_interval / max(time.time() - t_log, 1e-6); t_log = time.time()
             m = {k: float(v) for k, v in info.items()}; m["steps_per_sec"] = sps
-            logger.log(step, m)
-            print(f"  step {step:>7} loss={m['critic_loss']:.4f} q={m.get('q_mean',0):.4f} "
-                  f"{sps:.1f} it/s")
-        if logger and step > start_step and step % cfg.eval_interval == 0:
-            ev = evaluate(params, [next(batch_iter(99999)) for _ in range(4)])
-            logger.log(step, ev, prefix="eval")
-            print(f"  [eval {step}] loss={ev['eval_loss']:.4f} q_vs_mc_corr={ev['q_vs_mc_corr']:.3f}")
+            logger.log(step, m)                                # CSV + W&B (full record)
+            if is_tty:
+                pbar.set_postfix(loss=f"{m['critic_loss']:.4f}",
+                                 q=f"{m.get('q_mean', 0):.4f}", refresh=False)
+            else:                                              # non-tty heartbeat line
+                print(f"  step {step:>7}/{end_step} loss={m['critic_loss']:.4f} "
+                      f"q={m.get('q_mean', 0):.4f} {sps:.1f} it/s", flush=True)
+        if logger and eval_set and step > start_step and step % cfg.eval_interval == 0:
+            import vla_eval
+            import matplotlib.pyplot as plt
+            curves = vla_eval.compute_curves(trainer, params, eval_set, cfg.horizon, cfg.action_dim)
+            fig = vla_eval.plot_curves(curves, cfg.dist.v_min, cfg.dist.v_max)
+            logger.log_image(step, "eval/value_curves", fig)
+            plt.close(fig)
+            pbar.write(f"  [eval {step}] logged eval/value_curves to W&B")
         if logger and step > start_step and step % cfg.save_interval == 0:
-            save_checkpoint(cfg.checkpoint_dir, step, params, target_params, opt_state)
+            save_checkpoint(cfg.checkpoint_dir, step, params, opt_state)
             prune_checkpoints(cfg.checkpoint_dir, cfg.keep_period)
+    pbar.close()
 
     if timing_steps:
         dt = time.time() - t0
         print(f"\n=== timing: {timing_steps-1} steps in {dt:.1f}s -> {(timing_steps-1)/dt:.2f} it/s")
         print(f"    => 500k steps ~= {500_000/max((timing_steps-1)/dt,1e-9)/3600:.1f} h")
     else:
-        save_checkpoint(cfg.checkpoint_dir, start_step + n_steps, params, target_params, opt_state)
+        save_checkpoint(cfg.checkpoint_dir, start_step + n_steps, params, opt_state)
         logger.close()
         print("=== done ===")
 
@@ -219,15 +231,21 @@ def main():
     import tyro
     @dataclasses.dataclass
     class Args:
-        config: str = "vla_aqc_td_a51"     # registry key (see vla_config.CONFIGS)
+        config: str = "vla_aqc_td_macro"   # registry key (see vla_config.CONFIGS)
         exp_name: str = ""
         seed: int = 0
         timing_steps: int = 0              # >0 => throughput probe, no checkpoints
         resume: bool = False
+        batch_size: int = 0                # >0 overrides optim.batch_size (e.g. 1024)
+        lr: float = 0.0                    # >0 overrides optim.lr (scale with batch if desired)
     args = tyro.cli(Args)
     cfg = get_config(args.config)
-    cfg = dataclasses.replace(cfg, seed=args.seed,
-                              exp_name=args.exp_name or "")
+    if args.batch_size > 0 or args.lr > 0:
+        cfg = dataclasses.replace(cfg, optim=dataclasses.replace(
+            cfg.optim,
+            batch_size=args.batch_size or cfg.optim.batch_size,
+            lr=args.lr or cfg.optim.lr))
+    cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "")
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 

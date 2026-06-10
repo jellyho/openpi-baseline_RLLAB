@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.scipy.special import logsumexp
 
 from utils.transformer import PrefixValue
 from utils.distributional import hl_gauss_transform, categorical_cross_entropy
@@ -49,6 +50,7 @@ class VLACriticTrainer:
             num_heads=a.num_heads, head_dim=a.head_dim, mlp_dim=a.mlp_dim,
             layer_norm=a.layer_norm, num_atoms=d.num_atoms,
             per_position_head=a.per_position_head, state_encoder_dims=a.state_encoder_dims,
+            macro_group_size=cfg.td.macro_group_size,
         )
         sigma = d.hl_gauss_sigma_frac * (d.v_max - d.v_min) / d.num_atoms
         self.to_probs, self.from_probs = hl_gauss_transform(d.v_min, d.v_max, d.num_atoms, sigma)
@@ -56,7 +58,6 @@ class VLACriticTrainer:
         obs = jnp.zeros((1, cfg.latent_dim))
         act = jnp.zeros((1, cfg.horizon * cfg.action_dim))
         self.params = self.net.init(key, obs, act)
-        self.target_params = self.params           # used only if td.use_target_critic
         self.opt = _make_optimizer(cfg.optim)
         self.opt_state = self.opt.init(self.params)
 
@@ -65,38 +66,42 @@ class VLACriticTrainer:
         logits = self.net.apply(params, obs, act)            # (K, ..., H, atoms)
         return self.from_probs(jax.nn.softmax(logits, -1))   # (K, ..., H)
 
-    def _expected_prefix_max(self, params, next_latents, candidates):
-        """V(s') = max_{n,h'} min_K Q(s', cand_n)  over precomputed candidates.
+    def _aggregate(self, qf):
+        """Aggregate the (M, J) candidate x prefix Q's into V(s') per cfg.td.agg_mode.
 
-        Memory-bounded: instead of one (M*N)-sequence forward (which OOMs at N=32, H=50),
-        scan over the N candidates with a running max, so peak memory is a single
-        M-sequence forward. Semantics match the OGBench path (ensemble-min per
-        candidate/prefix, then joint max over (candidate, prefix)).
+        'max'       -> hard max (Best-of-N / EMaQ; optimistic).
+        'softmax'   -> Boltzmann weighted mean: sum_j softmax(beta q)_j * q_j (conservative).
+        'mellowmax' -> (1/beta) log( mean_j exp(beta q) ) (conservative; contraction-preserving).
+        beta = cfg.td.agg_beta (inverse temperature); beta->inf recovers max, beta->0 = mean.
+        """
+        mode = self.cfg.td.agg_mode
+        if mode == "max":
+            return qf.max(axis=-1)
+        beta = self.cfg.td.agg_beta
+        if mode == "softmax":
+            w = jax.nn.softmax(beta * qf, axis=-1)               # (M, J)
+            return (w * qf).sum(axis=-1)
+        if mode == "mellowmax":
+            J = qf.shape[-1]
+            return logsumexp(beta * qf, axis=-1) / beta - jnp.log(J) / beta
+        raise ValueError(f"unknown agg_mode {mode!r}")
+
+    def _expected_prefix_max(self, params, next_latents, candidates):
+        """V(s') = agg_{n,h'} min_K Q(s', cand_n)  over precomputed candidates.
+
+        One big forward over all M*N candidate sequences (fits on A100/L40S, especially
+        with macro-action grouping where each sequence is only macro_H+1 tokens). Ensemble-min
+        per (candidate, prefix), then aggregate over (candidate, prefix) via cfg.td.agg_mode
+        (hard max by default; softmax/mellowmax for a conservative bootstrap).
 
         next_latents: (M, latent); candidates: (M, N, H*action_dim) -> (M,) values.
-        ``bootstrap_candidate_tile`` (T) = candidates per forward: T=1 minimal memory (slow),
-        T=N one big forward (fastest). Candidates are tiled into G=ceil(N/T) groups and the
-        max is accumulated across groups, so peak memory is one (M*T)-sequence forward.
         """
         M, N, Hd = candidates.shape
-        T = max(1, min(self.cfg.td.bootstrap_candidate_tile, N))
-        pad = (-N) % T
-        if pad:  # duplicate a few candidates to fill the last tile (max is unaffected by dups)
-            candidates = jnp.concatenate([candidates, candidates[:, :pad]], axis=1)
-        G = (N + pad) // T
-        cand_g = candidates.reshape(M, G, T, Hd)
-
-        def body(running_max, g):
-            tile = jax.lax.dynamic_index_in_dim(cand_g, g, axis=1, keepdims=False)  # (M,T,Hd)
-            states = jnp.repeat(next_latents, T, axis=0)             # (M*T, latent)
-            chunks = tile.reshape(M * T, Hd)
-            qs = self._prefix_values(params, states, chunks)         # (K, M*T, H)
-            q = qs.min(axis=0).max(axis=-1).reshape(M, T).max(axis=-1)  # min_K, max over prefix & tile
-            return jnp.maximum(running_max, q), None
-
-        init = jnp.full((M,), -jnp.inf)
-        v, _ = jax.lax.scan(body, init, jnp.arange(G))               # max across tile groups
-        return v
+        states = jnp.repeat(next_latents, N, axis=0)             # (M*N, latent)
+        chunks = candidates.reshape(M * N, Hd)                   # (M*N, H*action_dim)
+        qs = self._prefix_values(params, states, chunks)        # (K, M*N, macro_H)
+        q = qs.min(axis=0)                                       # ensemble min -> (M*N, macro_H)
+        return self._aggregate(q.reshape(M, N * q.shape[-1]))   # (M,) over (candidate, prefix)
 
     # ---- losses ------------------------------------------------------------------
     def critic_loss_mc(self, params, batch):
@@ -111,20 +116,30 @@ class VLACriticTrainer:
                       "target_mean": batch["mc_return"].mean(),
                       "prefix_spread": (q.max(-1) - q.min(-1)).mean()}
 
-    def critic_loss_td(self, params, target_params, batch, prefixes):
+    def critic_loss_td(self, params, batch, prefixes):
         cfg = self.cfg
         B, P = batch["cum_reward"].shape
-        logits = self.net.apply(params, batch["observations"], batch["action_chunks"])  # (K,B,H,atoms)
-        pred = logits[:, :, prefixes - 1, :]                     # (K,B,P,atoms)
+        mg = cfg.td.macro_group_size
+        logits = self.net.apply(params, batch["observations"], batch["action_chunks"])  # (K,B,macro_H,atoms)
+        # prefixes are step-counts; convert to 0-indexed macro-prefix positions.
+        macro_idx = prefixes // mg - 1                            # e.g. [10,20,30,40,50]//10-1 = [0,1,2,3,4]
+        pred = logits[:, :, macro_idx, :]                         # (K,B,P,atoms)
 
+        # Bootstrap: online critic with stop_gradient (paper default, no target network).
         nl = batch["next_latents"].reshape(B * P, cfg.latent_dim)
         cand = batch["next_candidates"].reshape(B * P, batch["next_candidates"].shape[2], -1)
-        vmax = self._expected_prefix_max(target_params, nl, cand).reshape(B, P)
+        vmax = self._expected_prefix_max(jax.lax.stop_gradient(params), nl, cand).reshape(B, P)
         v_next = jnp.where(batch["term"] > 0, batch["next_mc_return"], vmax) \
             if cfg.td.terminal_uses_mc else vmax
 
         gamma_h = cfg.td.discount ** prefixes.astype(jnp.float32)  # (P,)
         target = batch["cum_reward"] + gamma_h[None, :] * batch["valid"] * v_next
+        # Cal-QL-style MC floor: value can't be below the realized behavior return V^beta(s_i)
+        # (mc_return at the start state). Boosts early/under-estimated TD targets up to the
+        # achievable return (and injects the terminal signal densely vs sparse-terminal TD).
+        # Valid lower bound since Q* >= V^beta; self-releases once TD >= mc. Broadcast over prefix.
+        if cfg.td.mc_floor:
+            target = jnp.maximum(target, batch["mc_return"][:, None])
         target = jax.lax.stop_gradient(target)                   # (B,P)
 
         tgt_probs = self.to_probs(target[..., None])             # (B,P,atoms)
@@ -139,7 +154,9 @@ class VLACriticTrainer:
         vsum = jnp.maximum(batch["valid"].sum(), 1.0)
         info = {
             "critic_loss": loss,
-            "q_mean": (q * valid).sum() / jnp.maximum(valid.sum(), 1.0),
+            # divide by valid*num_ensembles (same denom as the loss): q is (K,B,P), so dividing
+            # by valid.sum() alone summed over the K ensembles -> reported 2x the true mean.
+            "q_mean": (q * valid).sum() / denom,
             "target_mean": (target * batch["valid"]).sum() / vsum,
             "v_next_mean": v_next.mean(),
             "term_frac": batch["term"].mean(),
@@ -155,23 +172,20 @@ class VLACriticTrainer:
         cfg = self.cfg
         if cfg.td.target_kind == "mc":
             @jax.jit
-            def step(params, target_params, opt_state, batch, prefixes):
+            def step(params, opt_state, batch, prefixes):
                 (loss, info), grads = jax.value_and_grad(self.critic_loss_mc, has_aux=True)(params, batch)
                 updates, opt_state = self.opt.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
-                return params, params, opt_state, info
+                return params, opt_state, info
             return step
 
         @jax.jit
-        def step(params, target_params, opt_state, batch, prefixes):
-            tp = target_params if cfg.td.use_target_critic else jax.lax.stop_gradient(params)
+        def step(params, opt_state, batch, prefixes):
             (loss, info), grads = jax.value_and_grad(self.critic_loss_td, has_aux=True)(
-                params, tp, batch, prefixes)
+                params, batch, prefixes)
             updates, opt_state = self.opt.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
-            if cfg.td.use_target_critic:
-                target_params = optax.incremental_update(params, target_params, cfg.td.tau)
-            return params, target_params, opt_state, info
+            return params, opt_state, info
         return step
 
     def num_params(self):
@@ -179,7 +193,8 @@ class VLACriticTrainer:
 
 
 def to_jax_batch(b: dict):
-    """numpy loader batch -> (jax arrays, int32 prefixes or None for MC)."""
+    """numpy loader batch -> (jax arrays dict, int32 prefixes or None for MC)."""
     prefixes = jnp.asarray(b["prefixes"], dtype=jnp.int32) if "prefixes" in b else None
     keys = [k for k in b if k != "prefixes"]
     return {k: jnp.asarray(b[k]) for k in keys}, prefixes
+

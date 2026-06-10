@@ -33,8 +33,9 @@ import numpy as np
 import pyarrow.parquet as pq
 
 # Dataset-specific constants (verified from meta/stats.json + gamma check).
-VALUE_SUPPORT = (-0.5, 0.0)      # mc_return / reward range
-DISCOUNT = 0.995                 # mc_t = r_t + 0.995 * mc_{t+1}
+VALUE_SUPPORT = (-0.5, 0.0)      # precomputed mc_return range (gamma=0.995)
+VALUE_SUPPORT_UNDISCOUNTED = (-1.0, 0.0)  # undiscounted MC range (wider; covers long episodes)
+DISCOUNT = 0.995                 # mc_t = r_t + 0.995 * mc_{t+1} (precomputed column)
 LATENT_DIM = 2048
 ACTION_DIM = 14
 BASE_ACTION_SHAPE = (32, 50, 14)
@@ -83,16 +84,36 @@ class VLALeRobotDataset:
         commander_filter: Optional[set[str]] = None,
         include_base_action: bool = False,
         shuffle_buffer_groups: int = 8,
+        mc_gamma: Optional[float] = 1.0,
+        discount: float = DISCOUNT,
+        relabel_living: Optional[float] = None,
+        relabel_fail: float = -0.6,
     ):
+        """
+        Args:
+            mc_gamma: discount used to compute the MC return target.
+                ``1.0`` (default) = undiscounted sum of raw rewards (RECAP-style).
+                ``None`` = use the precomputed ``mc_return`` column (gamma=0.995).
+                Any other float = re-compute with that discount from raw rewards.
+            discount: gamma used for the TD-bootstrap cumulative reward (cum_reward).
+                Must match ``cfg.td.discount`` so cum_reward and the bootstrap weight agree.
+            relabel_living: if set, rescale the raw living cost (-1e-4) to this value in-loader
+                (e.g. -4e-4); the success terminal (0.0) scales to 0.0. ``None`` keeps raw.
+            relabel_fail: failure-terminal penalty after relabel (raw -0.5 -> this). Only used
+                when ``relabel_living`` is set.
+        """
         self.root = root
         self.horizon = horizon
         self.commander_filter = commander_filter
         self.include_base_action = include_base_action
         self.shuffle_buffer_groups = shuffle_buffer_groups
+        self.mc_gamma = mc_gamma
+        self.relabel_living = relabel_living
+        self.relabel_fail = relabel_fail
         self.files = find_parquet_files(root)
         self._readers = {f: pq.ParquetFile(f) for f in self.files}
-        self.value_support = VALUE_SUPPORT
-        self.discount = DISCOUNT
+        self.value_support = VALUE_SUPPORT_UNDISCOUNTED if mc_gamma == 1.0 else VALUE_SUPPORT
+        self.discount = discount
 
     # ---- introspection -----------------------------------------------------------
     def summary(self) -> dict:
@@ -100,6 +121,44 @@ class VLALeRobotDataset:
         n_rows = sum(r.metadata.num_rows for r in self._readers.values())
         return {"files": len(self.files), "row_groups": n_groups, "rows": n_rows,
                 "horizon": self.horizon, "value_support": self.value_support}
+
+    # ---- reward relabel (in-loader; avoids re-annotating 181GB of parquet) -------
+    def _relabel(self, rew: np.ndarray) -> np.ndarray:
+        """Map the raw reward column onto the chosen value scale, no re-annotation.
+
+        Raw encoding (verified on disk): living step = -1e-4, success terminal = 0.0,
+        failure terminal = -0.5 (exactly). The living cost is rescaled by a scalar
+        (relabel_living/-1e-4, e.g. -4e-4 -> x4; 0.0 stays 0.0); the failure penalty is
+        remapped *separately* (-0.5 -> relabel_fail) because it is NOT the same scale
+        (failure ~x1.2, living x4). Returns ``rew`` unchanged when relabel is off.
+        """
+        if self.relabel_living is None:
+            return rew
+        scale = self.relabel_living / -1e-4                      # living -1e-4 -> relabel_living
+        out = rew * scale                                        # living & success(0.0) rescaled
+        out = np.where(rew <= -0.05, self.relabel_fail, out)     # failure -0.5 -> relabel_fail
+        return out.astype(np.float32)
+
+    # ---- MC return computation ---------------------------------------------------
+    def _compute_mc(self, rew: np.ndarray, ep: np.ndarray) -> np.ndarray:
+        """Compute per-frame MC return from raw rewards within a row-group.
+
+        For ``mc_gamma=None`` this is not called (the precomputed column is used).
+        For ``mc_gamma=1.0`` returns undiscounted sum-to-end-of-episode (RECAP-style).
+        For other gamma computes discounted RTG with that factor.
+
+        Backward pass: reset at episode boundaries (detected by episode_index change).
+        """
+        n = len(rew)
+        mc = np.zeros(n, dtype=np.float32)
+        g = 1.0 if self.mc_gamma is None else float(self.mc_gamma)
+        running = 0.0
+        for i in range(n - 1, -1, -1):
+            running = float(rew[i]) + g * running
+            mc[i] = running
+            if i == 0 or ep[i - 1] != ep[i]:  # start of a new episode block -> reset
+                running = 0.0
+        return mc
 
     # ---- core sampling -----------------------------------------------------------
     def _row_cols(self) -> list[str]:
@@ -121,8 +180,11 @@ class VLALeRobotDataset:
         ep = np.asarray(t["episode_index"].to_pylist())
         act = _list_col_to_numpy(t["action"], (ACTION_DIM,))                 # (n, 14)
         rl = _list_col_to_numpy(t["rl_token"], (LATENT_DIM,))               # (n, 2048)
-        mc = np.asarray(t["mc_return"].to_pylist(), dtype=np.float32)        # (n,)
-        rew = np.asarray(t["reward"].to_pylist(), dtype=np.float32)          # (n,)
+        rew = self._relabel(np.asarray(t["reward"].to_pylist(), dtype=np.float32))   # (n,)
+        if self.mc_gamma is None:
+            mc = np.asarray(t["mc_return"].to_pylist(), dtype=np.float32)   # precomputed
+        else:
+            mc = self._compute_mc(rew, ep)                                   # recomputed
         cmd = t["observation.commander_state"].to_pylist()
 
         starts = np.arange(0, n - H)
@@ -182,8 +244,11 @@ class VLALeRobotDataset:
         ep = np.asarray(t["episode_index"].to_pylist())
         rl = _list_col_to_numpy(t["rl_token"], (LATENT_DIM,))               # (n, 2048)
         act = _list_col_to_numpy(t["action"], (ACTION_DIM,))               # (n, 14)
-        rew = np.asarray(t["reward"].to_pylist(), dtype=np.float32)         # (n,)
-        mc = np.asarray(t["mc_return"].to_pylist(), dtype=np.float32)       # (n,)
+        rew = self._relabel(np.asarray(t["reward"].to_pylist(), dtype=np.float32))   # (n,)
+        if self.mc_gamma is None:
+            mc = np.asarray(t["mc_return"].to_pylist(), dtype=np.float32)  # precomputed
+        else:
+            mc = self._compute_mc(rew, ep)                                  # recomputed
         ba = _list_col_to_numpy(t["base_action"], BASE_ACTION_SHAPE)        # (n,32,50,14)
         cmd = t["observation.commander_state"].to_pylist()
         last_idx = self._episode_last_index(ep)
@@ -197,8 +262,15 @@ class VLALeRobotDataset:
         Li = last_idx[starts]                                               # (S,)
         end = starts[:, None] + prefixes[None, :]                           # (S,P) = i+h
         valid = (end <= Li[:, None]).astype(np.float32)                     # within episode
-        term = ((end == Li[:, None]) & (valid > 0)).astype(np.float32)      # terminal next-state
         end_c = np.clip(end, 0, n - 1)                                      # safe gather idx
+        # True episode terminal iff the next-state carries a TERMINAL reward (success 0.0 /
+        # failure penalty), NOT the living cost. This is robust to the ~1000-row row-group
+        # boundaries: every episode spans several groups, so a boundary frame holds a living
+        # reward and is NOT mis-flagged. (The old `end == Li` test treated every group-end as
+        # a terminal -> ~half of all flagged terminals were false, bootstrapping from a living
+        # value (-1e-4) instead of the critic. Verified: reward in {0.0, -0.5} only at true ends.)
+        is_term_frame = (rew >= -1e-6) | (rew <= -0.05)                     # (n,) bool
+        term = ((valid > 0) & is_term_frame[end_c]).astype(np.float32)      # (S,P) genuine terminal
 
         # h-step discounted realized reward, per prefix (loop over the few prefixes).
         cum = np.zeros((S, P), np.float32)
@@ -217,6 +289,7 @@ class VLALeRobotDataset:
             "next_latents": rl[end_c],                                      # (S,P,2048)
             "next_candidates": ba[end_c].reshape(S, P, N, H * ACTION_DIM),  # (S,P,N,H*14)
             "next_mc_return": mc[end_c],                                    # (S,P)
+            "mc_return": mc[starts],                                        # (S,) start-state V^beta (Cal-QL floor)
             "term": term,                                                   # (S,P)
             "valid": valid,                                                 # (S,P)
         }

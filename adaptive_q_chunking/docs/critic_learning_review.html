@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Critic Learning — Pre-Experiment Review &amp; Checklist</title>
+<script>window.MathJax={tex:{inlineMath:[['\\(','\\)']]}};</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{--fg:#1c2330;--muted:#5b6776;--bg:#fff;--soft:#f5f7fa;--line:#e2e8f0;--accent:#2563eb;--good:#127a3d;--warn:#b4690e;--bad:#b42318;--purple:#7c3aed;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);max-width:1000px;margin:0 auto;padding:32px 24px 90px;line-height:1.6;}
+  h1{font-size:27px;margin:0 0 4px} h2{font-size:21px;margin:38px 0 8px;padding-top:16px;border-top:2px solid var(--line)} h3{font-size:16px;margin:18px 0 6px;color:#334155}
+  .sub{color:var(--muted);margin:0 0 18px}
+  code{background:var(--soft);padding:1px 6px;border-radius:4px;font-size:88%;font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:12.5px;line-height:1.5}
+  table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top} th{background:var(--soft)}
+  .box{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--soft);border-radius:8px;padding:12px 16px;margin:14px 0}
+  .box.good{border-left-color:var(--good)} .box.warn{border-left-color:var(--warn)} .box.bad{border-left-color:var(--bad)} .box.new{border-left-color:var(--purple)}
+  .st{display:inline-block;font-size:11px;font-weight:700;padding:1px 7px;border-radius:10px;margin-right:6px;white-space:nowrap}
+  .ok{background:#dcfce7;color:#166534} .vf{background:#fef3c7;color:#92400e} .dc{background:#ede9fe;color:#5b21b6}
+  .file{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:88%;color:var(--accent)}
+  ul{margin:6px 0 6px 2px;padding-left:22px} li{margin:4px 0}
+  .muted{color:var(--muted)}
+  .chk td:first-child{width:90px;text-align:center}
+  .legend span{margin-right:16px;font-size:13px}
+</style>
+</head>
+<body>
+<h1>Critic Learning — Pre-Experiment Review</h1>
+<p class="sub">VLA frozen-policy offline critic 학습 시작 전, 관련된 모든 부분을 한 번에 검토하는 checklist.
+끝나면 <b>진짜 실험 시작</b>. 코드: <span class="file">vla_aqc.py</span> ·
+<span class="file">vla_data.py</span> · <span class="file">vla_config.py</span> ·
+<span class="file">utils/transformer.py</span> · <span class="file">vla_train.py</span>.</p>
+
+<div class="box legend">
+<b>상태 범례 —</b>
+<span><span class="st ok">DONE</span> 구현·검증 완료</span>
+<span><span class="st vf">VERIFY</span> 구현됐으나 한번 더 확인 권장</span>
+<span><span class="st dc">DECIDE</span> 결정/선택 필요</span>
+</div>
+
+<!-- ============================================================ -->
+<h2>0. 문제 세팅 (framing)</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 상태</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>Offline / frozen VLA</td><td>환경(env) 없음. π0.5 VLA 고정, critic만 학습. OGBench env 같은 것 전혀 안 씀.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>입력 = 사전계산된 latent</td><td>state = <code>rl_token</code> (2048-d), action chunk = <code>base_action</code> (32 candidates × 50 × 14). 데이터에 다 들어있음.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>critic-only trainer</td><td><code>VLACriticTrainer</code> — flow actor / env rollout 없음. critic loss만.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>1. 데이터 (Data)</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 상태</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>데이터 구성 파악</td><td><b>teleop 831</b> (expert, 0 fail) + <b>inference 288</b> (policy, <b>124 fail</b>) = 1119 episodes / 3.08M frames. (원본은 expert/failure/success+hil 3 subset.)</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>failure reward label 확인</td><td>inference episode 288개 중 <b>124개에 terminal reward −0.5</b> 정상 존재 (원본 failure-data 125개와 일치). <span class="muted">초반에 "4개뿐"이라고 잘못 봤던 건 한 파일의 row-group 하나만 스캔했기 때문 — episode가 여러 파일/RG에 분산되어 전체를 합쳐야 정확. <span class="file">check_dataset.py</span>로 직접 확인 가능.</span></td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>전체 데이터 다운로드</td><td>HF가 4개 큰 파일(~181GB)로 제공, 로컬에 다 있음. (1119 ep 전부 포함.)</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>commander_filter</td><td>현재 <code>None</code> (teleop+inference 둘 다 사용). <b>teleop은 mc_return이 전부 −0.02로 동일</b>(전부 성공) → critic 학습 signal이 거의 없음. <b>inference만 쓸지</b> 결정 필요. ← <b>중요</b></td></tr>
+</table>
+<div class="box warn"><b class="st vf">VERIFY</b> <b>teleop의 학습 가치.</b> teleop 831개는 전부 mc_return≈−0.02 (길이만 다름).
+distributional critic 입장에서 "전부 같은 값"이라 informative하지 않을 수 있음. 반대로 in-distribution coverage를 넓혀
+critic을 안정화시킬 수도 있음. <b>실험적으로 <code>commander_filter=("inference",)</code> vs <code>None</code> 비교 가치 있음.</b></div>
+
+<!-- ============================================================ -->
+<h2>2. Reward &amp; Value Support</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 값</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>reward 구조 파악</td><td>−1e-4/step (living) + <b>−0.5 failure terminal</b>; success → 0. range [−0.5, 0]. (RECAP 방식: −1/T_max, C_fail=T_max/2, T_max≈10000.)</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>mc_return 검증</td><td>precomputed γ=0.995, range [−0.5, 0]. recurrence <code>mc_t = r_t + 0.995·mc_{t+1}</code> 수치 확인됨.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>value support</td><td><code>v_min=−1.0, v_max=0.0</code> (요청대로). 실제 range [−0.5,0]이 안에 들어가서 OOB=0% 보장. TD critic이 더 낮은 값 학습할 여유.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>num_atoms</td><td><b>201</b> (RECAP과 동일). [−1,0]에서 bin width = 0.005.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>HL-Gauss sigma</td><td><code>0.75 × (v_max−v_min)/atoms</code> = 0.00375. (Stop-Regressing 권장값.)</td></tr>
+<tr><td><span class="st vf">VERIFY</span></td><td>bin 활용도</td><td>성공 mass가 [−0.02,0]에 몰릴 수 있음. 학습 후 <code>dist_edge_mass</code> / <code>dist_target_oob</code> 로그 보고 너무 낭비면 좁히기 (예: −0.6). <b>일단 [−1,0]로 시작 확정.</b></td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>3. Transformer Architecture</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 값</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>critic = causal Transformer</td><td>state token 1 + macro-action tokens. per-position head (Prop G.7), Pre-LN, 2-ensemble min.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>capacity</td><td>n_embd=384 (8×48), 4 layers, mlp=1024 → ~13.5M. (state encoder = linear, ACSAC-faithful.)</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td><b>macro-action grouping</b></td><td><code>macro_group_size=10</code>: 50 action → 5 macro-token, sequence L=6. 검증: prefix-consistency ✅, shape (K,B,5,201) ✅. attention 72× / bootstrap 10× 감소.</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>state encoder MLP 여부</td><td>기본 linear (2048→384). <code>vla_..._stateenc</code> = MLP(512). 2048→384가 5× 압축이라 MLP가 도울 수 있음 → ablation 대상.</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>capacity sweep</td><td>OGBench에서 distributional 이득은 critic 클수록 커짐(Stop-Regressing). small(5M)/default(13.5M)/large(35M) 비교 가치.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>4. Critic Learning — TD (핵심)</h2>
+<p>TD critic 학습으로 결정. MC return은 검증용.</p>
+<h3>Target 공식 (per macro-prefix h)</h3>
+<pre>G_h = Σ_{j&lt;h} γ^j · r_{t+j}  +  γ^h · valid_h · V*(s_{t+h})
+
+V*(s') = min_K  max_{n∈[32], h'∈[H]}  Q_φ̄(s', base_action(s')^{(n)}_{1:h'})    ← 32 candidate joint-max
+
+terminal(−0.5 frame)에서는 V*(s') = mc_return(s')   ← max 대신 penalty 보존</pre>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 상태</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>per-prefix multi-step TD</td><td>각 prefix h={10,20,30,40,50}마다 target. <code>critic_loss_td</code>.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td><b>action-chunk reward sum</b></td><td><code>cum_reward[h] = Σ_{j&lt;h} γ^j·r[i+j]</code>, step 단위 discount (γ=0.995). loader에서 사전 계산. <b>env 불필요</b> — reward column에서 직접 합산.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>bootstrap = 32-candidate joint-max</td><td><code>_expected_prefix_max</code>: base_action 32개 × prefix max, ensemble min. tiled(메모리 안전).</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>terminal 처리</td><td><code>term</code> flag → bootstrap을 <code>mc_return</code>으로 대체 (−0.5 penalty 보존). <code>terminal_uses_mc=True</code>.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>episode boundary masking</td><td><code>valid</code> flag로 episode 넘어가는 prefix 제외.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td><b>no target network</b></td><td>online critic + <code>stop_gradient</code> (논문 방식). target_critic 코드 완전 제거함. ← 사용자가 요청한 대로.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>discount γ</td><td>0.995 (<code>TDConfig.discount</code>). cum_reward·bootstrap 모두 step 단위 γ.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>distributional loss</td><td>per-prefix HL-Gauss cross-entropy. target → soft histogram → CE.</td></tr>
+<tr><td><span class="st vf">VERIFY</span></td><td>terminal mc_return 스케일</td><td><code>mc_gamma=1.0</code>(undiscounted)인데 TD는 γ=0.995. <b>다만 terminal에서는 둘 다 −0.5로 일치</b>(terminal이 episode 마지막이라 future 없음) → 실질 문제 없음. <span class="muted">한번 눈으로 확인 권장.</span></td></tr>
+<tr><td><span class="st vf">VERIFY</span></td><td>executed chunk vs base_action</td><td>현재 critic의 <b>input</b>은 executed <code>action[t:t+H]</code>, bootstrap의 후보는 <code>base_action</code>. 데이터팀에 "critic이 어느 action에 conditioning돼야 하는지" 확인하면 더 확실.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. MC Return — 검증용</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 상태</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>MC regression 경로 존재</td><td><code>target_kind='mc'</code> + <code>critic_loss_mc</code>. 필요시 baseline으로 사용 가능.</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>검증 방법</td><td>학습된 TD Q 와 mc_return 비교: <b>TD Q ≥ mc_return 이면 policy improvement 확인</b>. eval에서 <code>q_vs_mc_corr</code> 로깅 중 — TD value &gt; MC value 인지 추가 지표 넣을지 결정.</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>undiscounted vs precomputed</td><td><code>mc_gamma</code>: 1.0(undiscounted) / None(precomputed γ=0.995). TD가 메인이라 당장은 무관하지만, MC baseline 돌릴 때 결정.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>6. Data Loader</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 상태</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>parquet streaming + shuffle</td><td>row-group 단위 읽기 + shuffle buffer. 빠른 list→ndarray 변환 (18× speedup).</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>bootstrap batch</td><td><code>iter_bootstrap_batches</code>: cum_reward, next_latents, next_candidates(32), term, valid, prefixes 전부 emit.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>MC batch</td><td><code>iter_batches</code>: observations, action_chunks, mc_return.</td></tr>
+<tr><td><span class="st vf">VERIFY</span></td><td>v1 윈도우 제약</td><td>chunk window가 한 row-group 안에 있을 때만 sample 형성 (~몇 % 손실). 학습엔 무방하나 인지.</td></tr>
+<tr><td><span class="st vf">VERIFY</span></td><td>base_action I/O 비용</td><td>base_action(138GB column)이 가장 무거움. 4090에서 batch당 ~2.8s. prefetch 없으면 학습 throughput의 병목 가능 → GPU 측정 필요.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>7. Training Infra</h2>
+<table class="chk">
+<tr><th>상태</th><th>항목</th><th>현재 상태</th></tr>
+<tr><td><span class="st ok">DONE</span></td><td>config + registry</td><td><code>VLAAQCConfig</code> nested groups, named presets, self-documenting run_name.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>run dir = lustre</td><td><code>/lustre/.../phase1/critic_learning/&lt;name&gt;/&lt;exp&gt;/</code> — config.json + metrics.csv + checkpoints/.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>checkpoint save/resume</td><td>params + opt_state (flax msgpack), keep_period prune, <code>--resume</code>. target_params 제거 반영됨.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>logging</td><td>CSV + W&B (project AQC-VLA). 진단지표: q_mean, target_mean, v_next_mean, term_frac, valid_frac, prefix_spread, dist_edge_mass, dist_target_oob.</td></tr>
+<tr><td><span class="st ok">DONE</span></td><td>offline eval</td><td><code>make_eval_fn</code>: Q vs mc_return correlation. (env rollout 불가하니 calibration 기반.)</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>num_train_steps</td><td>현재 500k ceiling. eval-based early stop. throughput 측정 후 확정.</td></tr>
+<tr><td><span class="st dc">DECIDE</span></td><td>batch_size</td><td>현재 256. bootstrap multiplier(B×P×N)가 진짜 비용. GPU 메모리 보고 확정.</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>8. 아직 결정/확인해야 할 것 (요약)</h2>
+<div class="box">
+<b>꼭 결정/확인할 것 (실험 전):</b>
+<ol>
+<li><span class="st dc">DECIDE</span> <b>commander_filter</b> — teleop 포함 vs inference만. (teleop은 mc 전부 −0.02라 signal 약함.) ← 가장 중요</li>
+<li><span class="st vf">VERIFY</span> <b>executed chunk vs base_action</b> conditioning — 데이터팀 확인 시 더 확실.</li>
+<li><span class="st vf">VERIFY</span> <b>GPU throughput</b> — <code>--timing_steps 100</code>로 it/s 측정 → num_train_steps·batch_size 확정.</li>
+<li><span class="st dc">DECIDE</span> <b>MC baseline 먼저 vs TD 바로</b> — 안정성 위해 MC sanity 먼저 권장하나, TD가 메인.</li>
+</ol>
+<b>나중에 ablation으로 봐도 되는 것:</b>
+<ul>
+<li><span class="st dc">DECIDE</span> num_atoms (201 vs 51), state_encoder (linear vs MLP), capacity (5/13.5/35M), v_min (−1 vs −0.6), mc_gamma (1.0 vs 0.995).</li>
+<li><span class="st dc">DECIDE</span> <b>QGF test-time guidance</b> — critic 잘 학습된 후, <code>openpi/models/pi0.py:sample_actions</code>의 step 함수에 gradient guidance 추가 (별도 논의됨).</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>9. Pre-flight Checklist (실험 직전 최종)</h2>
+<table>
+<tr><th>#</th><th>확인</th><th>방법</th></tr>
+<tr><td>1</td><td>데이터 무결성</td><td><code>.venv/bin/python adaptive_q_chunking/check_dataset.py</code> → 124 fail 확인</td></tr>
+<tr><td>2</td><td>config 값 확정</td><td>v_min/v_max=−1/0, atoms=201, γ=0.995, macro=10, prefixes=(10..50), commander_filter 결정</td></tr>
+<tr><td>3</td><td>GPU에서 forward/step 무에러</td><td><code>python vla_train.py --config vla_aqc_td_macro --timing_steps 100</code></td></tr>
+<tr><td>4</td><td>throughput 측정 → step budget</td><td>위 timing 결과로 it/s · 1M 예상시간 확인</td></tr>
+<tr><td>5</td><td>진단지표 sanity (초반 몇 k step)</td><td>prefix_spread &gt; 0, dist_target_oob ≈ 0, dist_edge_mass 낮음, loss 감소, q_mean이 [−0.5,0] 범위</td></tr>
+<tr><td>6</td><td>checkpoint·logging 동작</td><td>run_dir에 config.json/metrics.csv/checkpoints 생성 확인</td></tr>
+</table>
+
+<div class="box good"><b>요약:</b> 코드(아키텍처·distributional·reward·MC·bootstrap·loader·infra)는 <b>거의 다 DONE</b>.
+남은 건 주로 <b>결정(commander_filter, step budget)</b>과 <b>GPU 측정·sanity 확인</b>.
+이 checklist를 한 줄씩 통과하면 진짜 실험 시작 준비 완료.</div>
+
+</body>
+</html>

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>VLA Critic — Final Design Check (updated)</title>
+<script>window.MathJax={tex:{inlineMath:[['\\(','\\)']]}};</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root{--fg:#1c2330;--muted:#5b6776;--bg:#fff;--soft:#f5f7fa;--line:#e2e8f0;--accent:#2563eb;--good:#127a3d;--warn:#b4690e;--bad:#b42318;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);max-width:960px;margin:0 auto;padding:32px 24px 80px;line-height:1.65;}
+  h1{font-size:26px;margin:0 0 2px} h2{font-size:20px;margin:36px 0 10px;padding-top:14px;border-top:2px solid var(--line)} h3{font-size:16px;margin:20px 0 6px}
+  .sub{color:var(--muted);margin:0 0 20px}
+  .badge{display:inline-block;background:#dcfce7;color:#166534;border:1px solid #86efac;border-radius:4px;font-size:11px;padding:1px 7px;font-weight:600;margin-left:6px;vertical-align:middle}
+  .badge.new{background:#ede9fe;color:#5b21b6;border-color:#c4b5fd}
+  code{background:var(--soft);padding:1px 6px;border-radius:4px;font-size:89%;font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top} th{background:var(--soft)}
+  tr.done td:first-child::after{content:" ✅";font-size:11px}
+  .box{border:1px solid var(--line);border-left:4px solid var(--accent);background:var(--soft);border-radius:8px;padding:12px 16px;margin:14px 0}
+  .box.good{border-left-color:var(--good)} .box.warn{border-left-color:var(--warn)} .box.new{border-left-color:#7c3aed}
+  .tick::before{content:"✅ "} .cross::before{content:"⚠️ "} .idea::before{content:"💡 "}
+  ul{margin:6px 0;padding-left:22px} li{margin:3px 0}
+  .file{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:89%;color:var(--accent)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<h1>VLA Critic — Final Design Check <span class="badge">updated</span></h1>
+<p class="sub">Post-implementation review: (1) Transformer architecture &amp; size, (2) Distributional RL &amp;
+reward, (3) MC return — undiscounted, (4) Macro-action grouping <span class="badge">DONE</span>,
+(5) CAL-QL discussion.<br/>
+Code: <span class="file">vla_aqc.py</span> · <span class="file">vla_data.py</span> ·
+<span class="file">vla_config.py</span> · <span class="file">utils/transformer.py</span>.</p>
+
+<!-- ============================================================ -->
+<h2>1. Transformer Architecture &amp; Size</h2>
+
+<h3>Current defaults (<code>vla_mc_macro</code> / <code>vla_aqc_td_macro</code>)</h3>
+<table>
+<tr><th>parameter</th><th>value</th><th>note</th></tr>
+<tr><td><code>latent_dim</code> (state input)</td><td><b>2048</b></td><td>frozen VLA (π0.5) latent → state token</td></tr>
+<tr><td><code>action_dim</code></td><td><b>14</b></td><td>bimanual yam robot (7 DoF × 2)</td></tr>
+<tr><td><code>horizon H</code></td><td><b>50</b></td><td>native chunk length in <code>base_action</code></td></tr>
+<tr><td><code>macro_group_size</code> <span class="badge">new</span></td><td><b>10</b></td><td>10 consecutive steps → 1 macro-action token; macro_H = 50/10 = <b>5</b></td></tr>
+<tr><td><code>n_embd</code> = heads × head_dim</td><td><b>8 × 48 = 384</b></td><td>token width inside transformer</td></tr>
+<tr><td><code>num_layers</code></td><td><b>4</b></td><td>depth</td></tr>
+<tr><td><code>mlp_dim</code></td><td><b>1024</b></td><td>FFN hidden width (2.7×)</td></tr>
+<tr><td><code>num_ensembles K</code></td><td><b>2</b></td><td>min-aggregated</td></tr>
+<tr><td><code>per_position_head</code></td><td><b>True</b></td><td>one \((n_{embd}\to atoms)\) head per macro-prefix</td></tr>
+<tr><td><code>state_encoder_dims</code></td><td><b>()</b></td><td>linear 2048→384 (ACSAC-faithful); MLP <code>(512,)</code> = <code>_stateenc</code> ablation</td></tr>
+</table>
+
+<h3>Token sequence after macro-action grouping <span class="badge">DONE</span></h3>
+<pre>Before (H=50 tokens, L=51):   [ s_t | a_0 | a_1 | … | a_49 ]   ← 51 tokens, 2601-entry attention
+After  (macro_H=5 tokens, L=6): [ s_t | m_1 | m_2 | m_3 | m_4 | m_5 ]   ← 6 tokens, 36-entry attention
+                                         each m_k = Dense(10×14 = 140 → 384)
+
+Prefix outputs: {10, 20, 30, 40, 50} real steps  — 5 meaningful replan granularities (166 ms each @ 60 Hz)
+Verified: prefix-consistency ✅  output shape (K=2,B,macro_H=5,atoms=201) ✅  params ≈ 13.5M ✅</pre>
+
+<h3>Capacity presets</h3>
+<table>
+<tr><th>name</th><th>n_embd</th><th>L</th><th>mlp_dim</th><th>tokens</th><th>params</th><th>use case</th></tr>
+<tr><td><code>vla_mc_macro</code> <span class="badge">new</span></td><td>384</td><td>4</td><td>1024</td><td>6</td><td>~13.5M</td><td>MC baseline — <b>start here</b></td></tr>
+<tr><td><code>vla_aqc_td_macro</code> <span class="badge">new</span></td><td>384</td><td>4</td><td>1024</td><td>6</td><td>~13.5M</td><td>AQC-TD — after MC works</td></tr>
+<tr><td><code>vla_aqc_td_a51</code></td><td>384</td><td>4</td><td>1024</td><td>51</td><td>~15.5M</td><td>ablation: no macro-grouping</td></tr>
+<tr><td><code>_small</code></td><td>256</td><td>2</td><td>512</td><td>6</td><td>~5M</td><td>capacity sweep bracket</td></tr>
+<tr><td><code>_large</code></td><td>512</td><td>6</td><td>2048</td><td>6</td><td>~35M</td><td>capacity sweep bracket</td></tr>
+<tr><td><code>_stateenc</code></td><td>384</td><td>4</td><td>1024</td><td>6</td><td>~14.8M</td><td>MLP(512) state encoder ablation</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>2. Distributional RL &amp; Reward</h2>
+
+<h3>Dataset reward structure (verified from parquet, γ verified numerically)</h3>
+<table>
+<tr><th>column</th><th>range</th><th>meaning</th></tr>
+<tr><td><code>reward</code></td><td>[−0.5, 0]</td><td>−1e-4/step living cost + <b>−0.5 failure terminal</b>; success → 0</td></tr>
+<tr><td><code>mc_return</code> (dataset)</td><td>[−0.5, 0]</td><td>precomputed discounted RTG at γ=0.995 (verified: \(mc_t = r_t + 0.995 \cdot mc_{t+1}\))</td></tr>
+<tr><td>undiscounted MC (computed) <span class="badge">new</span></td><td>[~−1, 0]</td><td>raw reward sum to end of episode (γ=1, RECAP-style); wider range than precomputed</td></tr>
+</table>
+
+<h3>HL-Gauss distributional head</h3>
+<p>The critic outputs \(K \times \text{macro\_H} \times \text{num\_atoms}\) logits per forward pass.
+A scalar target \(y\) is soft-histogrammed via a truncated Gaussian CDF:
+\[p_i = \frac{\Phi\!\left(\tfrac{c_{i+1}-y}{\sqrt{2}\sigma}\right)-\Phi\!\left(\tfrac{c_i-y}{\sqrt{2}\sigma}\right)}{\Phi\!\left(\tfrac{c_K-y}{\sqrt{2}\sigma}\right)-\Phi\!\left(\tfrac{c_0-y}{\sqrt{2}\sigma}\right)},
+\qquad \hat{V} = \sum_i p_i c_i,
+\qquad \sigma = 0.75\,\frac{v_{max}-v_{min}}{N_{atoms}}\]</p>
+
+<h3>Value support — current settings <span class="badge">updated</span></h3>
+<table>
+<tr><th>mode</th><th>v_min / v_max</th><th>bin width @ 201 atoms</th><th>status</th></tr>
+<tr><td><code>fixed</code> (default) <span class="badge">updated</span></td><td><b>−1.0 / 0.0</b></td><td>0.005</td><td>✅ Covers undiscounted range + matches RECAP</td></tr>
+<tr><td><code>reward_norm</code></td><td>−1.0 / 0.0</td><td>0.005</td><td>Equivalent to fixed for this dataset</td></tr>
+<tr><td><code>data</code></td><td>p1/p99 of RTG</td><td>varies</td><td>OK; less predictable across runs</td></tr>
+</table>
+<p class="muted">Note: the previous default was v_min=−0.5 to match the precomputed mc_return.
+Now that we use undiscounted MC (longer episodes can reach −0.7 to −1.0), the support is widened to
+[−1.0, 0]. Bin width stays fine at 0.005 with 201 atoms.</p>
+
+<h3>num_atoms — current: 201 <span class="badge">updated</span></h3>
+<p>Changed from 51 to <b>201</b> to match RECAP (which uses 201 bins). With [−1, 0] support:
+bin width = 0.005 — resolves value differences ≥ 0.5%.
+The OGBench ablation (a51 ≫ a201 in small 0.94M critic) was likely a small-critic artefact;
+the VLA critic is 13.5M and the dataset is 3× larger, making 201 bins tractable and preferable.</p>
+
+<!-- ============================================================ -->
+<h2>3. MC Return — Undiscounted (RECAP-style) <span class="badge">updated</span></h2>
+
+<h3>Two options, both implemented</h3>
+<table>
+<tr><th>mode (<code>td.mc_gamma</code>)</th><th>target for each prefix</th><th>bootstrap?</th><th>recommended</th></tr>
+<tr><td><b>Undiscounted MC</b> <code>mc_gamma=1.0</code> (default) <span class="badge">new</span></td><td>\(\sum_{t'=t}^{T} r_{t'}\) — raw sum to episode end</td><td>No</td><td>✅ Start here — RECAP-style</td></tr>
+<tr><td><b>Precomputed MC</b> <code>mc_gamma=None</code></td><td>dataset <code>mc_return</code> column (γ=0.995)</td><td>No</td><td>Fallback / ablation</td></tr>
+<tr><td><b>AQC-TD</b> <code>target_kind='td'</code></td><td>\(\sum_{j<h}\gamma^j r_{t+j} + \gamma^h V^\star(s_{t+h})\)</td><td>Yes — 32×5 evals/step</td><td>After MC works</td></tr>
+</table>
+
+<h3>Why undiscounted (RECAP Eq. 1)</h3>
+<p>RECAP trains \(p_\phi(V | o_t, \ell)\) by minimizing \(H(R^B_t(\tau),\, p_\phi)\) where
+\(R_t(\tau) = \sum_{t'=t}^T r_{t'}\) — no discount factor. Key reasons:</p>
+<ul>
+<li><b>Simpler, more stable</b> — no discount horizon to tune; the target is the actual total cost incurred.</li>
+<li><b>Consistent across episode lengths</b> — discounted returns conflate "short failure" with "slow success"; undiscounted makes them clearly distinct.</li>
+<li><b>Wider, more informative range</b> — verified on real data: undiscounted [−0.10, −0.007] vs precomputed [−0.02, −0.006] in a clean-episode row group; undiscounted better separates episode quality via accumulated living cost.</li>
+</ul>
+<div class="box good"><b class="tick">Implementation:</b> <code>VLALeRobotDataset(mc_gamma=1.0)</code> runs a single backward pass over
+each episode in each row-group (<code>_compute_mc</code>), accumulating <code>running += rew[i]</code>
+and resetting at episode boundaries. Cost: negligible (pure numpy loop over rewards, no parquet re-read).
+The <code>value_support</code> property auto-returns <code>(-1.0, 0.0)</code> when <code>mc_gamma=1.0</code>.</div>
+
+<h3>RECAP vs us — comparison</h3>
+<table>
+<tr><th></th><th>RECAP (π*0.6)</th><th>us</th></tr>
+<tr><td>Architecture</td><td>VLM backbone (large)</td><td>Causal Transformer critic (13.5M)</td></tr>
+<tr><td>State conditioning</td><td>obs + language command</td><td><code>rl_token</code> (VLA latent — already encodes language)</td></tr>
+<tr><td>Return type</td><td>undiscounted MC (γ=1)</td><td>undiscounted MC (γ=1) ✅ now aligned</td></tr>
+<tr><td>num_atoms</td><td>201</td><td>201 ✅ now aligned</td></tr>
+<tr><td>Value target</td><td>V(s) — state value only</td><td><b>Q(s, a_{1:h})</b> — per-prefix action value (richer)</td></tr>
+<tr><td>Prefix granularity</td><td>single V (no chunking)</td><td><b>5 macro-prefix candidates</b> — adaptive replan</td></tr>
+<tr><td>Improvement over BC</td><td>limited (MC = behavior policy eval)</td><td><b>AQC-TD max over 32×5 candidates</b> — explicit improvement</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>4. Macro-Action Grouping <span class="badge">DONE ✅</span></h2>
+
+<h3>What was implemented</h3>
+<p><code>macro_group_size=10</code> is now the default. H=50 actions become 5 macro-action tokens,
+each embedding 10 consecutive steps via <code>Dense(140 → 384)</code>. Sequence length L = 6.</p>
+
+<table>
+<tr><th>file</th><th>change</th><th>verified</th></tr>
+<tr><td><span class="file">utils/transformer.py</span></td><td><code>macro_group_size</code> field on <code>CausalPrefixCritic</code> + <code>PrefixValue</code>; <code>macro_H = H // macro_group_size</code>; <code>Dense(group_size*d → n_embd)</code> for action tokens; pos_emb / per-position head use <code>macro_H</code></td><td>✅ prefix-consistency, shape (2,B,5,201)</td></tr>
+<tr><td><span class="file">vla_config.py</span></td><td><code>TDConfig.macro_group_size=10</code>; <code>prefixes=(10,20,30,40,50)</code> stored as step-counts; validation (<code>prefixes % macro_group_size == 0</code>); presets <code>vla_mc_macro</code>, <code>vla_aqc_td_macro</code></td><td>✅ registry + post_init assertions</td></tr>
+<tr><td><span class="file">vla_aqc.py</span></td><td><code>macro_group_size</code> passed to <code>PrefixValue</code>; <code>critic_loss_td</code> indexes output by <code>prefixes // mg - 1</code>; <code>gamma_h = discount ** prefixes</code> (step counts, correct)</td><td>✅ MC step compiles + converges</td></tr>
+<tr><td><span class="file">vla_data.py</span></td><td>Loader unchanged — emits flat <code>action_chunks (B, H*d)</code>; grouping happens inside the model</td><td>✅</td></tr>
+</table>
+
+<div class="box good"><b>Efficiency gains from macro-grouping:</b>
+<ul>
+<li>Attention matrix: 51×51 = 2601 → 6×6 = 36 entries per head (<b>72× reduction</b>)</li>
+<li>Bootstrap forward calls: 32×50 = 1600 → 32×5 = 160 per step (<b>10× reduction</b>)</li>
+<li>Prefix candidates: 50 → 5 (all meaningful: 10/20/30/40/50 real steps = 167ms granularity)</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. CAL-QL Discussion</h2>
+
+<h3>What it is</h3>
+<p>CAL-QL (Nakamoto et al. 2023) adds an offline conservatism penalty:
+\(\mathcal{L}_{CQL} = \alpha\!\left(\mathbb{E}_{a\sim\pi}[Q(s,a)] - \mathbb{E}_{a\sim\mathcal{D}}[Q(s,a)]\right)\),
+making the critic pessimistic on OOD actions.</p>
+
+<h3>Do we need it?</h3>
+<table>
+<tr><th>ingredient</th><th>available?</th><th>how</th></tr>
+<tr><td>MC supervision (in-distribution)</td><td>✅</td><td>undiscounted MC from raw rewards</td></tr>
+<tr><td>Policy Q estimate \(\mathbb{E}_{a\sim\pi}[Q]\)</td><td>✅</td><td><code>base_action</code> = 32 policy samples/state</td></tr>
+<tr><td>Dataset Q estimate \(\mathbb{E}_{a\sim\mathcal{D}}[Q]\)</td><td>✅</td><td><code>action</code> = executed behavior action</td></tr>
+<tr><td>Penalty weight \(\alpha\)</td><td>needs tuning</td><td>extra hyperparameter</td></tr>
+</table>
+
+<div class="box"><b>Verdict: defer until needed.</b> The MC regression + precomputed in-distribution
+<code>base_action</code> candidates keep the critic in-distribution by construction. CAL-QL matters
+when the critic overestimates OOD actions at rollout, which we don't yet know is a problem.
+<br><br>
+If needed, the one-line addition to <code>critic_loss_mc</code> in <span class="file">vla_aqc.py</span>:
+<pre>L_cal = alpha * (Q(s, base_action).mean() - Q(s, executed_action))
+L_total = L_mc + L_cal</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Experiment Plan</h2>
+<ol>
+<li><b>MC baseline</b> — <code>vla_mc_macro</code>: undiscounted MC (γ=1), 201 atoms, [−1,0] support, 5 macro-prefixes. This is the RECAP-equivalent. Eval: Q̂ vs mc_return correlation, prefix_spread &gt; 0.</li>
+<li><b>AQC-TD</b> — <code>vla_aqc_td_macro</code>: same config + 32-candidate joint-max bootstrap. Switch once MC loss converges.</li>
+<li><b>Ablations</b>: <code>mc_gamma=None</code> (precomputed γ=0.995 vs undiscounted); <code>num_atoms∈{51,101,201}</code>; <code>state_encoder_dims=(512,)</code>; <code>macro_group_size=1</code> (no grouping) vs <code>=10</code>.</li>
+<li><b>CAL-QL</b> — only if Q diverges or critic over-selects bad prefixes.</li>
+</ol>
+
+<!-- ============================================================ -->
+<h2>7. Code Status — All ✅</h2>
+<table>
+<tr><th>file</th><th>status</th><th>what's in it</th></tr>
+<tr class="done"><td><span class="file">utils/transformer.py</span></td><td>✅ implemented</td><td><code>macro_group_size</code>, per-position heads, state encoder MLP option</td></tr>
+<tr class="done"><td><span class="file">vla_aqc.py</span></td><td>✅ implemented</td><td>MC + AQC-TD losses, tiled bootstrap, macro-prefix indexing</td></tr>
+<tr class="done"><td><span class="file">vla_data.py</span></td><td>✅ implemented</td><td>fast loader, undiscounted MC (<code>_compute_mc</code>), both MC + TD batches</td></tr>
+<tr class="done"><td><span class="file">vla_config.py</span></td><td>✅ implemented</td><td>full nested config, <code>mc_gamma</code>, <code>macro_group_size</code>, named registry, run dirs on lustre</td></tr>
+<tr class="done"><td><span class="file">vla_train.py</span></td><td>✅ implemented</td><td>training loop, logging (CSV + W&B), checkpoint save/resume</td></tr>
+</table>
+
+<h3>Ready to run</h3>
+<pre>cd /home/gwanwoo13/projects/rss_ptf/openpi-baseline_RLLAB/adaptive_q_chunking
+
+# MC baseline (RECAP-style, recommended first run)
+python vla_train.py --config vla_mc_macro --exp_name run1
+
+# Throughput probe (100 steps, no checkpoints)
+python vla_train.py --config vla_mc_macro --timing_steps 100
+
+# AQC-TD (after MC works)
+python vla_train.py --config vla_aqc_td_macro --exp_name run1</pre>
+<p class="muted">All outputs go to <code>/lustre/gwanwoo13/rss_post_training/phase1/critic_learning/&lt;name&gt;/&lt;exp&gt;/</code>
+(config.json dump, metrics.csv, checkpoints/). On a login node prefix <code>JAX_PLATFORMS=cpu</code>.
+Unset <code>LD_LIBRARY_PATH</code> on the cluster before running (bundled CUDA wheels).</p>
+
+</body>
+</html>
