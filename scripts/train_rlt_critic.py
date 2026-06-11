@@ -19,14 +19,15 @@ import time
 from typing import Optional
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import flax.serialization as fs
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from tqdm import tqdm
 
-from vla_config import VLAAQCConfig, get_config
-from vla_data import VLALeRobotDataset, prefetch
-from vla_aqc import VLACriticTrainer
+from openpi.rlt_critic.config import VLAAQCConfig, get_config
+from openpi.rlt_critic.data import VLALeRobotDataset, prefetch
+from openpi.rlt_critic.agent import VLACriticTrainer
 
 
 # --------------------------------------------------------------------------- checkpoints
@@ -175,7 +176,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         # this is what lets a bigger multi-GPU batch keep the same it/s. 0 = legacy
         # single background thread.
         if cfg.loader_processes > 0:
-            from vla_loader import VLABatchIterable, make_torch_loader
+            from openpi.rlt_critic.loader import VLABatchIterable, make_torch_loader
             it = VLABatchIterable(ds_kwargs, cfg.optim.batch_size, cfg.td.target_kind,
                                   cfg.td.prefixes, seed)
             yield from make_torch_loader(it, cfg.loader_processes, cfg.prefetch_depth)
@@ -202,15 +203,19 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         return b
 
     logger = None if timing_steps else RunLogger(cfg)
-    # Build the fixed eval episode set ONCE (cached in RAM, ~a few episodes). Reused every
-    # eval_interval so the value curves are comparable across steps. Same dataset as training.
-    eval_set = None
+    # Offline eval (trajectory value-curve viz vs mc_return) is OPTIONAL: it only runs if an
+    # eval module (openpi.rlt_critic.eval_curves) is present. Stage-1 critic training doesn't
+    # need it, so skip cleanly when it's absent.
+    vla_eval, eval_set = None, None
     if logger:
-        import vla_eval
-        eval_set = vla_eval.build_eval_set(ds, n_success=cfg.eval_n_success,
-                                           n_fail=cfg.eval_n_fail, seed=cfg.seed)
-        print(f"    eval set: {sum(not e['fail'] for e in eval_set)} success + "
-              f"{sum(e['fail'] for e in eval_set)} failure episodes (cached)")
+        try:
+            from openpi.rlt_critic import eval_curves as vla_eval
+            eval_set = vla_eval.build_eval_set(ds, n_success=cfg.eval_n_success,
+                                               n_fail=cfg.eval_n_fail, seed=cfg.seed)
+            print(f"    eval set: {sum(not e['fail'] for e in eval_set)} success + "
+                  f"{sum(e['fail'] for e in eval_set)} failure episodes (cached)")
+        except Exception as e:
+            print(f"    [eval disabled] {type(e).__name__}: {e}")
 
     it = batch_iter(cfg.seed + start_step)
     n_steps = timing_steps or cfg.optim.num_train_steps
@@ -226,7 +231,9 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         except StopIteration:
             it = batch_iter(cfg.seed + step); b = scale_batch(next(it))
         jb, pf = shard_batch(b)
-        params, opt_state, info = step_fn(params, opt_state, jb, pf)
+        # ReLU-blend MC-warmup coefficient for this step (jnp scalar -> traced, no recompile).
+        beta = jnp.asarray(cfg.mc_blend_beta(step), jnp.float32)
+        params, opt_state, info = step_fn(params, opt_state, jb, pf, beta)
 
         if timing_steps and step == start_step:
             info["critic_loss"].block_until_ready()
@@ -241,8 +248,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
             else:                                              # non-tty heartbeat line
                 print(f"  step {step:>7}/{end_step} loss={m['critic_loss']:.4f} "
                       f"q={m.get('q_mean', 0):.4f} {sps:.1f} it/s", flush=True)
-        if logger and eval_set and step > start_step and step % cfg.eval_interval == 0:
-            import vla_eval
+        if logger and vla_eval is not None and eval_set and step > start_step and step % cfg.eval_interval == 0:
             import matplotlib.pyplot as plt
             # device_get: eval builds its own single-device inputs, which can't mix with
             # mesh-replicated params in eager ops; a host copy (~60MB) sidesteps that.
@@ -271,15 +277,18 @@ def main():
     import tyro
     @dataclasses.dataclass
     class Args:
-        config: str = "vla_aqc_td_macro"   # registry key (see vla_config.CONFIGS)
-        task: str = ""                     # override dataset task (see vla_config.TASKS); "" = config default
+        config: str = "vla_aqc_warmup"     # registry key (see config.CONFIGS)
+        task: str = ""                     # override dataset task (see config.TASKS); "" = config default
+        data_root: str = ""                # override dataset path (config.data_root_override); "" = task default
         exp_name: str = ""
         seed: int = 0
         timing_steps: int = 0              # >0 => throughput probe, no checkpoints
         resume: bool = False
         batch_size: int = 0                # >0 overrides optim.batch_size (e.g. 1024)
         lr: float = 0.0                    # >0 overrides optim.lr (scale with batch if desired)
-        mc_floor: Optional[bool] = None    # override td.mc_floor (Cal-QL floor on/off ablation)
+        mc_floor: Optional[bool] = None    # override td.mc_floor (ReLU-blend floor on/off)
+        mc_warmup_steps: int = -1          # >=0 overrides td.mc_warmup_steps (beta=0 phase length)
+        mc_ramp_steps: int = -1            # >=0 overrides td.mc_ramp_steps (beta 0->1 ramp length)
         agg_beta: float = 0.0              # >0 overrides td.agg_beta (softmax temperature sweep)
         loader_processes: int = -1         # >=0 overrides cfg.loader_processes (0 = thread loader)
     args = tyro.cli(Args)
@@ -291,13 +300,17 @@ def main():
             cfg.optim,
             batch_size=args.batch_size or cfg.optim.batch_size,
             lr=args.lr or cfg.optim.lr))
-    if args.mc_floor is not None or args.agg_beta > 0:
+    if (args.mc_floor is not None or args.agg_beta > 0
+            or args.mc_warmup_steps >= 0 or args.mc_ramp_steps >= 0):
         cfg = dataclasses.replace(cfg, td=dataclasses.replace(
             cfg.td,
             mc_floor=cfg.td.mc_floor if args.mc_floor is None else args.mc_floor,
-            agg_beta=args.agg_beta or cfg.td.agg_beta))
+            agg_beta=args.agg_beta or cfg.td.agg_beta,
+            mc_warmup_steps=cfg.td.mc_warmup_steps if args.mc_warmup_steps < 0 else args.mc_warmup_steps,
+            mc_ramp_steps=cfg.td.mc_ramp_steps if args.mc_ramp_steps < 0 else args.mc_ramp_steps))
     cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "",
-                              task=args.task or cfg.task)
+                              task=args.task or cfg.task,
+                              data_root_override=args.data_root or cfg.data_root_override)
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 

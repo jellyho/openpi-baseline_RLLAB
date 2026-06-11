@@ -44,7 +44,7 @@ from typing import Optional, Sequence
 import flax.linen as nn
 import jax.numpy as jnp
 
-from utils.networks import default_init, ensemblize
+from openpi.rlt_critic.networks import default_init, ensemblize
 
 
 class CausalPrefixCritic(nn.Module):

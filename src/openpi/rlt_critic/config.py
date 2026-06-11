@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import pathlib
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -37,9 +38,14 @@ from typing import Literal, Optional
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class ArchConfig:
-    """Causal-Transformer critic capacity (scaled up for the 2048-d VLA latent)."""
+    """Causal-Transformer critic capacity (scaled up for the 2048-d VLA latent).
+
+    Default sizing targets the requested ~10M-parameter critic: n_embd=384, 3 layers,
+    mlp=1024, K=2 ensembles, per-position head -> ~10.7M params (the 2048->384 state
+    projection and the macro_H x n_embd x num_atoms heads dominate the fixed cost).
+    """
     num_ensembles: int = 2          # K (min-aggregated target)
-    num_layers: int = 4
+    num_layers: int = 3             # 3L @ n_embd=384, K=2 -> ~10.7M (was 4L ~13.5M)
     num_heads: int = 8
     head_dim: int = 48              # n_embd = num_heads * head_dim = 384
     mlp_dim: int = 1024
@@ -58,23 +64,27 @@ class ArchConfig:
 @dataclass(frozen=True)
 class DistConfig:
     """Distributional (HL-Gauss) value head."""
-    num_atoms: int = 201            # 201 -> bin width 0.005 over [-1, 0] (matches RECAP)
+    num_atoms: int = 201            # 201 over [-0.5, 0] -> bin width 0.0025
     hl_gauss_sigma_frac: float = 0.75   # sigma = frac * (v_max - v_min) / num_atoms
     # How the value support [v_min, v_max] is set:
-    #   'fixed'       -> use v_min/v_max below (default [-1, 0] for undiscounted MC)
+    #   'fixed'       -> use v_min/v_max below
     #   'reward_norm' -> rewards scaled into [-1, 0]; support fixed to [-1, 0]
     #   'data'        -> p1/p99 of return-to-go + margin (DEAS data-centric)
     support_mode: Literal["fixed", "reward_norm", "data"] = "fixed"
-    v_min: float = -1.0            # covers undiscounted MC range; discounted [-0.5,0] fits inside
+    # mouse-battery (v1/v2 annotation): precomputed mc_return is gamma=0.995, range exactly
+    # [-0.5, 0] (stats.json: living=-1e-4, success=0, failure-terminal=-0.5). Match the support
+    # to the data so the atoms aren't wasted on an empty [-1,-0.5] half.
+    v_min: float = -0.5
     v_max: float = 0.0
 
 
 @dataclass(frozen=True)
 class TDConfig:
     """MC-return / multi-step TD bootstrap (the ACSAC expected-prefix-max)."""
-    discount: float = 0.9999        # near-undiscounted (v2 annotation): value ~ normalized
-                                    # steps-to-go + failure penalty; matches the re-annotated
-                                    # mc_return column (gamma=0.9999, globally /Z normalized)
+    discount: float = 0.995         # MUST match the precomputed mc_return column. mouse-battery
+                                    # (v1/v2 annotation) used gamma=0.995, mc_return in [-0.5,0].
+                                    # cum_reward + gamma^h*v_next and the MC floor all live on this
+                                    # scale. (v3 datasets use 0.9999 -> override per-task.)
     # Target kind:
     #   'td' -> per-prefix multi-step TD with the N-candidate joint-max bootstrap (paper)
     #   'mc' -> regress directly to precomputed mc_return (RECAP-style baseline; no bootstrap)
@@ -110,11 +120,22 @@ class TDConfig:
     # large gaps (0.2-0.4) but blurs small ones (~0.05). Sweep beta when ablating soft vs max.
     agg_mode: Literal["max", "softmax", "mellowmax"] = "max"
     agg_beta: float = 4.0
-    # Cal-QL-style MC floor on the TD target: target = max(td_target, mc_return(start state)).
-    # Default OFF: the OGBench task4/5 ablation (qc/ogbench_experiments.html, 06-12) showed the
-    # floor is harmful -- the top-RTG states seed an early value inflation that the NxH max-
-    # bootstrap amplifies (task4 success 0%). Keep available for ablation via --mc_floor True.
-    mc_floor: bool = False
+    # ReLU-blend MC-warmup target (the agreed design; see agent.critic_loss_td):
+    #     target = G_MC + beta * ReLU(TD - G_MC),   beta ramped 0 -> 1.
+    # mc_floor=True turns this on (default). It SUBSUMES the old behaviours:
+    #   * beta=0 (warmup)          -> pure MC regression (ground the success manifold first);
+    #   * beta=1 (after ramp)      -> max(G_MC, TD)  == the Cal-QL hard floor / max(MC,Q);
+    #   * mc_warmup=mc_ramp=0      -> beta=1 from step 0 (the old hard-max floor, no warmup);
+    #   * mc_floor=False           -> pure TD, no floor and no warmup.
+    # The earlier OGBench worry that a hard floor inflates value early is exactly what the
+    # warmup (beta=0 then a slow ramp) prevents: no bootstrap is trusted until MC has grounded
+    # the values, so the NxH max can't amplify a randomly-high early Q.
+    mc_floor: bool = True
+    # beta(step) schedule (used only when mc_floor=True): beta=0 for the first mc_warmup_steps
+    # (pure MC warmup), then a cosine ramp to 1 over mc_ramp_steps, then stays 1. Tie the lengths
+    # to how long MC needs to converge / the horizon: defaults give 20k warmup + 30k ramp.
+    mc_warmup_steps: int = 20_000
+    mc_ramp_steps: int = 30_000
 
 
 @dataclass(frozen=True)
@@ -143,14 +164,17 @@ class OptimConfig:
 # Challenge tasks: annotated dataset (rl_token/base_action + relabeled reward/mc_return).
 # Select with VLAAQCConfig.task or `--task <name>`; data_root is derived from this.
 # ---------------------------------------------------------------------------
-_DATA_BASE = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset"
+# Local workspace on the B200 box (see setup_env.sh). Override with --data_root for other
+# machines/clusters. mouse-battery is present (184GB, rl_token/base_action/reward/mc_return);
+# the others are placeholders with the same naming so --task can switch once they land.
+_DATA_BASE = "/NHNHOME/WORKSPACE/0526040008_A/jellyho"
 TASKS = {
-    # v3 annotation (current): raw living=-1 / C_fail=0.4*T_max, gamma=0.9999, globally
-    # normalized into [-1,0]; columns unnormalized_reward / reward / mc_return.
-    # See docs/reward_value_design.html. v1 data stays at *_annotated (paused g0.999 runs).
-    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated_v3",   # ready (v3)
-    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated_v3",  # ready (v3)
-    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated_v3",    # NOT annotated yet
+    # mouse-battery is the v1/v2 annotation actually on disk here: raw living=-1e-4,
+    # success=0, failure-terminal=-0.5; precomputed mc_return at gamma=0.995 in [-0.5,0]
+    # (stats.json). Use support [-0.5,0] + td.discount=0.995 (the config defaults).
+    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated",
+    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated",
+    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated",
 }
 
 
@@ -171,6 +195,7 @@ class VLAAQCConfig:
 
     # --- data ---
     task: str = "insert-mouse-battery"   # which challenge task (see TASKS); --task to switch
+    data_root_override: Optional[str] = None  # absolute dataset path; overrides TASKS[task]
     commander_filter: Optional[tuple[str, ...]] = None  # e.g. ("inference",) or ("teleop",)
     shuffle_buffer_groups: int = 8
     num_workers: int = 8            # parquet read THREADS per loader process
@@ -197,7 +222,7 @@ class VLAAQCConfig:
     eval_n_fail: int = 3            # fixed failure episodes shown in the eval plot
     save_interval: int = 25_000
     keep_period: Optional[int] = 100_000   # checkpoints at step % keep_period == 0 are kept
-    checkpoint_base_dir: str = "/scratch/gwanwoo13/rss_pft/phase1/critic_learning"
+    checkpoint_base_dir: str = "/NHNHOME/WORKSPACE/0526040008_A/jellyho/rlt_critic_runs"
     wandb_enabled: bool = True
     wandb_project: str = "rlt_critic_learning"
     wandb_entity: str = "RSS-PFT_RLLAB"
@@ -205,8 +230,25 @@ class VLAAQCConfig:
     # ---- derived identity --------------------------------------------------
     @property
     def data_root(self) -> str:
-        """Dataset path for the selected task (single source of truth: TASKS)."""
-        return TASKS[self.task]
+        """Dataset path: the explicit override if set, else TASKS[task]."""
+        return self.data_root_override or TASKS[self.task]
+
+    def mc_blend_beta(self, step: int) -> float:
+        """ReLU-blend warmup coefficient beta(step) in [0, 1] (see agent.critic_loss_td).
+
+        beta = 0 for the first ``td.mc_warmup_steps`` (pure MC warmup), then a cosine ramp
+        to 1 over ``td.mc_ramp_steps``, then stays 1 (target = max(MC, TD)). When mc_floor
+        is off there is no blend (returns 1.0; the loss then uses the pure-TD branch).
+        """
+        if not self.td.mc_floor:
+            return 1.0
+        w, r = self.td.mc_warmup_steps, self.td.mc_ramp_steps
+        if step < w:
+            return 0.0
+        if r <= 0 or step >= w + r:
+            return 1.0
+        t = (step - w) / r
+        return 0.5 * (1.0 - math.cos(math.pi * t))
 
     @property
     def run_name(self) -> str:
@@ -228,8 +270,11 @@ class VLAAQCConfig:
         ]
         if t.agg_mode != "max":                      # tag soft aggregation (avoid collision)
             parts.append(f"{t.agg_mode}{t.agg_beta:g}")
-        if t.mc_floor:                               # tag Cal-QL MC floor (default on)
-            parts.append("mcfloor")
+        if t.mc_floor:                               # tag ReLU-blend floor + warmup schedule
+            if t.mc_warmup_steps == 0 and t.mc_ramp_steps == 0:
+                parts.append("mcfloor")              # beta=1 from step 0 (hard max, no warmup)
+            else:
+                parts.append(f"warm{t.mc_warmup_steps // 1000}k+{t.mc_ramp_steps // 1000}k")
         if self.reward.reward_normalize:
             parts.append("rnorm")
         if self.commander_filter:
@@ -280,73 +325,67 @@ class VLAAQCConfig:
 # Named registry of presets (the "what is this run" catalogue)
 # ---------------------------------------------------------------------------
 _CONFIGS = [
-    # Paper-faithful default: per-prefix TD, 32-candidate joint-max bootstrap, HL-Gauss a51
-    # over the fixed [-0.5, 0] support, n_embd=384 / 4 layers (~15M params).
+    # ---- PRIMARY: the agreed design ----------------------------------------------------
+    # Per-prefix multi-step TD with the 32-candidate joint-max bootstrap, ReLU-blend MC
+    # warmup (beta 0->1 over 20k+30k steps), HL-Gauss 201 atoms over [-0.5,0], ~10M critic
+    # (n_embd=384/3L/K2), macro grouping (5 macro-tokens -> replan at 10/20/30/40/50 steps).
     VLAAQCConfig(
-        name="vla_aqc_td_a51",
-        notes="Default ACSAC-TD critic on mouse-battery: 32-candidate joint-max bootstrap, "
-              "HL-Gauss 51 atoms over fixed [-0.5,0], n_embd=384/4L, B=256.",
+        name="vla_aqc_warmup",
+        notes="PRIMARY. AQC-TD on mouse-battery with ReLU-blend MC warmup: pure MC for 20k "
+              "steps then cosine-ramp the bootstrap (improvement) trust to 1 over 30k. "
+              "~10M critic, [-0.5,0] support, gamma=0.995, B=256.",
     ),
-    # MC baseline with macro-action grouping (recommended first run):
-    # macro_group_size=10 -> 5 tokens, L=6 sequence, 5 prefix candidates {10,20,30,40,50}.
+    # ---- Warmup stage 1 in isolation: pure MC regression (no bootstrap) -----------------
+    # Cheap, very stable; good first sanity run and a lower-bound reference. Equivalent to
+    # the PRIMARY run's first phase (beta=0) run forever.
     VLAAQCConfig(
-        name="vla_mc_macro",
-        notes="MC regression baseline with macro-action grouping (group_size=10). "
-              "5 macro-tokens, L=6 sequence (same as OGBench critic). "
-              "Start here: stable MC target, cheap, meaningful replan granularity.",
-        td=TDConfig(target_kind="mc", macro_group_size=10,
-                    prefixes=(10, 20, 30, 40, 50)),
-    ),
-    # TD variant with macro-action grouping (after MC baseline works).
-    VLAAQCConfig(
-        name="vla_aqc_td_macro",
-        notes="AQC-TD with macro-action grouping. 32 candidates x 5 prefixes = 160 evals/step "
-              "(vs 1600 without grouping). Switch to this after vla_mc_macro validates.",
-        td=TDConfig(target_kind="td", macro_group_size=10,
-                    prefixes=(10, 20, 30, 40, 50)),
-    ),
-    # Soft-aggregation variant: conservative bootstrap via Boltzmann softmax over the
-    # N x prefix Q's instead of hard max (Best-of-N). beta=20 per the OGBench E2 beta-sweep
-    # (qc/ogbench_experiments.html: beta 1~5 ~ mean -> collapse, beta=20 best, >= argmax).
-    VLAAQCConfig(
-        name="vla_aqc_td_macro_softmax",
-        notes="AQC-TD macro with softmax(beta=20) bootstrap aggregation (soft Best-of-N). "
-              "Compare against vla_aqc_td_macro (max) for offline overestimation.",
-        td=TDConfig(target_kind="td", macro_group_size=10,
-                    prefixes=(10, 20, 30, 40, 50),
-                    agg_mode="softmax", agg_beta=20.0),
-    ),
-    # MC baseline: regress directly to mc_return (no bootstrap). Cheap stability sanity check.
-    VLAAQCConfig(
-        name="vla_mc_baseline",
-        notes="MC baseline: HL-Gauss regression to precomputed mc_return (no bootstrap). "
-              "Stable lower-bound reference for the TD runs.",
+        name="vla_mc",
+        notes="Pure MC regression to the precomputed mc_return (no bootstrap). Stable "
+              "lower-bound reference; the beta=0 phase of vla_aqc_warmup in isolation.",
         td=TDConfig(target_kind="mc"),
     ),
-    # Capacity sweep brackets (share everything except arch).
+    # ---- Ablations on the transition --------------------------------------------------
+    # Hard max(MC,TD) from step 0 (no warmup): the old Cal-QL floor. Tests whether the
+    # warmup ramp actually matters vs trusting the bootstrap immediately.
     VLAAQCConfig(
-        name="vla_aqc_td_a51_small",
-        notes="Capacity bracket (small): n_embd=256 / 2 layers, linear state projection.",
+        name="vla_aqc_hardmax",
+        notes="Ablation: hard max(MC,TD) floor from step 0 (mc_warmup=mc_ramp=0, beta=1). "
+              "No warmup -- the pre-warmup baseline to measure the ramp's benefit.",
+        td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
+    ),
+    # Pure TD, no MC floor at all (mc_floor=False). The other extreme: tests how slow raw
+    # bootstrapping is on this long-horizon offline data (the problem the warmup addresses).
+    VLAAQCConfig(
+        name="vla_aqc_no_floor",
+        notes="Ablation: pure multi-step TD, no MC floor and no warmup (mc_floor=False). "
+              "Baseline for how slow unaided long-horizon propagation is.",
+        td=TDConfig(mc_floor=False),
+    ),
+    # Conservative bootstrap: softmax(beta=20) aggregation over the NxH candidate-prefix Q's
+    # instead of the hard Best-of-N max, on top of the warmup. Guards offline overestimation.
+    VLAAQCConfig(
+        name="vla_aqc_warmup_softmax",
+        notes="PRIMARY + conservative softmax(beta=20) bootstrap aggregation (soft Best-of-N) "
+              "over the candidate x prefix Q's. Compare vs vla_aqc_warmup (hard max).",
+        td=TDConfig(agg_mode="softmax", agg_beta=20.0),
+    ),
+    # ---- Capacity brackets (share everything except arch) -------------------------------
+    VLAAQCConfig(
+        name="vla_aqc_warmup_small",
+        notes="Capacity bracket (small): n_embd=256 / 2 layers, mlp=512 (~4M).",
         arch=ArchConfig(head_dim=32, num_layers=2, mlp_dim=512),
     ),
     VLAAQCConfig(
-        name="vla_aqc_td_a51_large",
-        notes="Capacity bracket (large): n_embd=512 / 6 layers, linear state projection.",
+        name="vla_aqc_warmup_large",
+        notes="Capacity bracket (large): n_embd=512 / 6 layers, mlp=2048 (~35M).",
         arch=ArchConfig(head_dim=64, num_layers=6, mlp_dim=2048),
     ),
-    # Ablation: same as default but with an MLP state-encoder (2048->512->n_embd) instead of
-    # the linear projection -- to test whether the 2048-d latent needs nonlinear digestion.
+    # Ablation: MLP state-encoder (2048->512->n_embd) instead of the single linear projection
+    # -- tests whether the 2048-d VLA latent needs nonlinear digestion before the critic.
     VLAAQCConfig(
-        name="vla_aqc_td_a51_stateenc",
-        notes="Default + MLP state-encoder (512,) on the 2048-d latent (vs linear default).",
+        name="vla_aqc_warmup_stateenc",
+        notes="PRIMARY + MLP state-encoder (512,) on the 2048-d latent (vs linear default).",
         arch=ArchConfig(state_encoder_dims=(512,)),
-    ),
-    # Reward-normalized variant (fixed [-1,0] support via reward scaling).
-    VLAAQCConfig(
-        name="vla_aqc_td_a51_rnorm",
-        notes="Same as default but reward-normalized to [-1,0] (support_mode=reward_norm).",
-        dist=DistConfig(support_mode="reward_norm", v_min=-1.0, v_max=0.0),
-        reward=RewardConfig(reward_normalize=True),
     ),
 ]
 

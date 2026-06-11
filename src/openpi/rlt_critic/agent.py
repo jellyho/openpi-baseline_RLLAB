@@ -19,9 +19,9 @@ import numpy as np
 import optax
 from jax.scipy.special import logsumexp
 
-from utils.transformer import PrefixValue
-from utils.distributional import hl_gauss_transform, categorical_cross_entropy
-from vla_config import VLAAQCConfig
+from openpi.rlt_critic.transformer import PrefixValue
+from openpi.rlt_critic.distributional import hl_gauss_transform, categorical_cross_entropy
+from openpi.rlt_critic.config import VLAAQCConfig
 
 
 def _make_optimizer(opt_cfg):
@@ -116,7 +116,7 @@ class VLACriticTrainer:
                       "target_mean": batch["mc_return"].mean(),
                       "prefix_spread": (q.max(-1) - q.min(-1)).mean()}
 
-    def critic_loss_td(self, params, batch, prefixes):
+    def critic_loss_td(self, params, batch, prefixes, beta):
         cfg = self.cfg
         B, P = batch["cum_reward"].shape
         mg = cfg.td.macro_group_size
@@ -134,11 +134,21 @@ class VLACriticTrainer:
 
         gamma_h = cfg.td.discount ** prefixes.astype(jnp.float32)  # (P,)
         td_target = batch["cum_reward"] + gamma_h[None, :] * batch["valid"] * v_next
-        mc_col = batch["mc_return"][:, None]                       # (B,1) realized behavior return
-        target = jnp.maximum(td_target, mc_col) if cfg.td.mc_floor else td_target
+        mc_col = batch["mc_return"][:, None]                       # (B,1) realized behavior return G_MC
+        # ReLU-blend MC-warmup transition:  target = G_MC + beta * ReLU(TD - G_MC).
+        #   beta=0 -> pure MC warmup (regress every prefix to the realized return-to-go,
+        #             grounding the whole success manifold with no bootstrap);
+        #   beta=1 -> max(G_MC, TD), i.e. the Cal-QL-floored max(MC, Q-backup) target.
+        # beta is ramped 0->1 by the trainer schedule (config.mc_blend_beta). MC stays a hard
+        # lower-bound floor -- beta only scales the *improvement* term above it (the ReLU side),
+        # which is exactly the slow/risky bootstrap signal we want to trust gradually.
+        improvement = jnp.maximum(td_target - mc_col, 0.0)        # (B,P) ReLU(Q-backup - G_MC)
+        target = mc_col + beta * improvement if cfg.td.mc_floor else td_target
         target = jax.lax.stop_gradient(target)                   # (B,P)
-        # Cal-QL floor diagnostics: how often mc_return wins the max (floor binds) and by how much.
-        floor_gap = jnp.maximum(mc_col - td_target, 0.0)         # (B,P) lift applied where >0
+        # Floor diagnostics: where MC is the binding value (TD<=MC -> improvement masked to 0 -> target=MC)
+        # and the MC-above-TD gap. With warmup, floor_frac starts ~1 (beta=0 -> all MC) and decays
+        # as beta->1 and TD overtakes MC (self-releasing).
+        floor_gap = jnp.maximum(mc_col - td_target, 0.0)         # (B,P) MC-above-TD gap
         floor_active = (floor_gap > 0).astype(jnp.float32)
 
         tgt_probs = self.to_probs(target[..., None])             # (B,P,atoms)
@@ -153,6 +163,7 @@ class VLACriticTrainer:
         vsum = jnp.maximum(batch["valid"].sum(), 1.0)
         info = {
             "critic_loss": loss,
+            "beta": beta,                                        # ReLU-blend warmup coefficient
             # divide by valid*num_ensembles (same denom as the loss): q is (K,B,P), so dividing
             # by valid.sum() alone summed over the K ensembles -> reported 2x the true mean.
             "q_mean": (q * valid).sum() / denom,
@@ -176,7 +187,9 @@ class VLACriticTrainer:
         cfg = self.cfg
         if cfg.td.target_kind == "mc":
             @jax.jit
-            def step(params, opt_state, batch, prefixes):
+            def step(params, opt_state, batch, prefixes, beta):
+                # MC baseline ignores beta (pure regression to mc_return); kept in the
+                # signature so the train loop can call both kinds uniformly.
                 (loss, info), grads = jax.value_and_grad(self.critic_loss_mc, has_aux=True)(params, batch)
                 updates, opt_state = self.opt.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
@@ -184,9 +197,9 @@ class VLACriticTrainer:
             return step
 
         @jax.jit
-        def step(params, opt_state, batch, prefixes):
+        def step(params, opt_state, batch, prefixes, beta):
             (loss, info), grads = jax.value_and_grad(self.critic_loss_td, has_aux=True)(
-                params, batch, prefixes)
+                params, batch, prefixes, beta)
             updates, opt_state = self.opt.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
             return params, opt_state, info

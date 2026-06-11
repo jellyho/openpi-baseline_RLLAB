@@ -24,7 +24,7 @@ import multiprocessing
 
 import torch.utils.data as tud
 
-from vla_data import VLALeRobotDataset
+from openpi.rlt_critic.data import VLALeRobotDataset
 
 
 class VLABatchIterable(tud.IterableDataset):
