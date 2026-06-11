@@ -141,6 +141,18 @@ class OptimConfig:
 
 
 # ---------------------------------------------------------------------------
+# Challenge tasks: annotated dataset (rl_token/base_action + relabeled reward/mc_return).
+# Select with VLAAQCConfig.task or `--task <name>`; data_root is derived from this.
+# ---------------------------------------------------------------------------
+_DATA_BASE = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset"
+TASKS = {
+    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated",   # ready (relabeled)
+    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated",  # ready (relabeled)
+    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated",    # NOT annotated yet
+}
+
+
+# ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -156,11 +168,17 @@ class VLAAQCConfig:
     latent_dim: int = 2048
 
     # --- data ---
-    data_root: str = ("/lustre/gwanwoo13/rss_post_training/"
-                      "Challenge-phase1-dataset/insert-mouse-battery_annotated")
+    task: str = "insert-mouse-battery"   # which challenge task (see TASKS); --task to switch
     commander_filter: Optional[tuple[str, ...]] = None  # e.g. ("inference",) or ("teleop",)
     shuffle_buffer_groups: int = 8
-    num_workers: int = 8
+    num_workers: int = 8            # parquet read THREADS per loader process
+    prefetch_depth: int = 3         # batches prefetched (thread queue / per torch worker)
+    # Loader worker PROCESSES (torch DataLoader, openpi-style; see vla_loader.py).
+    # The pipeline is host-bound, so this is the throughput knob: each process streams a
+    # disjoint shard of row-groups and yields full global batches => ~linear scaling until
+    # CPU/lustre saturates. Total read threads = loader_processes * num_workers (size
+    # SLURM --cpus-per-task accordingly). 0 = legacy in-process thread prefetch.
+    loader_processes: int = 4
 
     # --- grouped hyperparameters ---
     arch: ArchConfig = field(default_factory=ArchConfig)
@@ -184,12 +202,20 @@ class VLAAQCConfig:
 
     # ---- derived identity --------------------------------------------------
     @property
+    def data_root(self) -> str:
+        """Dataset path for the selected task (single source of truth: TASKS)."""
+        return TASKS[self.task]
+
+    @property
     def run_name(self) -> str:
         """Descriptive, self-documenting run name built from the load-bearing settings."""
-        # Compact spec only (the family name lives in the parent dir via `name`); avoids
-        # doubling the name. e.g. "a51_sup-fixed_emb384x4L_N32_P4_b256_g0.995_s0".
+        # Task prefix so runs on different datasets never collide (same config, diff task).
+        # e.g. "seal-water-bottle-cap_a201_sup-fixed_emb384x4L_N32_P5_b256_g0.999_mcfloor_s0".
+        # To resume a pre-existing run whose dir lacks the prefix, just `mv` its dir to the new
+        # run_name (printed at train start) -- resume finds checkpoints by dir name.
         a, d, t = self.arch, self.dist, self.td
         parts = [
+            self.task,                                  # which dataset
             f"a{d.num_atoms}",                          # atoms
             f"sup-{d.support_mode}",                    # value support choice
             f"emb{a.n_embd}x{a.num_layers}L",           # capacity
@@ -222,6 +248,7 @@ class VLAAQCConfig:
         return self.run_dir / "checkpoints"
 
     def __post_init__(self):
+        assert self.task in TASKS, f"unknown task {self.task!r}; available: {sorted(TASKS)}"
         assert self.dist.v_min < self.dist.v_max, "value support must be non-empty"
         assert self.horizon % self.td.macro_group_size == 0, \
             f"horizon {self.horizon} must be divisible by macro_group_size {self.td.macro_group_size}"

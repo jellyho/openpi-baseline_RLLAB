@@ -21,11 +21,12 @@ from typing import Optional
 import jax
 import numpy as np
 import flax.serialization as fs
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from tqdm import tqdm
 
 from vla_config import VLAAQCConfig, get_config
-from vla_data import VLALeRobotDataset
-from vla_aqc import VLACriticTrainer, to_jax_batch
+from vla_data import VLALeRobotDataset, prefetch
+from vla_aqc import VLACriticTrainer
 
 
 # --------------------------------------------------------------------------- checkpoints
@@ -138,21 +139,60 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         params, opt_state = load_checkpoint(cfg.checkpoint_dir, start_step, params, opt_state)
         print(f"    resumed from step {start_step}")
 
-    ds = VLALeRobotDataset(cfg.data_root, horizon=cfg.horizon,
-                           commander_filter=set(cfg.commander_filter) if cfg.commander_filter else None,
-                           include_base_action=(cfg.td.target_kind == "td"),
-                           shuffle_buffer_groups=cfg.shuffle_buffer_groups,
-                           mc_gamma=cfg.td.mc_gamma, discount=cfg.td.discount,
-                           relabel_living=cfg.reward.relabel_living,
-                           relabel_fail=cfg.reward.relabel_fail)
+    # Data-parallel mesh (openpi-style, single process): params replicated on every GPU,
+    # each batch split along its leading axis -> jit inserts the grad all-reduce itself.
+    # With 1 device this is the identity setup, so the single-GPU path is unchanged.
+    devices = jax.devices()
+    n_dev = len(devices)
+    assert cfg.optim.batch_size % n_dev == 0, \
+        f"batch_size {cfg.optim.batch_size} must be divisible by {n_dev} devices"
+    mesh = Mesh(np.asarray(devices), ("dp",))
+    data_sharding = NamedSharding(mesh, PartitionSpec("dp"))
+    repl_sharding = NamedSharding(mesh, PartitionSpec())
+    params = jax.device_put(params, repl_sharding)
+    opt_state = jax.device_put(opt_state, repl_sharding)
+    print(f"    devices: {n_dev} x {devices[0].device_kind}  "
+          f"(global B={cfg.optim.batch_size} -> {cfg.optim.batch_size // n_dev}/device, "
+          f"loader_processes={cfg.loader_processes})")
+
+    ds_kwargs = dict(
+        root=cfg.data_root, horizon=cfg.horizon,
+        commander_filter=set(cfg.commander_filter) if cfg.commander_filter else None,
+        include_base_action=(cfg.td.target_kind == "td"),
+        shuffle_buffer_groups=cfg.shuffle_buffer_groups,
+        mc_gamma=cfg.td.mc_gamma, discount=cfg.td.discount,
+        relabel_living=cfg.reward.relabel_living,
+        relabel_fail=cfg.reward.relabel_fail,
+        num_workers=cfg.num_workers)
+    ds = VLALeRobotDataset(**ds_kwargs)    # main-process handle: summary + eval episodes
     print(f"    data: {ds.summary()}")
     rscale = reward_scale(cfg)
 
     def batch_iter(seed):
+        # Host-side pipeline (the throughput bottleneck: ~217ms/batch assembly vs ~135ms
+        # GPU step at B=256). loader_processes>0: N worker PROCESSES each stream a disjoint
+        # row-group shard and yield full global batches (openpi pattern; vla_loader.py) --
+        # this is what lets a bigger multi-GPU batch keep the same it/s. 0 = legacy
+        # single background thread.
+        if cfg.loader_processes > 0:
+            from vla_loader import VLABatchIterable, make_torch_loader
+            it = VLABatchIterable(ds_kwargs, cfg.optim.batch_size, cfg.td.target_kind,
+                                  cfg.td.prefixes, seed)
+            yield from make_torch_loader(it, cfg.loader_processes, cfg.prefetch_depth)
+            return
         if cfg.td.target_kind == "mc":
-            yield from ds.iter_batches(cfg.optim.batch_size, seed=seed)
+            gen = ds.iter_batches(cfg.optim.batch_size, seed=seed)
         else:
-            yield from ds.iter_bootstrap_batches(cfg.optim.batch_size, cfg.td.prefixes, seed=seed)
+            gen = ds.iter_bootstrap_batches(cfg.optim.batch_size, cfg.td.prefixes, seed=seed)
+        yield from prefetch(gen, depth=cfg.prefetch_depth)
+
+    def shard_batch(b):
+        """numpy loader batch -> jax arrays split over the dp mesh (prefixes replicated)."""
+        jb = {k: jax.make_array_from_process_local_data(data_sharding, v)
+              for k, v in b.items() if k != "prefixes"}
+        pf = (jax.device_put(np.asarray(b["prefixes"], np.int32), repl_sharding)
+              if "prefixes" in b else None)
+        return jb, pf
 
     def scale_batch(b):
         if rscale != 1.0:
@@ -175,10 +215,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     it = batch_iter(cfg.seed + start_step)
     n_steps = timing_steps or cfg.optim.num_train_steps
     t0 = time.time(); t_log = t0
-    # Progress bar ONLY in an interactive terminal. In a SLURM .out (non-tty) the bar is
-    # disabled (its carriage-return refreshes would pile up as garbage) — instead we emit a
-    # concise heartbeat line every log_interval. The real metric record is metrics.csv / W&B;
-    # the .out is just for liveness. Make the .out sparser by raising cfg.log_interval.
+
     is_tty = sys.stderr.isatty()
     end_step = start_step + n_steps
     pbar = tqdm(range(start_step, end_step), desc=cfg.name,
@@ -188,7 +225,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
             b = scale_batch(next(it))
         except StopIteration:
             it = batch_iter(cfg.seed + step); b = scale_batch(next(it))
-        jb, pf = to_jax_batch(b)
+        jb, pf = shard_batch(b)
         params, opt_state, info = step_fn(params, opt_state, jb, pf)
 
         if timing_steps and step == start_step:
@@ -207,7 +244,10 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         if logger and eval_set and step > start_step and step % cfg.eval_interval == 0:
             import vla_eval
             import matplotlib.pyplot as plt
-            curves = vla_eval.compute_curves(trainer, params, eval_set, cfg.horizon, cfg.action_dim)
+            # device_get: eval builds its own single-device inputs, which can't mix with
+            # mesh-replicated params in eager ops; a host copy (~60MB) sidesteps that.
+            curves = vla_eval.compute_curves(trainer, jax.device_get(params), eval_set,
+                                             cfg.horizon, cfg.action_dim)
             fig = vla_eval.plot_curves(curves, cfg.dist.v_min, cfg.dist.v_max)
             logger.log_image(step, "eval/value_curves", fig)
             plt.close(fig)
@@ -232,20 +272,32 @@ def main():
     @dataclasses.dataclass
     class Args:
         config: str = "vla_aqc_td_macro"   # registry key (see vla_config.CONFIGS)
+        task: str = ""                     # override dataset task (see vla_config.TASKS); "" = config default
         exp_name: str = ""
         seed: int = 0
         timing_steps: int = 0              # >0 => throughput probe, no checkpoints
         resume: bool = False
         batch_size: int = 0                # >0 overrides optim.batch_size (e.g. 1024)
         lr: float = 0.0                    # >0 overrides optim.lr (scale with batch if desired)
+        mc_floor: Optional[bool] = None    # override td.mc_floor (Cal-QL floor on/off ablation)
+        agg_beta: float = 0.0              # >0 overrides td.agg_beta (softmax temperature sweep)
+        loader_processes: int = -1         # >=0 overrides cfg.loader_processes (0 = thread loader)
     args = tyro.cli(Args)
     cfg = get_config(args.config)
+    if args.loader_processes >= 0:
+        cfg = dataclasses.replace(cfg, loader_processes=args.loader_processes)
     if args.batch_size > 0 or args.lr > 0:
         cfg = dataclasses.replace(cfg, optim=dataclasses.replace(
             cfg.optim,
             batch_size=args.batch_size or cfg.optim.batch_size,
             lr=args.lr or cfg.optim.lr))
-    cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "")
+    if args.mc_floor is not None or args.agg_beta > 0:
+        cfg = dataclasses.replace(cfg, td=dataclasses.replace(
+            cfg.td,
+            mc_floor=cfg.td.mc_floor if args.mc_floor is None else args.mc_floor,
+            agg_beta=args.agg_beta or cfg.td.agg_beta))
+    cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "",
+                              task=args.task or cfg.task)
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 
