@@ -27,10 +27,51 @@ Design notes
 
 import glob
 import os
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, Optional, Sequence
 
 import numpy as np
 import pyarrow.parquet as pq
+
+
+_PREFETCH_SENTINEL = object()
+
+
+def prefetch(iterable, depth: int = 3):
+    """Run a batch generator in a background thread, yielding via a bounded queue.
+
+    Overlaps disk read + numpy batch assembly with the consumer (the GPU train step):
+    while the GPU computes step t, the worker prepares batch t+1. Thread-based because
+    pyarrow reads and numpy ops release the GIL, so they run concurrently with JAX
+    dispatch on the main thread. ``depth`` batches may sit in RAM (each VLA bootstrap
+    batch is ~1.2 GB due to next_candidates), so keep it small.
+
+    Exceptions from the worker propagate to the consumer; the thread is a daemon.
+    """
+    if depth <= 0:
+        yield from iterable
+        return
+    q: "queue.Queue" = queue.Queue(maxsize=depth)
+
+    def _worker():
+        try:
+            for item in iterable:
+                q.put(item)
+        except BaseException as e:                 # propagate to consumer
+            q.put(e)
+        else:
+            q.put(_PREFETCH_SENTINEL)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is _PREFETCH_SENTINEL:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
 
 # Dataset-specific constants (verified from meta/stats.json + gamma check).
 VALUE_SUPPORT = (-0.5, 0.0)      # precomputed mc_return range (gamma=0.995)
@@ -88,6 +129,7 @@ class VLALeRobotDataset:
         discount: float = DISCOUNT,
         relabel_living: Optional[float] = None,
         relabel_fail: float = -0.6,
+        num_workers: int = 8,
     ):
         """
         Args:
@@ -107,6 +149,7 @@ class VLALeRobotDataset:
         self.commander_filter = commander_filter
         self.include_base_action = include_base_action
         self.shuffle_buffer_groups = shuffle_buffer_groups
+        self.num_workers = num_workers
         self.mc_gamma = mc_gamma
         self.relabel_living = relabel_living
         self.relabel_fail = relabel_fail
@@ -249,7 +292,9 @@ class VLALeRobotDataset:
             mc = np.asarray(t["mc_return"].to_pylist(), dtype=np.float32)  # precomputed
         else:
             mc = self._compute_mc(rew, ep)                                  # recomputed
-        ba = _list_col_to_numpy(t["base_action"], BASE_ACTION_SHAPE)        # (n,32,50,14)
+        # Keep base_action as fp16 (it is stored as halffloat): skips the f32 astype (~89->5ms)
+        # and halves the next_candidates gather + host->device transfer. Cast to f32 on GPU.
+        ba = _list_col_to_numpy(t["base_action"], BASE_ACTION_SHAPE, dtype=np.float16)  # (n,32,50,14)
         cmd = t["observation.commander_state"].to_pylist()
         last_idx = self._episode_last_index(ep)
 
@@ -296,13 +341,18 @@ class VLALeRobotDataset:
         return out
 
     def iter_bootstrap_batches(self, batch_size: int, prefixes: Sequence[int],
-                               seed: int = 0, drop_last: bool = True) -> Iterator[dict]:
+                               seed: int = 0, drop_last: bool = True,
+                               shard: tuple[int, int] = (0, 1)) -> Iterator[dict]:
         """Yield AQC-TD bootstrap batches (needs ``base_action``; set it in the constructor).
 
         Args:
             batch_size: transitions per batch.
             prefixes: 1-indexed prefix lengths h to bootstrap on (the subsample grid),
                 e.g. [1, 5, 10, 20, 35, 50]. Fewer => cheaper (the H=50 cost knob).
+            shard: ``(i, n)`` -- take every n-th row-group of the shuffled work list,
+                starting at i. Used by the multiprocess loader (vla_loader) so n worker
+                processes stream DISJOINT data; the shuffle uses ``seed`` only, so all
+                shards agree on the partition. (0, 1) = everything (default).
         """
         prefixes = np.asarray(sorted(set(int(h) for h in prefixes)), dtype=np.int64)
         assert prefixes.min() >= 1 and prefixes.max() <= self.horizon
@@ -312,7 +362,19 @@ class VLALeRobotDataset:
         work = [(f, g) for f in self.files
                 for g in range(self._readers[f].metadata.num_row_groups)]
         rng.shuffle(work)
-        pool, pool_n, buf = [], 0, 0
+        si, sn = shard
+        if sn > 1:
+            work = work[si::sn]
+            rng = np.random.default_rng((seed, si))   # decorrelate pool permutations
+        pool, pool_n = [], 0
+
+        def read_form(fg):
+            # Fresh ParquetFile per read: read_row_group on a SHARED handle is not thread-safe;
+            # the footer read is cheap. pyarrow decode releases the GIL, so concurrent reads of
+            # the heavy base_action column (~828ms/group) actually parallelize across threads.
+            f, g = fg
+            t = pq.ParquetFile(f).read_row_group(g, columns=cols)
+            return self._bootstrap_samples_from_table(t, prefixes)
 
         def emit():
             nonlocal pool, pool_n
@@ -326,22 +388,28 @@ class VLALeRobotDataset:
                     yield out
             pool, pool_n = [], 0
 
-        for (f, g) in work:
-            t = self._readers[f].read_row_group(g, columns=cols)
-            s = self._bootstrap_samples_from_table(t, prefixes)
-            if s is not None:
-                pool.append(s); pool_n += len(s["valid"])
-            buf += 1
-            if buf >= self.shuffle_buffer_groups:
-                yield from emit(); buf = 0
-        yield from emit()
+        # Read shuffle_buffer_groups row-groups concurrently (num_workers threads), then emit.
+        # The executor is created AND shut down within each chunk (before any yield) so no
+        # worker threads stay alive across a yield -> avoids the abandoned-generator join error
+        # at interpreter shutdown if the loop is broken early.
+        n_workers = max(1, self.num_workers)
+        for i in range(0, len(work), self.shuffle_buffer_groups):
+            chunk = work[i:i + self.shuffle_buffer_groups]
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(chunk))) as ex:
+                samples = list(ex.map(read_form, chunk))
+            for s in samples:
+                if s is not None:
+                    pool.append(s); pool_n += len(s["valid"])
+            yield from emit()
 
     def iter_batches(self, batch_size: int, seed: int = 0,
-                     drop_last: bool = True) -> Iterator[dict]:
+                     drop_last: bool = True,
+                     shard: tuple[int, int] = (0, 1)) -> Iterator[dict]:
         """Yield shuffled training batches by streaming row-groups.
 
         Reads ``shuffle_buffer_groups`` row-groups into a pool, shuffles the pooled
         samples, and emits ``batch_size`` chunks until the pool drains, then refills.
+        ``shard=(i, n)``: stream every n-th row-group only (see iter_bootstrap_batches).
         """
         rng = np.random.default_rng(seed)
         cols = self._row_cols()
@@ -349,6 +417,10 @@ class VLALeRobotDataset:
         work = [(f, g) for f in self.files
                 for g in range(self._readers[f].metadata.num_row_groups)]
         rng.shuffle(work)
+        si, sn = shard
+        if sn > 1:
+            work = work[si::sn]
+            rng = np.random.default_rng((seed, si))   # decorrelate pool permutations
 
         pool: list[dict] = []
         pool_n = 0
