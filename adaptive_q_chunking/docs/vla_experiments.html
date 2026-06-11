@@ -3,15 +3,17 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>VLA Critic — Running Experiments</title>
+<title>VLA Critic — Experiments Log</title>
 <style>
   :root{--fg:#1c2330;--muted:#5b6776;--bg:#fff;--soft:#f5f7fa;--line:#e2e8f0;--accent:#2563eb;--good:#127a3d;--warn:#b4690e;}
   *{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--fg);background:var(--bg);max-width:980px;margin:0 auto;padding:28px 24px 60px;line-height:1.6;}
   h1{font-size:23px;margin:0 0 2px} h2{font-size:18px;margin:26px 0 6px;padding-top:12px;border-top:2px solid var(--line)}
+  h3{font-size:15px;margin:16px 0 4px;color:#334155}
   .sub{color:var(--muted);margin:0 0 16px;font-size:14px}
   .badge{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:4px}
-  .badge.run{background:#dcfce7;color:var(--good)} .badge.plan{background:#e0f2fe;color:#0369a1} .badge.todo{background:#fef3c7;color:#92400e}
+  .badge.run{background:#dcfce7;color:var(--good)} .badge.plan{background:#e0f2fe;color:#0369a1}
+  .badge.todo{background:#fef3c7;color:#92400e} .badge.paused{background:#f1f5f9;color:#64748b}
   code{background:var(--soft);padding:1px 5px;border-radius:4px;font-size:88%;font-family:ui-monospace,Menlo,Consolas,monospace}
   pre{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:10px 14px;overflow-x:auto;font-size:12.5px;line-height:1.5}
   table{border-collapse:collapse;width:100%;margin:10px 0;font-size:13px}
@@ -25,79 +27,121 @@
 <body>
 <h1>VLA Critic — Experiments Log</h1>
 <div class="box">📌 <b>이 파일 = VLA critic 실험의 단일 정본(canonical log).</b> 새 실험·결과는 전부 여기에
-(compact 표 + 섹션). 짝: OGBench는 <code>adaptive_q_chunking/qc/ogbench_experiments.html</code>.
-설계 rationale(reward_value_design / bootstrap_aggregation / run_management)은 별개.</div>
-<p class="sub">frozen-Pi0.5 latent에 대한 AQC distributional critic 학습. 현재 <b>argmax vs softmax × task</b> 비교 중.</p>
-
-<div class="box"><b>공통 세팅</b>: distributional HL-Gauss <b>a201</b>, support <b>[-1,0]</b> ·
-H=50, macro_group=10 (5 macro-tokens) · N=32 candidates · γ=0.999 · <b>mc_floor=on</b> (Cal-QL) ·
-reward relabel(living −4e-4, fail −0.5) in-place 완료 · B=256 · 500k offline · prefetch on.
-<b>W&amp;B</b>: <code>RSS-PFT_RLLAB / rlt_critic_learning</code> (group=registry key, run name에 task·agg 태그).</div>
+(표 한 줄 + 섹션). 짝: OGBench는 <code>adaptive_q_chunking/qc/ogbench_experiments.html</code>.
+설계 rationale은 별개 (<code>reward_value_design.html</code> · <code>bootstrap_aggregation.html</code> · <code>run_management.html</code>).</div>
+<p class="sub">frozen-Pi0.5 latent에 대한 AQC distributional critic 학습 (offline, 롤아웃 없음 —
+eval = trajectory value-curve vs mc_return).</p>
 
 <!-- ============================================================ -->
-<h2>2×2 (task × aggregation)</h2>
+<h2>실험 목록</h2>
 <table>
-<tr><th></th><th>argmax (max, BoN)</th><th>softmax (β=4)</th></tr>
-<tr><td><b>insert-mouse-battery</b></td>
-    <td class="c"><span class="badge run">RUNNING</span><br>~45k</td>
-    <td class="c"><span class="badge run">RUNNING</span><br>~46k</td></tr>
-<tr><td><b>seal-water-bottle-cap</b></td>
-    <td class="c"><span class="badge run">RUNNING</span><br>~75k</td>
-    <td class="c"><span class="badge plan">제출 예정</span><br>(아래 커맨드)</td></tr>
+<tr><th>ID</th><th>날짜</th><th>질문</th><th>grid</th><th>reward</th><th>상태</th></tr>
+<tr>
+  <td><b>V2</b></td><td>06-12~</td>
+  <td>Cal-QL <b>mc_floor</b>가 VLA(v3)에서도 해로운가? (OGBench에선 해로움)</td>
+  <td>task{mouse,seal} × mc_floor{off,on} = <b>4</b> (전부 argmax)</td>
+  <td><b>v3</b> (γ=0.9999)</td>
+  <td><span class="badge plan">시작 준비됨</span></td>
+</tr>
+<tr>
+  <td><b>V1</b></td><td>06-11~12</td>
+  <td>task × {argmax, softmax β4} (mc_floor on 고정)</td>
+  <td>task{mouse,seal} × agg{max,softmax4} = 4</td>
+  <td>v1 (γ=0.999)</td>
+  <td><span class="badge paused">PAUSED @200k–275k</span></td>
+</tr>
 </table>
-<p class="muted">전부 mc_floor=on, β(softmax)=4. run_name: <code>&lt;task&gt;_a201_..._[softmax4_]mcfloor_s0</code>.
-liveness는 W&amp;B에서 확인 (scratch mtime은 캐시로 지연 보일 수 있음).</p>
 
-<h3>커맨드</h3>
+<!-- ============================================================ -->
+<h2>V2 — v3 reward × Cal-QL mc_floor 2×2 <span class="badge plan">시작 준비됨</span></h2>
+
+<div class="box"><b>질문.</b> OGBench task4/5 ablation에선 mc_floor가 <b>명확히 해로웠다</b>
+(top-RTG state가 value 인플레의 씨앗이 되고 N×H max-bootstrap이 증폭 — <code>qc/ogbench_experiments.html</code> 분석).
+<b>VLA v3 데이터에선 다를 수 있나?</b> 실로봇 데이터 + v3의 깊은 failure 신호 + 다른 RTG 분포 → 직접 검증.
+softmax variant는 <b>추가 논의 후로 보류</b> (preset β20은 registry에 보존).</div>
+
+<h3>세팅</h3>
+<div class="box">데이터 <b><code>*_annotated_v3</code></b>: living −1 raw, C_fail=0.4·T_max, γ=0.9999,
+전역 /Z normalize → [−1,0] (mouse: C_fail 4000, Z 7548 / seal: 6315, 9033 — 상세
+<code>reward_value_design.html</code>) · 컬럼 <code>unnormalized_reward / reward / mc_return</code> ·
+distributional a201 · support [−1,0] · H=50/macro10 · N=32 · <b>argmax</b> bootstrap · B=256 · 500k ·
+prefetch on · <b>W&amp;B</b> <code>RSS-PFT_RLLAB / rlt_critic_learning</code>.</div>
+
+<table>
+<tr><th></th><th>mc_floor OFF (TD)</th><th>mc_floor ON (Cal-QL)</th></tr>
+<tr><td><b>insert-mouse-battery</b></td>
+    <td class="c"><span class="badge plan">준비</span><br><code>insert-mouse-battery_a201_..._g0.9999_s0</code></td>
+    <td class="c"><span class="badge plan">준비</span><br><code>insert-mouse-battery_a201_..._g0.9999_mcfloor_s0</code></td></tr>
+<tr><td><b>seal-water-bottle-cap</b></td>
+    <td class="c"><span class="badge plan">준비</span><br><code>seal-water-bottle-cap_a201_..._g0.9999_s0</code></td>
+    <td class="c"><span class="badge plan">준비</span><br><code>seal-water-bottle-cap_a201_..._g0.9999_mcfloor_s0</code></td></tr>
+</table>
+
+<h3>커맨드 (4개, 각각 별도 GPU tmux — 전부 <code>vla_aqc_td_macro</code>)</h3>
 <pre>cd /home/gwanwoo13/projects/rss_ptf/openpi-baseline_RLLAB/adaptive_q_chunking
 
-# argmax (max)
-uv run --no-sync python vla_train.py --config vla_aqc_td_macro          --task insert-mouse-battery
-uv run --no-sync python vla_train.py --config vla_aqc_td_macro          --task seal-water-bottle-cap
-# softmax (β=4)
-uv run --no-sync python vla_train.py --config vla_aqc_td_macro_softmax  --task insert-mouse-battery
-uv run --no-sync python vla_train.py --config vla_aqc_td_macro_softmax  --task seal-water-bottle-cap   # ← 추가할 4번째</pre>
+uv run --no-sync python vla_train.py --config vla_aqc_td_macro --task insert-mouse-battery
+uv run --no-sync python vla_train.py --config vla_aqc_td_macro --task insert-mouse-battery  --mc_floor True
+uv run --no-sync python vla_train.py --config vla_aqc_td_macro --task seal-water-bottle-cap
+uv run --no-sync python vla_train.py --config vla_aqc_td_macro --task seal-water-bottle-cap --mc_floor True</pre>
+<p class="muted">mc_floor 기본=False → ON은 <code>--mc_floor True</code> (run_name <code>mcfloor</code> 태그 자동).
+<code>g0.9999</code> 태그로 v1 dir/W&amp;B와 충돌 없음. loader smoke test 통과 (terminal 검출 −0.53/−0.70,
+cum_reward 스케일, mc ⊂ [−1,0] — 06-12).</p>
 
-<!-- ============================================================ -->
-<h2>볼 지표 (W&amp;B)</h2>
+<h3>볼 지표 (W&amp;B)</h3>
 <table>
-<tr><th>지표</th><th>의미</th></tr>
-<tr><td><b>eval/value_curves</b> (10k마다, 이미지)</td><td>성공/실패 traj에서 critic Q vs mc_return 곡선. <b>본 정성평가</b> (롤아웃 없음)</td></tr>
-<tr><td><code>train/critic_loss</code></td><td>HL-Gauss CE, ↓ 수렴</td></tr>
-<tr><td><code>train/q_mean</code> / <code>target_mean</code> / <code>v_next_mean</code></td><td>−0.3~−0.4 안정. softmax면 v_next가 max보다 낮음(conservative). (q_mean 2× 버그 수정됨)</td></tr>
-<tr><td><code>train/mc_floor_frac</code> / <code>_gap</code></td><td>Cal-QL floor binding 비율/양. 초기↑→↓(self-release)</td></tr>
+<tr><th>지표</th><th>의미 / 기대 (v3 스케일)</th></tr>
+<tr><td><b>eval/value_curves</b> (10k마다, 고정 6 episode)</td><td>success: mc −0.3~−0.9 → 0 상승 / failure: 시작부터 깊고(median −0.67/−0.80) terminal −0.53/−0.70. <b>v1과 달리 failure 곡선이 평평하면 안 됨</b> — v3 설계의 핵심 검증</td></tr>
+<tr><td><code>train/mc_floor_frac</code> / <code>_gap</code></td><td><b>핵심 관찰점</b> (mcfloor run): 초기↑→↓(self-release)가 정상. OGBench 실패 패턴 = 초반 몇 k step에 <code>q_mean</code>이 mc 평균 위로 점프(인플레 씨앗) — 재현되는지. OFF run은 =0</td></tr>
+<tr><td><code>train/q_mean·target_mean·v_next_mean</code></td><td>v3는 value 분포가 넓음 (시작 −0.3~−1.0) → 평균 ~−0.5 부근에서 안정. ON/OFF 간 초반 궤적 차이 비교</td></tr>
 <tr><td><code>train/dist_target_oob</code>(=0) / <code>prefix_spread</code>(&gt;0)</td><td>support fit / chunk-length 신호</td></tr>
 </table>
 
+<h3>결과</h3>
+<div class="box warn"><b>TODO</b> — ① mc_floor ON vs OFF: 초반 value 인플레(OGBench 패턴) 재현 여부,
+mc_floor_frac self-release, 수렴 후 calibration(value_curves가 mc를 따라가는지).
+② v3 자체 검증: failure 곡선이 시작부터 분리되는지 (v1 대비). ③ 결론 → softmax 논의 재개 여부.</div>
+
 <!-- ============================================================ -->
-<h2>추후 돌릴 후보</h2>
+<h2>V1 — v1 reward, task × aggregation <span class="badge paused">PAUSED (06-12, resume 가능)</span></h2>
+<p class="muted">v1 스킴(γ=0.999, living −4e-4, fail −0.5, <b>mc_floor on 고정</b>, softmax β4)으로 돌리던
+4개 run을 v3 전환을 위해 중단. checkpoint·v1 데이터(<code>*_annotated</code>) 모두 보존 — 언제든 resume 가능.</p>
+
 <table>
-<tr><th>#</th><th>실험</th><th>왜</th><th>커맨드 / 상태</th></tr>
-<tr><td>C1</td><td><b>seal + softmax</b></td><td>2×2 완성 (지금 3/4)</td>
-    <td><code>--config vla_aqc_td_macro_softmax --task seal-water-bottle-cap</code> <span class="badge plan">바로</span></td></tr>
-<tr><td>C2</td><td><b>mc_floor ablation</b> (off vs on)</td><td>지금 전부 on이라 Cal-QL 효과 baseline 없음. off 1개 돌려 비교</td>
-    <td><code>--config vla_aqc_td_macro --task insert-mouse-battery --mc_floor False</code></td></tr>
-<tr><td>C3</td><td><b>softmax β-sweep</b> {1,4,10,20}</td><td>[-1,0]서 best β (β=1≈mean, β↑≈max). 지금 4 한 점만 봄</td>
-    <td><code>--config vla_aqc_td_macro_softmax --agg_beta 10</code> 등 (OGBench E2와 동일 motivation)</td></tr>
-<tr><td>C4</td><td><b>batch 1024</b></td><td>큰 batch 효과 (느린 학습 가속/안정)</td>
-    <td><code>--config vla_aqc_td_macro --batch_size 1024 --lr 6e-4</code></td></tr>
-<tr><td>C5</td><td><b>3번째 task (tower-of-hanoi)</b></td><td>전 task 커버</td>
-    <td><span class="badge todo">대기</span> rl_token annotation 먼저 (아직 _annotated 없음)</td></tr>
-<tr><td>C6</td><td><b>capacity</b> (small/large/stateenc)</td><td>critic 용량/state-encoder 영향</td>
-    <td><code>--config vla_aqc_td_a51_small</code> / <code>_large</code> / <code>_stateenc</code> (<code>--exp_name</code> 필요)</td></tr>
+<tr><th>run dir (<code>/scratch/gwanwoo13/rss_pft/phase1/critic_learning/&lt;config&gt;/</code>)</th><th>config</th><th>마지막 ckpt</th></tr>
+<tr><td><code>insert-mouse-battery_a201_..._g0.999_mcfloor_s0</code></td><td>vla_aqc_td_macro</td><td class="c"><b>250k</b></td></tr>
+<tr><td><code>seal-water-bottle-cap_a201_..._g0.999_mcfloor_s0</code></td><td>vla_aqc_td_macro</td><td class="c"><b>275k</b></td></tr>
+<tr><td><code>insert-mouse-battery_a201_..._g0.999_softmax4_mcfloor_s0</code></td><td>vla_aqc_td_macro_softmax</td><td class="c"><b>250k</b></td></tr>
+<tr><td><code>seal-water-bottle-cap_a201_..._g0.999_softmax4_mcfloor_s0</code></td><td>vla_aqc_td_macro_softmax</td><td class="c"><b>200k</b></td></tr>
 </table>
-<div class="box"><b>우선순위 제안</b>: C1(2×2 완성) → C2(Cal-QL 효과 격리) → C3(β-sweep). C4/C6는 task별 best 세팅
-정해진 뒤. C5는 hanoi annotation 후. <br>
-<span class="muted">override flag 추가됨: <code>--mc_floor True/False</code>, <code>--agg_beta &lt;f&gt;</code>, <code>--batch_size</code>, <code>--lr</code>, <code>--task</code>, <code>--seed</code>, <code>--exp_name</code>.</span></div>
+
+<h3>v1 resume recipe (run_name 일치해야 dir를 찾음)</h3>
+<pre># vla_config.py를 v1 상태로 임시 되돌리기 (4곳):
+#   1) TASKS 경로: *_annotated_v3  ->  *_annotated
+#   2) TDConfig.discount = 0.999
+#   3) TDConfig.mc_floor = True
+#   4) softmax preset agg_beta = 4.0   (softmax run 재개 시)
+uv run --no-sync python vla_train.py --config vla_aqc_td_macro --task insert-mouse-battery --resume
+# (나머지 3개 동일 패턴; 끝나면 config 원복!)</pre>
+<p class="muted">주의: q_mean 2× 버그 수정(06-11)이 run 중간에 들어가 W&amp;B q_mean 곡선은 수정 전(×2)/후 혼재.
+기타 stale dir (<code>a201_..._mcfloor_s0</code> 0step · <code>a201_..._softmax4_mcfloor_s0</code> 100k(task태그 이전) ·
+<code>b32</code> 테스트)는 삭제 가능.</p>
 
 <!-- ============================================================ -->
-<h2>결과 <span class="muted">(채울 것)</span></h2>
-<div class="box warn"><b>TODO</b> — 2×2 (task × argmax/softmax) 수렴 후: value_curves 정성비교 (성공 traj가 0/−0.4,
-실패가 −0.5로 가는지), q_vs_mc 정렬도, softmax가 max 대비 overestimation 줄이는지. β-sweep best β.</div>
+<h2>추후 후보</h2>
+<table>
+<tr><th>#</th><th>실험</th><th>비고</th></tr>
+<tr><td>C1</td><td><b>softmax bootstrap</b> (β20, 보류 중)</td><td>논의 후 재개. preset <code>vla_aqc_td_macro_softmax</code>(β20, OGBench E2 best) 준비돼 있음; β sweep은 <code>--agg_beta</code></td></tr>
+<tr><td>C2</td><td>batch 1024</td><td><code>--batch_size 1024 --lr 6e-4</code></td></tr>
+<tr><td>C3</td><td>tower-of-hanoi (3rd task)</td><td><span class="badge todo">대기</span> rl_token annotation + v3 reward 필요</td></tr>
+<tr><td>C4</td><td>capacity (small/large/stateenc)</td><td>best 세팅 확정 후</td></tr>
+<tr><td>C5</td><td>seed 1 반복</td><td>V2 결론 확인용 (<code>--seed 1</code>)</td></tr>
+</table>
 
-<p class="muted">코드: <code>vla_config.py</code>(TASKS·CONFIGS), <code>vla_train.py</code>(override flags),
-<code>vla_aqc.py</code>(agg_mode·mc_floor), <code>vla_eval.py</code>(value_curves).
-설계 문서: <code>docs/reward_value_design.html</code>, <code>bootstrap_aggregation.html</code>, <code>run_management.html</code>.</p>
+<p class="muted">코드: <code>vla_config.py</code> (TASKS·CONFIGS) · <code>vla_train.py</code> (override:
+--task --seed --batch_size --lr --mc_floor --agg_beta --resume) · <code>vla_aqc.py</code> ·
+<code>vla_eval.py</code> · <code>vla_eval_videos.py</code> (v3엔 meta/videos 미복사 — 영상 필요 시 meta 복사+videos symlink).
+설계: <code>reward_value_design.html</code>(v3 canonical) · <code>bootstrap_aggregation.html</code> · <code>run_management.html</code>.</p>
 
 </body>
 </html>
