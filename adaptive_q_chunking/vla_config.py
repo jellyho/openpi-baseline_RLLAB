@@ -72,7 +72,9 @@ class DistConfig:
 @dataclass(frozen=True)
 class TDConfig:
     """MC-return / multi-step TD bootstrap (the ACSAC expected-prefix-max)."""
-    discount: float = 0.999         # long-horizon task; effective horizon 1/(1-g)=1000 steps
+    discount: float = 0.9999        # near-undiscounted (v2 annotation): value ~ normalized
+                                    # steps-to-go + failure penalty; matches the re-annotated
+                                    # mc_return column (gamma=0.9999, globally /Z normalized)
     # Target kind:
     #   'td' -> per-prefix multi-step TD with the N-candidate joint-max bootstrap (paper)
     #   'mc' -> regress directly to precomputed mc_return (RECAP-style baseline; no bootstrap)
@@ -109,11 +111,10 @@ class TDConfig:
     agg_mode: Literal["max", "softmax", "mellowmax"] = "max"
     agg_beta: float = 4.0
     # Cal-QL-style MC floor on the TD target: target = max(td_target, mc_return(start state)).
-    # Lower-bounds the value by the realized behavior return V^beta(s) -> boosts early/over-
-    # pessimistic TD estimates up to the achievable return and injects the terminal/return signal
-    # densely (counters slow propagation from sparse terminals). Valid (Q* >= V^beta), self-
-    # releases once TD >= mc. Default on; set False to ablate.
-    mc_floor: bool = True
+    # Default OFF: the OGBench task4/5 ablation (qc/ogbench_experiments.html, 06-12) showed the
+    # floor is harmful -- the top-RTG states seed an early value inflation that the NxH max-
+    # bootstrap amplifies (task4 success 0%). Keep available for ablation via --mc_floor True.
+    mc_floor: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,13 +122,11 @@ class RewardConfig:
     """Reward shaping for the value scale (interacts with DistConfig.support_mode)."""
     reward_normalize: bool = False  # scale rewards so return-to-go lands in [-1, 0]
     support_margin: float = 0.05    # margin for 'data' support / normalization
-    # In-loader relabel of the raw reward column. NOW DISABLED (=None): the dataset was
-    # re-annotated IN PLACE (data_annoation/reward_annotate.py) so the disk already holds
-    # living=-4e-4, success=0.0, failure=-0.5, and mc_return at gamma=0.999. Applying the
-    # x4 relabel again would DOUBLE it (-4e-4 -> -1.6e-3). Keep None unless pointing the
-    # loader at a fresh raw dataset (then set relabel_living=-4e-4, relabel_fail=-0.5).
-    relabel_living: Optional[float] = None    # disk already relabeled; None = use as-is
-    relabel_fail: float = -0.5                # only used if relabel_living is set
+    # In-loader relabel of the raw reward column. DISABLED (=None): the v3 datasets already
+    # hold the final normalized values on disk (reward = unnormalized_reward / Z, mc_return
+    # at gamma=0.9999; see data_annoation/reward_annotate.py). Never re-relabel v3 data.
+    relabel_living: Optional[float] = None    # disk already final; None = use as-is
+    relabel_fail: float = -0.5                # only used if relabel_living is set (legacy)
 
 
 @dataclass(frozen=True)
@@ -146,9 +145,12 @@ class OptimConfig:
 # ---------------------------------------------------------------------------
 _DATA_BASE = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset"
 TASKS = {
-    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated",   # ready (relabeled)
-    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated",  # ready (relabeled)
-    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated",    # NOT annotated yet
+    # v3 annotation (current): raw living=-1 / C_fail=0.4*T_max, gamma=0.9999, globally
+    # normalized into [-1,0]; columns unnormalized_reward / reward / mc_return.
+    # See docs/reward_value_design.html. v1 data stays at *_annotated (paused g0.999 runs).
+    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated_v3",   # ready (v3)
+    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated_v3",  # ready (v3)
+    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated_v3",    # NOT annotated yet
 }
 
 
@@ -304,15 +306,15 @@ _CONFIGS = [
                     prefixes=(10, 20, 30, 40, 50)),
     ),
     # Soft-aggregation variant: conservative bootstrap via Boltzmann softmax over the
-    # N x prefix Q's instead of hard max (Best-of-N). beta=4 = mild conservatism at our
-    # [-1,0] scale. Ablation against vla_aqc_td_macro (max) for offline overestimation.
+    # N x prefix Q's instead of hard max (Best-of-N). beta=20 per the OGBench E2 beta-sweep
+    # (qc/ogbench_experiments.html: beta 1~5 ~ mean -> collapse, beta=20 best, >= argmax).
     VLAAQCConfig(
         name="vla_aqc_td_macro_softmax",
-        notes="AQC-TD macro with softmax(beta=4) bootstrap aggregation (conservative vs max). "
-              "Compare against vla_aqc_td_macro to test offline overestimation.",
+        notes="AQC-TD macro with softmax(beta=20) bootstrap aggregation (soft Best-of-N). "
+              "Compare against vla_aqc_td_macro (max) for offline overestimation.",
         td=TDConfig(target_kind="td", macro_group_size=10,
                     prefixes=(10, 20, 30, 40, 50),
-                    agg_mode="softmax", agg_beta=4.0),
+                    agg_mode="softmax", agg_beta=20.0),
     ),
     # MC baseline: regress directly to mc_return (no bootstrap). Cheap stability sanity check.
     VLAAQCConfig(
