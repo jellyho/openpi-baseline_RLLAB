@@ -98,7 +98,7 @@ class VLACriticTrainer:
         """
         M, N, Hd = candidates.shape
         states = jnp.repeat(next_latents, N, axis=0)             # (M*N, latent)
-        chunks = candidates.reshape(M * N, Hd)                   # (M*N, H*action_dim)
+        chunks = candidates.reshape(M * N, Hd).astype(jnp.float32)  # fp16 from loader -> f32 (cheap on GPU)
         qs = self._prefix_values(params, states, chunks)        # (K, M*N, macro_H)
         q = qs.min(axis=0)                                       # ensemble min -> (M*N, macro_H)
         return self._aggregate(q.reshape(M, N * q.shape[-1]))   # (M,) over (candidate, prefix)
@@ -133,14 +133,13 @@ class VLACriticTrainer:
             if cfg.td.terminal_uses_mc else vmax
 
         gamma_h = cfg.td.discount ** prefixes.astype(jnp.float32)  # (P,)
-        target = batch["cum_reward"] + gamma_h[None, :] * batch["valid"] * v_next
-        # Cal-QL-style MC floor: value can't be below the realized behavior return V^beta(s_i)
-        # (mc_return at the start state). Boosts early/under-estimated TD targets up to the
-        # achievable return (and injects the terminal signal densely vs sparse-terminal TD).
-        # Valid lower bound since Q* >= V^beta; self-releases once TD >= mc. Broadcast over prefix.
-        if cfg.td.mc_floor:
-            target = jnp.maximum(target, batch["mc_return"][:, None])
+        td_target = batch["cum_reward"] + gamma_h[None, :] * batch["valid"] * v_next
+        mc_col = batch["mc_return"][:, None]                       # (B,1) realized behavior return
+        target = jnp.maximum(td_target, mc_col) if cfg.td.mc_floor else td_target
         target = jax.lax.stop_gradient(target)                   # (B,P)
+        # Cal-QL floor diagnostics: how often mc_return wins the max (floor binds) and by how much.
+        floor_gap = jnp.maximum(mc_col - td_target, 0.0)         # (B,P) lift applied where >0
+        floor_active = (floor_gap > 0).astype(jnp.float32)
 
         tgt_probs = self.to_probs(target[..., None])             # (B,P,atoms)
         ce = categorical_cross_entropy(pred, tgt_probs[None])    # (K,B,P)
@@ -161,6 +160,11 @@ class VLACriticTrainer:
             "v_next_mean": v_next.mean(),
             "term_frac": batch["term"].mean(),
             "valid_frac": batch["valid"].mean(),
+            # Cal-QL MC floor: fraction of valid targets where mc_return raises the TD target,
+            # and the mean lift it applies (0 if mc_floor off -> just shows how often mc > td).
+            "mc_floor_frac": (floor_active * batch["valid"]).sum() / vsum,
+            "mc_floor_gap": (floor_gap * batch["valid"]).sum() / vsum,
+            "mc_return_mean": (mc_col * batch["valid"]).sum() / vsum,
             "prefix_spread": (q.max(0).max(-1) - q.max(0).min(-1)).mean(),
             "dist_edge_mass": edge.mean(),
             "dist_target_oob": ((target < cfg.dist.v_min) | (target > cfg.dist.v_max)).mean(),
