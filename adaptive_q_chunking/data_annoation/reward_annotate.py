@@ -41,14 +41,18 @@ import pyarrow.parquet as pq
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-INPUT_ROOT  = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/insert-mouse-battery_annotated"
-OUTPUT_ROOT = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/insert-mouse-battery_annotated_v2"
+INPUT_ROOT  = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/seal-water-bottle-cap_annotated"
+OUTPUT_ROOT = "/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/seal-water-bottle-cap_annotated_v2"
 
-RELABEL_LIVING = -4e-4   # was -1e-4
+# Living is "-1/step then normalized per task", so the RAW value differs by task
+# (mouse-battery: -1e-4 = -1/2500 area; seal: -9.015e-5 = -1/11093). We rescale every
+# task's living to the SAME target RELABEL_LIVING; the scale is computed from the data's
+# actual living value (below), not hardcoded -- so only the path needs changing per task.
+RELABEL_LIVING = -4e-4   # target living after relabel (gives success-start ~ -0.40 @ gamma=0.999)
 RELABEL_FAIL   = -0.5    # keep; raw -0.5 -> -0.5  (no change to C_fail)
 MC_GAMMA       = 0.999   # was 0.995
 
-# terminal detection: reward in {0.0, -0.5}; living is -1e-4 / -4e-4
+# terminal detection: reward in {0.0, -0.5}; living is a small negative (-9e-5 / -1e-4 / -4e-4)
 _TERMINAL_THRESH = -0.05  # reward <= this -> failure terminal; >= -1e-6 -> success terminal
 
 
@@ -58,11 +62,14 @@ _TERMINAL_THRESH = -0.05  # reward <= this -> failure terminal; >= -1e-6 -> succ
 def relabel_reward(rew: np.ndarray) -> np.ndarray:
     """Map raw reward -> new scale. In-place safe; returns float32 array."""
     out = rew.copy().astype(np.float32)
-    living_mask  = (rew > _TERMINAL_THRESH) & (rew < -1e-6)   # -1e-4 living cost
+    living_mask  = (rew > _TERMINAL_THRESH) & (rew < -1e-6)     # the (small) living cost
     failure_mask = rew <= _TERMINAL_THRESH                      # -0.5 failure terminal
     success_mask = rew >= -1e-6                                 # 0.0  success terminal
-    # scale living cost; terminals stay as configured
-    scale = RELABEL_LIVING / -1e-4                              # 4.0 for -4e-4
+    # Task-agnostic: scale the DATA's actual living value to RELABEL_LIVING (living is
+    # -1/step normalized per task -> raw value differs: mouse=-1e-4, seal=-9.015e-5).
+    # median is robust; falls back to -1e-4 if no living frames in this shard.
+    actual_living = float(np.median(rew[living_mask])) if living_mask.any() else -1e-4
+    scale = RELABEL_LIVING / actual_living                     # mouse->1.0, seal->4.44, etc.
     out[living_mask]  = (rew[living_mask] * scale).astype(np.float32)
     out[failure_mask] = np.float32(RELABEL_FAIL)
     out[success_mask] = np.float32(0.0)
@@ -124,11 +131,6 @@ def _already_relabeled(rew_raw: np.ndarray) -> bool:
 
 def process_file(src_path: Path, dst_path: Path, dry_run: bool = False) -> dict:
     """Relabel reward + recompute mc_return for one parquet file.
-
-    Writes atomically: build ``<dst>.tmp`` in the same directory, then os.replace()
-    over ``dst``. When dst == src this is a safe in-place update — the original is
-    never left half-written even if the job dies (rl_token/base_action are expensive
-    to regenerate, so the original must be protected).
     """
     inplace = (dst_path.resolve() == src_path.resolve())
     dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,7 +189,8 @@ def process_file(src_path: Path, dst_path: Path, dry_run: bool = False) -> dict:
     print(f"[{tag}] pass2 : writing {tmp_path.name}  (0%)", flush=True)
     row_offset = 0
     writer = None
-    next_pct = 10                       # emit a full progress line every +10%
+    PRINT_EVERY = 15.0                  # seconds between progress lines (steady cadence)
+    last_print = time.time()
     try:
         for g in range(n_groups):
             table = pf.read_row_group(g)    # full row-group (all columns)
@@ -200,15 +203,17 @@ def process_file(src_path: Path, dst_path: Path, dry_run: bool = False) -> dict:
                 writer = pq.ParquetWriter(tmp_path, table.schema, compression=comp)
             writer.write_table(table)
             row_offset += n_g
-            # Full self-identifying line so the 4 concurrent workers stay readable.
-            pct = (g + 1) * 100 // n_groups
-            if pct >= next_pct or g + 1 == n_groups:
-                elapsed = time.time() - t0
+            # Time-throttled, full self-identifying line so the 4 concurrent workers stay readable.
+            now = time.time()
+            if now - last_print >= PRINT_EVERY or g + 1 == n_groups:
+                elapsed = now - t0
+                pct = (g + 1) * 100 // n_groups
                 eta = elapsed * (n_groups - (g + 1)) / (g + 1)
-                print(f"[{tag}] pass2 : {pct:3d}%  ({g+1:>4}/{n_groups} rg, "
+                bar = "#" * (pct // 5) + "-" * (20 - pct // 5)     # 20-char ascii bar
+                print(f"[{tag}] pass2 [{bar}] {pct:3d}%  ({g+1:>4}/{n_groups} rg, "
                       f"{row_offset:,}/{total_rows:,} rows)  elapsed={elapsed:.0f}s eta={eta:.0f}s",
                       flush=True)
-                next_pct = pct - (pct % 10) + 10
+                last_print = now
         if writer:
             writer.close()
             writer = None
@@ -266,7 +271,7 @@ def main():
     print(f"=== reward_annotate ===")
     print(f"input   : {src_root}")
     print(f"output  : {dst_root}" + ("  (IN-PLACE — overwrites originals)" if args.inplace else ""))
-    print(f"relabel : living {-1e-4} -> {RELABEL_LIVING},  fail {-0.5} -> {RELABEL_FAIL}")
+    print(f"relabel : living (data-detected) -> {RELABEL_LIVING},  fail -0.5 -> {RELABEL_FAIL}")
     print(f"gamma   : {MC_GAMMA}  (was 0.995)")
     print(f"files   : {len(src_files)}")
     print(f"workers : {args.workers}  (each file is independent; bottleneck = lustre write)")

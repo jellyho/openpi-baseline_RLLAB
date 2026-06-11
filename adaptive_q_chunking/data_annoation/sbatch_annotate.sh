@@ -34,7 +34,9 @@ echo ""
 # activate the venv used by this project
 source /home/gwanwoo13/projects/rss_ptf/openpi-baseline_RLLAB/.venv/bin/activate
 
-INPUT="/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/insert-mouse-battery_annotated"
+# Dataset to relabel in-place. Pass as the 1st arg, else default to seal (task2).
+# (task1 insert-mouse-battery already done; guard would skip it anyway.)
+INPUT="${1:-/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/seal-water-bottle-cap_annotated}"
 
 # In-place: overwrites reward/mc_return in the original files (atomic temp+rename).
 # Only the two scalar columns change; rl_token/base_action are preserved as-is.
