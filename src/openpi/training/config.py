@@ -956,6 +956,35 @@ _CONFIGS = [
         num_workers=64,
         save_interval=20_000,
     ),
+    # Single-forward (joint) RLT for the tower-of-hanoi task.  Same recipe as the
+    # vanilla pi05_tower-of-hanoi-game_rlt, but the RL token is sourced from the
+    # image-token hidden states of the full pi_vla forward (language-conditioned),
+    # so annotation runs the backbone once.  NOT checkpoint-compatible with the
+    # vanilla Pi0RLT — train fresh.
+    TrainConfig(
+        name="pi05_tower-of-hanoi-game_rlt_joint",
+        model=pi0_rlt.Pi0RLTJointConfig(pi05=True),
+        # Reuse the bc_ft's norm stats (identical dataset + transforms) so RLT
+        # training does NOT recompute them.  Without this, the default asset dir
+        # (./assets/pi05_tower-of-hanoi-game_rlt_joint) is empty → norm_stats=None.
+        data=dataclasses.replace(
+            _dualyam_data("tower-of-hanoi-game"),
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_tower-of-hanoi-game_bc_ft",
+                asset_id="jellyho/tower-of-hanoi-game_rl_224",
+            ),
+        ),
+        # Freeze on the LOCAL hanoi bc_ft final checkpoint (150k-step run,
+        # 0-indexed final step → 149999).
+        weight_loader=weight_loaders.AlphaFlowWeightLoader(
+            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_tower-of-hanoi-game_bc_ft/pi05_tower-of-hanoi-game_bc_ft/149999/params"
+        ),
+        lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
+        num_train_steps=100_000,
+        batch_size=256,
+        num_workers=64,
+        save_interval=20_000,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

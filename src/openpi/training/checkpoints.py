@@ -117,11 +117,40 @@ def restore_state(
     return _merge_params(restored["train_state"], restored["params"])
 
 
-def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    norm_stats_dir = epath.Path(assets_dir) / asset_id
-    norm_stats = _normalize.load(norm_stats_dir)
-    logging.info(f"Loaded norm stats from {norm_stats_dir}")
-    return norm_stats
+def load_norm_stats(checkpoint_dir: epath.Path | str, asset_id: str | None) -> dict[str, _normalize.NormStats] | None:
+    """Load a checkpoint's norm stats, searching the locations save_state may use.
+
+    ``save_state`` writes ``norm_stats.json`` reliably under ``params/<asset_id>/``
+    (the self-contained copy committed after the params item lands) and, via the
+    async "assets" item, under ``assets/<asset_id>/``.  The assets copy can be empty
+    (async/raced), so we look in ``params/`` FIRST.  Each ``<asset_id>`` dir also has
+    a folder-less fallback (``norm_stats.json`` sitting directly in ``params/`` /
+    ``assets/`` / the checkpoint root) for backward compatibility with checkpoints
+    saved without the asset-id nesting.
+
+    ``checkpoint_dir`` is the checkpoint STEP dir (the one containing ``params/`` and
+    ``assets/``).
+    """
+    checkpoint_dir = epath.Path(checkpoint_dir)
+    candidates: list[epath.Path] = []
+    if asset_id is not None:
+        candidates += [
+            checkpoint_dir / "params" / asset_id,   # step dir → self-contained copy (reliable; checked first)
+            checkpoint_dir / asset_id,              # base_dir already an assets dir (legacy callers)
+            checkpoint_dir / "assets" / asset_id,   # step dir → "assets" item (may be empty if async-raced)
+        ]
+    # Folder-less fallbacks (backward compat: norm_stats.json with no <asset_id> dir).
+    candidates += [checkpoint_dir / "params", checkpoint_dir, checkpoint_dir / "assets"]
+
+    for norm_stats_dir in candidates:
+        if (norm_stats_dir / "norm_stats.json").exists():
+            logging.info(f"Loaded norm stats from {norm_stats_dir}")
+            return _normalize.load(norm_stats_dir)
+
+    raise FileNotFoundError(
+        f"norm_stats.json not found in checkpoint {checkpoint_dir} "
+        f"(searched: {', '.join(str(c) for c in candidates)})."
+    )
 
 
 class Callback(Protocol):

@@ -50,7 +50,9 @@ def build_input_transform(train_config, checkpoint_dir):
     if hasattr(data_cfg, "include_next_obs"):
         data_cfg = dataclasses.replace(data_cfg, include_next_obs=False)
     data_config = data_cfg.create(train_config.assets_dirs, train_config.model)
-    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
+    # Pass the checkpoint STEP dir: load_norm_stats checks params/<asset_id>/ (the
+    # reliable self-contained copy) before the assets/ item, with flat fallbacks.
+    norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
     return _transforms.compose([
         *data_config.repack_transforms.inputs,
         _transforms.InjectDefaultPrompt(None),
