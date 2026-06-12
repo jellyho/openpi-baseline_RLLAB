@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -745,6 +746,15 @@ _PI05_BASE_ASSETS = AssetsConfig(
 )
 _PI05_BASE_PARAMS = "gs://openpi-assets/checkpoints/pi05_base/params"
 
+# ── Machine-specific roots (set in setup_env.sh; defaults = the /data5 box) ───────────
+# So per-config dataset / checkpoint paths don't need hand-editing per machine.
+_PFR_DATA = os.environ.get("PFR_DATA", "/data5/jellyho/PFR_RSS/dataset")          # raw/merged/combined datasets
+_PFR_CKPT = os.environ.get("PFR_CKPT", "/data5/jellyho/PFR_RSS/checkpoints")      # pretrained (rss_ckpt) checkpoints
+# BC fine-tune outputs (what the RLT configs initialize from) live where stage 1 wrote them:
+# PI_CKPT_DIR if absolute, else this repo's ./checkpoints.
+_BC_CKPT = (os.environ["PI_CKPT_DIR"] if os.path.isabs(os.environ.get("PI_CKPT_DIR", ""))
+            else str(pathlib.Path(__file__).resolve().parents[3] / "checkpoints"))
+
 
 def _tabletop_data(repo_id, *, include_mc_return=False, include_next_obs=False):
     """LeRobotTabletopDataConfig on pi05_base assets (prompt-from-task, abs actions)."""
@@ -769,7 +779,7 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
         base_config=DataConfig(
             prompt_from_task=True,
             # local_files_path=f"/home/yonsei_jell/{task}",
-            local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
+            local_files_path=f"{_PFR_DATA}/phase1_merged/{task}",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
@@ -784,7 +794,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=_dualyam_data("seal-water-bottle-cap"),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
+            f"{_PFR_CKPT}/rss_ckpt/pi05_seal-water-bottle-cap/199999/params"
         ),
         num_train_steps=100_000,
         batch_size=128,
@@ -796,7 +806,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=_dualyam_data("insert-mouse-battery"),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_insert-mouse-battery/199999/params"
+            f"{_PFR_CKPT}/rss_ckpt/pi05_insert-mouse-battery/199999/params"
         ),
         num_train_steps=100_000,
         batch_size=128,
@@ -808,7 +818,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=_dualyam_data("tower-of-hanoi-game"),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_tower-of-hanoi-game/199999/params"
+            f"{_PFR_CKPT}/rss_ckpt/pi05_tower-of-hanoi-game/199999/params"
         ),
         num_train_steps=150_000,
         batch_size=128,
@@ -822,12 +832,12 @@ _CONFIGS = [
             repo_id="jellyho/phase1_combined",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_files_path="/data5/jellyho/PFR_RSS/dataset/phase1_combined",
+                local_files_path=f"{_PFR_DATA}/phase1_combined",
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/data5/jellyho/PFR_RSS/checkpoints/rss_ckpt/pi05_rss2026_multitask/199999/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(f"{_PFR_CKPT}/rss_ckpt/pi05_rss2026_multitask/199999/params"),
         num_train_steps=100_000,
         batch_size=128,
         num_workers=32,
@@ -844,7 +854,7 @@ _CONFIGS = [
         model=pi0_rlt.Pi0RLTConfig(pi05=True),
         data=_dualyam_data("seal-water-bottle-cap"),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_seal-water-bottle-cap_bc_ft/pi05_seal-water-bottle-cap_bc_ft/99999/params"
+            f"{_BC_CKPT}/pi05_seal-water-bottle-cap_bc_ft/pi05_seal-water-bottle-cap_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,
@@ -857,7 +867,7 @@ _CONFIGS = [
         model=pi0_rlt.Pi0RLTConfig(pi05=True),
         data=_dualyam_data("tower-of-hanoi-game"),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_tower-of-hanoi-game_bc_ft/pi05_tower-of-hanoi-game_bc_ft/99999/params"
+            f"{_BC_CKPT}/pi05_tower-of-hanoi-game_bc_ft/pi05_tower-of-hanoi-game_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,
@@ -870,7 +880,7 @@ _CONFIGS = [
         model=pi0_rlt.Pi0RLTConfig(pi05=True),
         data=_dualyam_data("insert-mouse-battery"),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_insert-mouse-battery_bc_ft/pi05_insert-mouse-battery_bc_ft/99999/params"
+            f"{_BC_CKPT}/pi05_insert-mouse-battery_bc_ft/pi05_insert-mouse-battery_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,
@@ -887,7 +897,7 @@ _CONFIGS = [
             repo_id="jellyho/phase1_combined",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_files_path="/home/yonsei_jell/dualyam_combined",
+                local_files_path=f"{_PFR_DATA}/phase1_combined",
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
@@ -899,7 +909,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
+            f"{_BC_CKPT}/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,
@@ -919,8 +929,8 @@ _CONFIGS = [
             repo_id="jellyho/phase1_combined",
             base_config=DataConfig(
                 prompt_from_task=True,
-                # local_files_path="/home/yonsei_jell/dualyam_combined",
-                local_files_path="/data5/jellyho/PFR_RSS/dataset/phase1_combined",
+                # local_files_path=f"{_PFR_DATA}/phase1_combined",
+                local_files_path=f"{_PFR_DATA}/phase1_combined",
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
@@ -932,7 +942,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
+            f"{_BC_CKPT}/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,
@@ -961,7 +971,7 @@ _CONFIGS = [
         # Freeze on the LOCAL hanoi bc_ft final checkpoint (150k-step run,
         # 0-indexed final step → 149999).
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_tower-of-hanoi-game_bc_ft/pi05_tower-of-hanoi-game_bc_ft/149999/params"
+            f"{_BC_CKPT}/pi05_tower-of-hanoi-game_bc_ft/pi05_tower-of-hanoi-game_bc_ft/149999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,

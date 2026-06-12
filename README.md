@@ -47,24 +47,34 @@ GPU; the AQC critic (stage 4) is ~10 M params and fits in <8 GB.
 
 ## 1. Configure
 
-**Environment** — edit [`setup_env.sh`](setup_env.sh) for your cluster (sourced automatically by
-every `stageN_*.sh` launcher):
+**Everything machine-specific lives in one file: [`setup_env.sh`](setup_env.sh).** It is sourced
+automatically by every `stageN_*.sh` launcher, and `config.py` / `rlt_critic/config.py` read these
+env vars — so the per-config dataset / checkpoint paths **never need hand-editing** when you move
+boxes; you only edit `setup_env.sh`.
 
+**Caches**:
 ```bash
-export OPENPI_DATA_HOME=...   # where pretrained checkpoints are downloaded / cached
-export HF_LEROBOT_HOME=...    # LeRobot dataset cache (the challenge dataset root)
+export OPENPI_DATA_HOME=...   # pretrained checkpoint cache
+export HF_LEROBOT_HOME=...    # LeRobot dataset cache
 export HF_HOME=...            # HuggingFace model cache
 ```
 
-**Dataset & checkpoint paths** — in [`src/openpi/training/config.py`](src/openpi/training/config.py),
-each challenge config sets `local_files_path` (raw LeRobot dataset) and a `weight_loader` path
-(the checkpoint each stage initializes from). Point these at your machine. The cross-stage
-dependencies:
+**Dataset / checkpoint roots** (defaults target the `/data5` box; override per machine).
+`config.py` builds every per-config `local_files_path` / `weight_loader` path from these:
 
-- a `*_bc_ft` config loads `pi05_base` (the RSS multitask checkpoint);
-- a `*_rlt[_joint]` config loads the **trained `*_bc_ft` checkpoint** (`AlphaFlowWeightLoader`)
-  and **reuses the BC norm stats** (`AssetsConfig`) so it does not recompute them;
-- the annotate scripts (`annotate_rlt*.sh`) and `merge` take the trained `*_rlt` **step dir**.
+| env var | what it points at | default |
+|---|---|---|
+| `PFR_DATA` | raw / merged / combined LeRobot datasets (`local_files_path`) | `$CACHE_DIR/PFR_RSS/dataset` |
+| `PFR_CKPT` | pretrained `pi05` bases the BC configs load from (`rss_ckpt/`) | `$CACHE_DIR/PFR_RSS/checkpoints` |
+| `RLT_DATA_BASE` | the AQC critic's annotated datasets (`<task>_annotated`) | `$PFR_DATA/phase1_annotated` |
+| `PI_CKPT_DIR` | where stage 1–2 training **writes** (and stage 2 reads its BC init from) | `./checkpoints` |
+| `RLT_CRITIC_CKPT_DIR` | where stage 4 critic runs are written | `$CACHE_DIR/PFR_RSS/checkpoints/rlt_critic_runs` |
+
+Cross-stage wiring, handled by these roots automatically:
+- a `*_bc_ft` config loads `pi05_base` from `$PFR_CKPT/rss_ckpt/…` and **writes** to `$PI_CKPT_DIR`;
+- a `*_rlt[_joint]` config loads the **trained `*_bc_ft` checkpoint** from `$PI_CKPT_DIR`
+  (`AlphaFlowWeightLoader`) and **reuses the BC norm stats** (`AssetsConfig`, no recompute);
+- the annotate scripts and `stage5_merge.sh` take the trained `*_rlt` **step dir**.
 
 ---
 

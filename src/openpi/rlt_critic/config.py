@@ -28,6 +28,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import os
 import pathlib
 from dataclasses import dataclass, field
 from typing import Literal, Optional
@@ -168,7 +169,9 @@ class OptimConfig:
 # Local workspace on the B200 box (see setup_env.sh). Override with --data_root for other
 # machines/clusters. mouse-battery is present (184GB, rl_token/base_action/reward/mc_return);
 # the others are placeholders with the same naming so --task can switch once they land.
-_DATA_BASE = "/NHNHOME/WORKSPACE/0526040008_A/jellyho"
+# Base dir holding the per-task <task>_annotated datasets. Set RLT_DATA_BASE in setup_env.sh
+# (default = the /data5 box) so this isn't hand-edited per machine.
+_DATA_BASE = os.environ.get("RLT_DATA_BASE", "/data5/jellyho/PFR_RSS/dataset/phase1_annotated")
 TASKS = {
     # mouse-battery is v3-annotated on disk here (reward_annotate.py: living=-1/step,
     # fail=-0.4*T_max, gamma=0.9999, globally normalized so mc_return in [-1,0]). Matches the
@@ -223,7 +226,8 @@ class VLAAQCConfig:
     eval_n_fail: int = 3            # fixed failure episodes shown in the eval plot
     save_interval: int = 25_000
     keep_period: Optional[int] = 100_000   # checkpoints at step % keep_period == 0 are kept
-    checkpoint_base_dir: str = "/NHNHOME/WORKSPACE/0526040008_A/jellyho/rlt_critic_runs"
+    checkpoint_base_dir: str = field(default_factory=lambda: os.environ.get(
+        "RLT_CRITIC_CKPT_DIR", "/data5/jellyho/PFR_RSS/checkpoints/rlt_critic_runs"))
     wandb_enabled: bool = True
     wandb_project: str = "rlt_critic_learning"
     wandb_entity: str = "RSS-PFT_RLLAB"

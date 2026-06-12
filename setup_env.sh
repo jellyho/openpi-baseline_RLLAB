@@ -31,6 +31,15 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_CO
 export PI_CKPT_DIR="${PI_CKPT_DIR:-./checkpoints}"
 export RLT_CRITIC_CKPT_DIR="${RLT_CRITIC_CKPT_DIR:-$CACHE_DIR/PFR_RSS/checkpoints/rlt_critic_runs}"
 
+# Machine-specific roots read by config.py / rlt_critic/config.py so the per-config
+# paths don't have to be hand-edited when moving boxes. Override here per machine.
+#   PFR_DATA       raw/merged/combined LeRobot datasets (local_files_path bases)
+#   PFR_CKPT       pretrained checkpoints (the rss_ckpt/ pi05 bases the BC configs load)
+#   RLT_DATA_BASE  the AQC critic's annotated datasets (per-task <task>_annotated)
+export PFR_DATA="${PFR_DATA:-$CACHE_DIR/PFR_RSS/dataset}"
+export PFR_CKPT="${PFR_CKPT:-$CACHE_DIR/PFR_RSS/checkpoints}"
+export RLT_DATA_BASE="${RLT_DATA_BASE:-$PFR_DATA/phase1_annotated}"
+
 echo "Environment variables set:"
 echo "  HF_HOME:          $HF_HOME"
 echo "  HF_LEROBOT_HOME:  $HF_LEROBOT_HOME"
@@ -39,3 +48,6 @@ echo "  JAX_COMPILATION_CACHE_DIR: $JAX_COMPILATION_CACHE_DIR"
 echo "  HF_HUB_ENABLE_HF_TRANSFER: $HF_HUB_ENABLE_HF_TRANSFER"
 echo "  PI_CKPT_DIR: $PI_CKPT_DIR"
 echo "  RLT_CRITIC_CKPT_DIR: $RLT_CRITIC_CKPT_DIR"
+echo "  PFR_DATA: $PFR_DATA"
+echo "  PFR_CKPT: $PFR_CKPT"
+echo "  RLT_DATA_BASE: $RLT_DATA_BASE"
