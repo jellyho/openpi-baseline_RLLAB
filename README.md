@@ -1,643 +1,270 @@
-# RSS2026 Workshop Baseline Guidance
+# RSS 2026 — Post-Training for Robot Foundation Models (RLLAB)
 
-This repository is the baseline for the RSS 2026 Post-Training for Robot Foundation Models workshop challenge. The three challenge tasks are pre-registered as training configs:
+A fork of [openpi](https://github.com/Physical-Intelligence/openpi) (π₀.₅ VLA) extended for the
+RSS 2026 *Post-Training for Robot Foundation Models* workshop challenge. On top of the standard
+behaviour-cloning baseline, this repo adds an **offline-RL fine-tuning stack** built around an
+**RL-token bottleneck + adaptive-Q-chunking (AQC) prefix critic**: a lightweight transformer
+critic, trained on *precomputed* frozen-VLA latents, that at deployment scores the policy's
+candidate action chunks and picks both *which* chunk and *how many steps* to commit.
 
-- `pi05_insert-mouse-battery`
-- `pi05_seal-water-bottle-cap`
-- `pi05_tower-of-hanoi-game`
+The three challenge tasks are pre-registered as training configs:
+`insert-mouse-battery`, `seal-water-bottle-cap`, `tower-of-hanoi-game` (plus a merged
+`generalist`).
 
-Follow the three steps below to reproduce the baseline.
+---
 
-### 0. Quick Environment Setup
+## Pipeline
+
+```
+                 stage 1                stage 2                 stage 3                       stage 4              stage 5
+  pi05_base ──► BC fine-tune ──► RLT bottleneck (frozen ──► annotate dataset ───────────► AQC prefix ──► merge + deploy
+              (pi05_*_bc_ft)     VLA, train rlt_* only)     • rl_token + base_action       critic        (adaptive Q-chunking
+                                 (pi05_*_rlt[_joint])         (trained RLT, GPU)            (rlt_critic)   replanning policy)
+                                                            • reward v3 + mc_return
+                                                              (CPU annotate)
+```
+
+Each stage is one command. The critic (stage 4) reads only the annotated `rl_token` /
+`base_action` / `mc_return` columns, so it trains **without any VLA forward pass** — fast and cheap.
+
+| Stage | What | Command |
+|---|---|---|
+| 1 | BC fine-tune π₀.₅ on a challenge task | `bash train.sh pi05_<task>_bc_ft` |
+| 2 | Train the RL-token bottleneck on the frozen BC policy | `bash train.sh pi05_<task>_rlt_joint` |
+| 3a | Annotate `rl_token` + `base_action` (multi-GPU) | `bash annotate_rlt_joint.sh` |
+| 3b | Annotate reward v3 + `mc_return` | `python adaptive_q_chunking/data_annoation/reward_annotate.py --input <root> --inplace` |
+| 4 | Train the AQC prefix critic | `scripts/train_rlt_critic.sh vla_aqc_warmup 64 <gpu>` |
+| 5 | Merge into a deployable bundle, then serve | `python -m openpi.rlt_critic.merge …` → `create_aqc_policy(bundle)` |
+
+---
+
+## 0. Install
+
 ```bash
 git clone --recurse-submodules https://github.com/jellyho/openpi-baseline_RLLAB.git
-
 cd openpi-baseline_RLLAB
 
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
-### 1. Configure dataset paths
+Requires an NVIDIA GPU. Full fine-tuning of the 2B π₀.₅ backbone (stages 1–2) needs an 80 GB
+GPU; the AQC critic (stage 4) is ~10 M params and fits in <8 GB.
 
-Open [`src/openpi/training/config.py`](src/openpi/training/config.py) and edit the three challenge configs at **lines 615-660**. Replace the `/Your/path/to/...` placeholder in each config's `local_files_path` with the actual location of the challenge dataset on your machine, for example:
+## 1. Configure
 
-```python
-base_config=DataConfig(
-    prompt_from_task=True,
-    local_files_path="/data/Posttraining-RFM-RSS2026/Challenge-phase1-dataset/insert-mouse-battery/expert-data",
-),
-```
-
-### 2. Set environment variables
-
-Edit [`setup_env.sh`](setup_env.sh) to match your cluster:
+**Environment** — edit [`setup_env.sh`](setup_env.sh) for your cluster (sourced automatically by
+`train.sh`):
 
 ```bash
-export OPENPI_DATA_HOME=...   # where pretrained checkpoints are downloaded
-export HF_LEROBOT_HOME=...    # LeRobot dataset cache
+export OPENPI_DATA_HOME=...   # where pretrained checkpoints are downloaded / cached
+export HF_LEROBOT_HOME=...    # LeRobot dataset cache (the challenge dataset root)
 export HF_HOME=...            # HuggingFace model cache
 ```
 
-For `HF_LEROBOT_HOME`, the normal path is `Your/path/to/Posttraining-RFM-RSS2026/Challenge-phase1-dataset`
-`train.sh` sources this file automatically, so there is no need to `source` it manually before training.
+**Dataset & checkpoint paths** — in [`src/openpi/training/config.py`](src/openpi/training/config.py),
+each challenge config sets `local_files_path` (raw LeRobot dataset) and a `weight_loader` path
+(the checkpoint each stage initializes from). Point these at your machine. The cross-stage
+dependencies:
 
-### 3. Run training
+- a `*_bc_ft` config loads `pi05_base` (the RSS multitask checkpoint);
+- a `*_rlt[_joint]` config loads the **trained `*_bc_ft` checkpoint** (`AlphaFlowWeightLoader`)
+  and **reuses the BC norm stats** (`AssetsConfig`) so it does not recompute them;
+- the annotate scripts (`annotate_rlt*.sh`) and `merge` take the trained `*_rlt` **step dir**.
 
-Launch a baseline run with one of the three challenge config names:
+---
+
+## 2. Stage 1 — BC fine-tune
+
+Fine-tune π₀.₅ on a single challenge task (or the merged generalist):
 
 ```bash
-bash train.sh pi05_insert-mouse-battery
+bash train.sh pi05_insert-mouse-battery_bc_ft     # or _seal-water-bottle-cap_, _tower-of-hanoi-game_, _generalist_
 ```
 
-`train.sh` does two things in order:
+`train.sh` sources `setup_env.sh`, runs `scripts/train.py <config> --resume`, and tees logs to
+`logs/<config>_<timestamp>.log`. Norm stats are computed once and saved next to the checkpoint
+(`params/<asset_id>/norm_stats.json`), making `params/` self-contained for inference.
 
-1. `scripts/compute_norm_stats.py` — computes per-dataset normalization statistics.
-2. `scripts/train.py` — runs the training loop and tees logs to `logs/<config>_<timestamp>.log`.
+> Merged **generalist**: concatenate the three task datasets with
+> [`scripts/merge_lerobot.py`](scripts/merge_lerobot.py) (see [Appendix](#appendix--merging-datasets)),
+> then train `pi05_generalist_bc_ft`.
 
-Normalization stats only need to be computed once per dataset. If `assets/<config>/norm_stats.json` already exists, you can comment out the `compute_norm_stats.py` line in `train.sh` to skip recomputation.
+## 3. Stage 2 — RLT bottleneck
 
-### 4. Merging datasets (optional)
-
-Some recipes — DAgger-style retraining on `expert + rollout` data, or training a single multi-task generalist across all three challenge tasks — require concatenating several LeRobot-format repos into one. We provide [`scripts/merge_lerobot.py`](scripts/merge_lerobot.py) for this. It re-indexes `episode_index` / global frame `index`, copies parquet and videos, merges `tasks.jsonl`, and writes `meta/sources.jsonl` recording the per-source episode range for provenance.
-
-Pass sources either inline or via a list file:
+Train the **RL-token bottleneck** ([arXiv:2604.23073](https://arxiv.org/abs/2604.23073)) on top of
+the **frozen** BC policy. An encoder–decoder compresses the VLA's prefix image features (+ proprio)
+into a compact 2048-d latent `z_rl`; only the `rlt_*` params train (VLA + action expert stay frozen).
 
 ```bash
-# Inline
+bash train.sh pi05_generalist_rlt_joint           # or pi05_<task>_rlt_joint
+```
+
+Two variants:
+- **`*_rlt`** (vanilla `Pi0RLT`) — token comes from a *language-free* image-only backbone pass.
+- **`*_rlt_joint`** (`Pi0RLTJoint`, **recommended**) — token is sourced from the image-token hidden
+  states of the *same* full (image+language) forward used for action sampling, so annotation /
+  inference runs the 2B backbone **once** per state instead of twice. The token becomes
+  language-conditioned (fine for a generalist). Not checkpoint-compatible with vanilla `Pi0RLT` —
+  train fresh.
+
+## 4. Stage 3 — Annotate the dataset
+
+The critic reads four columns from the LeRobot v3.0 dataset. Two annotation passes add them:
+
+**(3a) RL-token + base actions** — uses the trained RLT checkpoint on the GPU. Edit the
+`CONFIG` / `CKPT` / `SRC` / `OUT` / `GPUS` variables at the top of the script, then:
+
+```bash
+bash annotate_rlt_joint.sh        # joint model (single backbone forward); annotate_rlt.sh for vanilla
+```
+
+It shards files across GPUs (DDP-style: GPU sampling is the bottleneck, data loading is ~100× faster),
+writes per-frame columns, and registers the new features in `meta/info.json` once all shards finish.
+
+**(3b) Reward v3 + Monte-Carlo return** — CPU-only, idempotent (skips if already v3):
+
+```bash
+python adaptive_q_chunking/data_annoation/reward_annotate.py --input <dataset_root> --inplace --workers 4
+#   add --dry_run for the design summary
+```
+
+The annotated columns:
+
+| column | dtype | shape | meaning |
+|---|---|---|---|
+| `rl_token` | f32 | `[2048]` | frozen-VLA bottleneck latent = critic **state token** |
+| `base_action` | f16 | `[32, 50, 14]` | N=32 base-policy **candidate chunks** (raw action space) |
+| `reward` | f32 | `[1]` | v3-normalized reward |
+| `mc_return` | f32 | `[1]` | v3-normalized return-to-go (γ=0.9999), in `[-1, 0]` |
+
+**v3 reward scheme**: living `−1`/step, success terminal `0`, failure terminal `−0.4·T_max`;
+γ=0.9999 return-to-go; globally normalized by `Z = |min return|` so `mc_return ∈ [-1, 0]`. This
+makes *steps-to-go* (hence prefix length) informative — the earlier near-flat scheme collapsed the
+adaptive-chunking signal.
+
+## 5. Stage 4 — Train the AQC prefix critic
+
+A small causal transformer (`src/openpi/rlt_critic/`) learns the **prefix-conditioned** value
+`Q(z_rl, a_{1:h})` for *every* commit length `h` in one forward pass — the signal that lets
+deployment pick how many steps to execute.
+
+```bash
+# detached single run (survives the shell)
+scripts/train_rlt_critic.sh vla_aqc_warmup 64 3                 # CONFIG  BATCH  GPU
+
+# overnight / unattended: auto-resume on crash from the last checkpoint
+scripts/train_rlt_critic_supervised.sh vla_aqc_warmup 64 3
+```
+
+Set the dataset per task in `src/openpi/rlt_critic/config.py` (`TASKS[...]`) or pass
+`--data_root <annotated_root>`. Checkpoints (every 25k), `metrics.csv`, and offline W&B land under
+`config.checkpoint_base_dir/<name>/<run>/`. Resume with `EXTRA="--resume"`.
+
+**Critic design** — `n_embd=384 / 3 layers / K=2` ensemble (min-aggregated), HL-Gauss 201 atoms over
+`[-1, 0]`, **macro-grouping** 10 (the 50-step chunk → 5 macro-tokens → replan at 10/20/30/40/50
+steps, ~10.7 M params). The target is **MC-warmup → `max(MC, Q-backup)`** via a ReLU-blend:
+
+```
+y = G_MC + β · ReLU( r + γ·Q̄(s', a') − G_MC )
+```
+
+`β=0` (first `mc_warmup_steps`) regresses every prefix to the realized return (grounds the value,
+suppresses early Q overestimation); `β` then cosine-ramps to `1` (the Cal-QL-floored target). MC
+stays a hard lower bound. Presets in `config.py`: `vla_aqc_warmup` (primary), `vla_mc` (pure-MC
+baseline), `vla_aqc_hardmax` / `vla_aqc_no_floor` / `vla_aqc_warmup_softmax` (target ablations),
+`vla_aqc_warmup_{small,large,stateenc}` (capacity).
+
+> Multi-GPU data-parallel is automatic when several GPUs are visible and `batch_size % n_gpu == 0`.
+> See [`src/openpi/rlt_critic/README.md`](src/openpi/rlt_critic/README.md) for the package internals
+> (losses, network, loader, file map).
+
+## 6. Stage 5 — Merge & deploy (adaptive Q-chunking)
+
+**Merge** the RLT backbone + trained critic into one deployable bundle:
+
+```bash
+python -m openpi.rlt_critic.merge \
+  --rlt-config pi05_generalist_rlt_joint \
+  --rlt-checkpoint <rlt_step_dir> \
+  --critic-run-dir <critic_run_dir> --critic-step latest \
+  --out <bundle>
+```
+
+This writes `params/` (RLT orbax params) + `critic/{params.msgpack,net.json}` +
+`aqc_manifest.json`. **Deploy** as an openpi policy:
+
+```python
+from openpi.rlt_critic.inference import create_aqc_policy
+
+policy = create_aqc_policy("<bundle>", exec_mode="truncate")   # drop-in BasePolicy
+out = policy.infer(obs_dict)   # -> {actions, h_star, n_star, q_by_h, policy_timing}
+```
+
+At each call the RLT samples N candidate chunks + `z_rl` (one backbone forward for the joint model),
+decodes them to raw action space, the prefix critic scores every `(candidate n, length h)`, and a
+**joint arg-max picks `(n*, h*)`** — the best chunk *and* how many steps to commit. Execution modes:
+`truncate` (execute `h*` steps, then replan) or `absolute_hold` (full chunk, tail held at the
+`h*`-th absolute target). The bundle is a drop-in for the websocket policy server.
+
+---
+
+## Configs reference
+
+All training configs live in [`src/openpi/training/config.py`](src/openpi/training/config.py); AQC
+critic presets in [`src/openpi/rlt_critic/config.py`](src/openpi/rlt_critic/config.py).
+
+| Config | Stage | Notes |
+|---|---|---|
+| `pi05_<task>_bc_ft`, `pi05_generalist_bc_ft` | 1 | π₀.₅ BC fine-tune (`<task>` ∈ the 3 challenge tasks) |
+| `pi05_<task>_rlt`, `pi05_generalist_rlt` | 2 | RLT bottleneck, language-free token |
+| `pi05_<task>_rlt_joint`, `pi05_generalist_rlt_joint` | 2 | RLT bottleneck, single-forward language-conditioned token (**recommended**) |
+| `vla_aqc_warmup` (+ ablation/capacity presets) | 4 | AQC prefix critic |
+
+---
+
+## Repo layout
+
+```
+src/openpi/
+  models/            π₀.₅ VLA (pi0) + RL-token bottleneck (pi0_rlt: Pi0RLT / Pi0RLTJoint)
+  rlt_critic/        AQC prefix-critic package — train / merge / inference  (see its README.md)
+  policies/          input/output transforms (yam_policy for the challenge DualYam robot)
+  training/          train loop, data loader, configs, checkpointing
+scripts/
+  train.py                       main VLA training loop  (stages 1–2, via train.sh)
+  compute_rl_tokens.py           rl_token + base_action annotation  (via annotate_rlt*.sh)
+  train_rlt_critic.py / .sh      AQC critic training  (stage 4)
+  merge_lerobot.py               concatenate LeRobot datasets (generalist / DAgger)
+adaptive_q_chunking/data_annoation/reward_annotate.py   reward v3 + mc_return  (stage 3b)
+train.sh · annotate_rlt[_joint].sh · setup_env.sh       launchers
+```
+
+---
+
+## Appendix — Merging datasets
+
+DAgger-style retraining (`expert + rollout`) or the multi-task generalist need several LeRobot
+repos concatenated into one. [`scripts/merge_lerobot.py`](scripts/merge_lerobot.py) re-indexes
+episodes / global frame index, copies parquet + videos, merges `tasks.jsonl`, and records per-source
+provenance in `meta/sources.jsonl`:
+
+```bash
 uv run scripts/merge_lerobot.py \
     --src_paths /path/to/expert-data /path/to/rollout-data \
     --tgt_path  /path/to/merged \
     --repo_id   insert-mouse-battery/merged
-
-# Or with a newline-separated list file ('#' for comments)
-uv run scripts/merge_lerobot.py \
-    --src_list  merge_list.txt \
-    --tgt_path  /path/to/merged \
-    --repo_id   challenge/multitask-generalist
+# or: --src_list merge_list.txt   (newline-separated, '#' comments)
 ```
 
-`fps`, `robot_type`, and `features` are inferred from the first source. Use `--force` to allow merging across minor metadata conflicts. After merging, register the new repo as a fresh `TrainConfig` (or point an existing one's `local_files_path` at the merged directory) and run training as in steps 1-3.
-
-This script refers to the implementation in [kai0](https://github.com/OpenDriveLab/kai0).
+`fps`, `robot_type`, `features` are inferred from the first source; `--force` allows minor metadata
+conflicts. (Implementation follows [kai0](https://github.com/OpenDriveLab/kai0).)
 
 ---
 
-# Tabletop-Sim
-
-`examples/tabletop_sim/` contains an inference / evaluation script for running openpi policies on the [Tabletop-Sim](third_party/Tabletop-Sim) MuJoCo environment (dual-arm Aloha robot).
-
-## Task: aloha_handover_box
-
-A bimanual coordination task that requires two distinct sub-skills in sequence.
-
-**Scenario**
-A soda box is placed on the left side of the table and a pink fabric cube (basket) is placed on the right side. The robot must:
-1. **Pick up** the box with the **left arm**.
-2. **Hand it over** to the **right arm** in the air.
-3. **Place** the box into the pink basket with the **right arm**.
-
-**Language instruction**: `"Handover the box and place into the pink basket"`
-
-## Action / State Space
-
-| Field | Dims | Convention |
-|---|---|---|
-| `state` (qpos) | 14 | `[left_arm(6), left_gripper(1), right_arm(6), right_gripper(1)]` |
-| `actions` (joint_pos) | 14 | Same layout — absolute joint positions, gripper in **[-1, 1]** |
-
-Gripper values use the tabletop's own normalization (`ALOHA_GRIPPER_NORMALIZE_FN`), **not** the real Aloha linear-space convention. The policy therefore uses `adapt_to_pi=False`.
-
-## Training
-
-### 1. Prepare the dataset
-
-The dataset is uploaded to HuggingFace Hub as a LeRobot dataset and is referenced directly in the training config:
-
-```
-jellyho/aloha_handover_box_joint_pos_rl (Including Failure)
-jellyho/aloha_handvoer_box_joint_pos_bc (Only Success)
-```
-
-No local conversion is needed — the dataloader pulls the dataset automatically via `HF_LEROBOT_HOME`. Set that env variable in [`setup_env.sh`](setup_env.sh) to control the cache location.
-
-### 2. Training config
-
-The `pi05_tabletop', 'pi05_tabletop_bc' configs in [`src/openpi/training/config.py`](src/openpi/training/config.py) already point to this dataset. The `LeRobotTabletopDataConfig` repack transform maps lerobot keys to inference keys automatically:
-
-| Dataset key | Inference key |
-|---|---|
-| `observation.images.back` | `images["cam_high"]` |
-| `observation.images.wrist_left` | `images["cam_left_wrist"]` |
-| `observation.images.wrist_right` | `images["cam_right_wrist"]` |
-| `observation.state` | `state` |
-| `action` | `actions` |
-| `task` | `prompt` |
-
-### 3. Run training
-
-Norm stats are loaded directly from the pi05 base checkpoint (`asset_id=trossen`), so **no separate norm stats computation is needed**.
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 srun --gres=gpu:1 --nodelist node200 -c 32 uv run scripts/train.py pi05_alphaflow_critic_rl \
-    --exp-name critic_rl --overwrite
-```
-
-### Available Training Configs
-
-All configs live in [`src/openpi/training/config.py`](src/openpi/training/config.py). Run any of them with `./train.sh <config> <gpus> <batch/gpu> <steps>` (default `30000` steps, batch `32`). Dataset suffixes: `_rl` = RL dataset (includes failures), `_bc` = behaviour-cloning (success only), `_orig` = the "orig" data variant, `_mc` = carries the Monte-Carlo `mc_return` column (required by critic / LPS configs, produced by [`scripts/compute_mc_returns.py`](scripts/compute_mc_returns.py)).
-
-For the `H#` / `O#` / `A#` references and the full debugging history of the alpha-flow 1-NFE work, see [`docs/alphaflow_troubleshooting.md`](docs/alphaflow_troubleshooting.md).
-
-#### The RFT pipeline (4 categories)
-
-The tabletop work is organised as a 4-stage **RFT (Reinforced Fine-Tuning)** pipeline. Two independent routes produce a *1-NFE policy + critic* checkpoint — the **joint** route (cat 2) and the **2-stage** route (cat 1 → cat 3) — and both feed the final LPS-RFT step (cat 4):
-
-```
-            ┌─ 2. pi05_alphaflow_critic_{rl,bc}   (joint: distill + critic, from pi05_base) ─┐
-pi05_base ──┤                                                                                ├─→ 4. pi05_rft_phase2_rl
-            └─ 1. pi05_tabletop{,_bc} (FM) ─→ 3. pi05_rft_phase1_{rl,bc} (rectify + critic) ──┘      (LPS-RFT)
-```
-
-All AlphaFlow configs use the **tuned recipe**: `flow_ratio=0.25` (25% FM-border / 75% MeanFlow samples), `lambda_fm=lambda_mf=0.5`, discrete-only (`use_jvp=False`), `alpha_min=0.1`, and `large_span_warmup_gate=True` (full-span oversampling is gated to the post-warmup phase). The full design history is in [`docs/alphaflow_troubleshooting.md`](docs/alphaflow_troubleshooting.md).
-
-> **Critic head — multi-horizon value (warmup) / single-Q (LPS).** The critic tokens are causally masked, so token `h-1` is `Q(s, a₀:h)`. In **warmup** (cat-2/cat-3) the critic reads `critic_horizons` (default `(5,10,25,50)`) → `[b, K, n_bins]` C51 heads, **all supervised by the chunk MC return** `G_t`. (Under MC the target telescopes to the same `G_t` for every horizon, so warmup just pre-positions the heads at MC scale; per-horizon differentiation is deferred to LPS chunked-TD.) **LPS phase-2** currently reads only the full-chunk head as a single `Q` — how to exploit the multiple horizons in the RL TD target is TBD. Set via `critic_horizons`.
-
-**1. Flow-matching baseline** (`Pi0Config`, multi-step) — the task-adapted FM policy that cat-3 rectifies. *(defined in the "Fine-tuning Tabletop-Sim" section of config.py.)*
-
-| Config | Dataset | Description |
-|---|---|---|
-| `pi05_tabletop` | `..._rl_orig` | Pi05 flow-matching baseline on the RL dataset. cat-3 `_rl` init. |
-| `pi05_tabletop_bc` | `..._bc_orig` | Same, on the success-only BC dataset. cat-3 `_bc` init. |
-| `pi0_tabletop` | `..._rl` | Pi0 (not Pi05) flow-matching baseline. |
-
-**2. AlphaFlow + critic baseline** (`Pi0WithCritic`, joint, from `pi05_base`) — single-stage: alpha-flow 1-NFE distillation + a multi-horizon C51/HL-Gauss critic trained together. Init is `pi05_base` (NOT task-adapted), so it keeps the **25% FM warmup** (schedule 25/50/25). Requires an `_mc` dataset.
-
-| Config | Dataset | Description |
-|---|---|---|
-| `pi05_alphaflow_critic_rl` | `..._rl_orig` (+mc) | Joint distill + critic on the RL dataset. |
-| `pi05_alphaflow_critic_bc` | `..._bc_orig` (+mc) | Same, on the success-only BC dataset. |
-
-**3. 2-stage RFT phase-1: rectify + critic warmup** (`Pi0WithCritic`, from a cat-1 FM checkpoint) — this is exactly the AlphaFlowTSE setting (rectifying an FM checkpoint), so it uses the **TSE alpha schedule** (`warmup_ratio=0.05` / `transition_ratio=0.667` / floor 0.333, `alpha_gamma=15`, `alpha_min=0.1`): a short FM warmup re-grounds the field in our data, then anneal + floor. The **VLM is frozen**; only the action expert (rectify FM → 1-NFE), its projections + r-conditioning, and the critic (warmup) train. Update the `weight_loader` path to your cat-1 run/step.
-
-| Config | Dataset | Init from |
-|---|---|---|
-| `pi05_rft_phase1_rl` | `..._rl_orig` (+mc) | `pi05_tabletop` checkpoint |
-| `pi05_rft_phase1_bc` | `..._bc_orig` (+mc) | `pi05_tabletop_bc` checkpoint |
-
-**4. LPS-RFT phase-2 — offline RL via Latent Policy Steering** (`Pi0LPSRFT`) — loads a **cat-2 OR cat-3** checkpoint (VLM + action + critic), adds a latent-actor expert, freezes the VLM + action decoder, and steers the frozen 1-NFE policy toward high-value actions (CrossQ chunked-TD critic + DDPG actor). Update the `weight_loader` path to your cat-2/cat-3 run/step.
-
-| Config | Dataset | Description |
-|---|---|---|
-| `pi05_rft_phase2_rl` | `..._rl_orig` (+mc, +next_obs) | Final offline-RL fine-tune; common to both routes. |
-
-**Alpha-Flow challenge tasks** (`Pi0AlphaFlow`, DualYam data) — plain 1-NFE distillation on the challenge tasks.
-
-| Config | Task |
-|---|---|
-| `pi05_alphaflow_insert-mouse-battery` | `insert-mouse-battery` |
-| `pi05_alphaflow_seal-water-bottle-cap` | `seal-water-bottle-cap` |
-
-**Challenge-phase baselines** (standard Pi05 FM, 200k steps, DualYam data)
-
-| Config | Task |
-|---|---|
-| `pi05_insert-mouse-battery` | `insert-mouse-battery` challenge task |
-| `pi05_seal-water-bottle-cap` | `seal-water-bottle-cap` challenge task |
-| `pi05_tower-of-hanoi-game` | `tower-of-hanoi-game` challenge task |
-
-> The upstream openpi repo also ships generic configs (`pi05_libero`, `pi05_droid`, `pi05_aloha`, …) further down the file; those are not part of the RLLAB tabletop baseline.
-
-## Evaluation
-
-Start the policy server (in a separate terminal):
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_tabletop \
-    --policy.dir=/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_rft_phase2_rl_mh/pi05_rft_phase2_rl_mh/25000
-```
-
-Run the evaluation script:
-
-```bash
-# Single task, 5 episodes
-uv run examples/tabletop_sim/main.py \
-    --args.task-name aloha_handover_box \
-    --args.num-episodes 50 \
-    --args.replan-steps 25 \
-    --args.video_out_path data/tabletop_sim/pi05_tabletop_bc
-```
-
-Key options:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--args.task-name` | `aloha_handover_box` | Task name, or `all` to evaluate every task |
-| `--args.num-episodes` | `50` | Rollouts per task |
-| `--args.replan-steps` | `25` | Steps to execute per action chunk (= action_horizon / 2) |
-| `--args.use-benchmark-init` | `True` | Use reproducible initial states |
-| `--args.video-out-path` | `data/tabletop_sim/videos` | Where to save rollout videos |
-| `--args.value-plot` | `False` | Overlay the critic `E[V]` curve next to the camera (critic models only) |
-| `--args.action-overlay` | `False` | Project predicted gripper paths onto the camera: base samples vs steered chunk (LPS-RFT only) |
-
-### Action / Value Overlays (LPS-RFT steering debug)
-
-To debug whether latent steering pushes the action chunk off-distribution, the server
-can also return **N base-policy action samples** (random sphere latents) alongside the
-steered chunk, and the eval client projects the predicted **gripper paths** onto the
-camera via forward kinematics + the `teleoperator_pov` camera matrix.
-
-Start the server with `--num-action-samples N` (LPS-RFT checkpoints only — needs
-`sample_random_actions`):
-
-```bash
-CUDA_VISIBLE_DEVICES=2 XLA_FLAGS="--xla_gpu_autotune_level=0" \
-uv run scripts/serve_policy.py \
-    --num-action-samples 16 \
-    policy:checkpoint \
-    --policy.config=pi05_rft_phase2_rl_mh_ens \
-    --policy.dir=/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/lps-rft/<run>/<step>
-```
-
-Run the client with `--args.action-overlay` (add `--args.value-plot` for the E[V] video too):
-
-```bash
-MUJOCO_GL=egl uv run examples/tabletop_sim/main.py \
-    --args.task-name aloha_handover_box \
-    --args.num-episodes 5 \
-    --args.replan-steps 25 \
-    --args.action-overlay \
-    --args.video-out-path data/tabletop_sim/lps_action_overlay
-```
-
-This writes `<task>_ep<NNN>_<success|failure>_actions.mp4`: the camera with the **base
-samples** (faint, left arm light-blue / right arm light-orange) and the **latent-steered
-chunk** (bold blue / orange), a dot marking the current step. If the steered path stays
-inside the faint cloud, steering is in-distribution; if it shoots out of frame, the
-latent actor is producing off-distribution (exploding) actions. Base samples need
-`--num-action-samples > 0` on the server; without it only the steered path is drawn.
-
-### Critic Visualization
-
-For critic models (`Pi0WithCritic`, e.g. `pi05_alphaflow_critic_tabletop`), render an
-mp4 of one trajectory with the camera view on the left and the critic's per-step
-predicted value `E[V]` (from the ground-truth action chunk) vs the ground-truth
-Monte-Carlo return on the right:
-
-```bash
-./visualize_critic.sh <config> <checkpoint_dir> <repo_id> [episode] [output]
-
-# Example
-./visualize_critic.sh \
-    pi05_alphaflow_critic_tabletop \
-    checkpoints/pi05_alphaflow_critic_tabletop/pi05_alphaflow_critic_tabletop/14999 \
-    jellyho/aloha_handover_box_joint_pos_rl_mc \
-    0
-```
-
-The dataset must contain an `mc_return` column (see `scripts/compute_mc_returns.py`).
-A well-trained critic's `E[V]` curve should track the GT MC return; a flat or
-mismatched curve indicates the critic did not learn the value well.
-
-| Arg | Default | Description |
-|---|---|---|
-| `config` | — | Train config name (must be a critic model) |
-| `checkpoint_dir` | — | Checkpoint dir containing `params/` and `assets/` |
-| `repo_id` | — | LeRobot dataset with the `mc_return` column |
-| `episode` | `0` | Episode index to visualize |
-| `output` | `data/critic_vis/<config>_ep<episode>.mp4` | Output mp4 path |
-
-### Baseline Results
-
-Evaluated on `aloha_handover_box` with `benchmark_init`, 50 episodes, `replan_steps=25`.
-
-| Model | Dataset | Success Rate |
-|---|---|---|
-| `pi05_tabletop_bc` | `jellyho/aloha_handvoer_box_joint_pos_bc` (success only) | --% |
-
----
-
-# openpi
-
-openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
-
-Currently, this repo contains three types of models:
-- the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
-- the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
-- the [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05), an upgraded version of π₀ with better open-world generalization trained with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation). Note that, in this repository, we currently only support the flow matching head for both $\pi_{0.5}$ training and inference.
-
-For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
-
-This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
-
-## Updates
-
-- [Sept 2025] We released PyTorch support in openpi.
-- [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
-- [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
-
-
-## Requirements
-
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
-
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
-
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
-
-## Installation
-
-When cloning this repo, make sure to update submodules:
-
-```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
-
-# Or if you already cloned the repo:
-git submodule update --init --recursive
-```
-
-We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
-
-```bash
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-```
-
-NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
-
-**Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
-
-
-
-
-## Model Checkpoints
-
-### Base Models
-We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
-
-| Model        | Use Case    | Description                                                                                                 | Checkpoint Path                                |
-| ------------ | ----------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| $\pi_0$      | Fine-Tuning | Base [π₀ model](https://www.physicalintelligence.company/blog/pi0) for fine-tuning                | `gs://openpi-assets/checkpoints/pi0_base`      |
-| $\pi_0$-FAST | Fine-Tuning | Base autoregressive [π₀-FAST model](https://www.physicalintelligence.company/research/fast) for fine-tuning | `gs://openpi-assets/checkpoints/pi0_fast_base` |
-| $\pi_{0.5}$    | Fine-Tuning | Base [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05) for fine-tuning    | `gs://openpi-assets/checkpoints/pi05_base`      |
-
-### Fine-Tuned Models
-We also provide "expert" checkpoints for various robot platforms and tasks. These models are fine-tuned from the base models above and intended to run directly on the target robot. These may or may not work on your particular robot. Since these checkpoints were fine-tuned on relatively small datasets collected with more widely available robots, such as ALOHA and the DROID Franka setup, they might not generalize to your particular setup, though we found some of these, especially the DROID checkpoint, to generalize quite broadly in practice.
-
-| Model                    | Use Case    | Description                                                                                                                                                                                              | Checkpoint Path                                       |
-| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| $\pi_0$-FAST-DROID       | Inference   | $\pi_0$-FAST model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): can perform a wide range of simple table-top manipulation tasks 0-shot in new scenes on the DROID robot platform | `gs://openpi-assets/checkpoints/pi0_fast_droid`       |
-| $\pi_0$-DROID            | Fine-Tuning | $\pi_0$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): faster inference than $\pi_0$-FAST-DROID, but may not follow language commands as well                                | `gs://openpi-assets/checkpoints/pi0_droid`            |
-| $\pi_0$-ALOHA-towel      | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can fold diverse towels 0-shot on ALOHA robot platforms                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_towel`      |
-| $\pi_0$-ALOHA-tupperware | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can unpack food from a tupperware container                                                                                                             | `gs://openpi-assets/checkpoints/pi0_aloha_tupperware` |
-| $\pi_0$-ALOHA-pen-uncap  | Inference   | $\pi_0$ model fine-tuned on public [ALOHA](https://dit-policy.github.io/) data: can uncap a pen                                                                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap`  |
-| $\pi_{0.5}$-LIBERO      | Inference   | $\pi_{0.5}$ model fine-tuned for the [LIBERO](https://libero-project.github.io/datasets) benchmark: gets state-of-the-art performance (see [LIBERO README](examples/libero/README.md)) | `gs://openpi-assets/checkpoints/pi05_libero`      |
-| $\pi_{0.5}$-DROID      | Inference / Fine-Tuning | $\pi_{0.5}$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/) with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation): fast inference and good language-following | `gs://openpi-assets/checkpoints/pi05_droid`      |
-
-
-By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
-
-
-
-
-## Running Inference for a Pre-Trained Model
-
-Our pre-trained model checkpoints can be run with a few lines of code (here our $\pi_0$-FAST-DROID model):
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-
-# Create a trained policy.
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference on a dummy example.
-example = {
-    "observation/exterior_image_1_left": ...,
-    "observation/wrist_image_left": ...,
-    ...
-    "prompt": "pick up the fork"
-}
-action_chunk = policy.infer(example)["actions"]
-```
-You can also test this out in the [example notebook](examples/inference.ipynb).
-
-We provide detailed step-by-step examples for running inference of our pre-trained checkpoints on [DROID](examples/droid/README.md) and [ALOHA](examples/aloha_real/README.md) robots.
-
-**Remote Inference**: We provide [examples and code](docs/remote_inference.md) for running inference of our models **remotely**: the model can run on a different server and stream actions to the robot via a websocket connection. This makes it easy to use more powerful GPUs off-robot and keep robot and policy environments separate.
-
-**Test inference without a robot**: We provide a [script](examples/simple_client/README.md) for testing inference without a robot. This script will generate a random observation and run inference with the model. See [here](examples/simple_client/README.md) for more details.
-
-
-
-
-
-## Fine-Tuning Base Models on Your Own Data
-
-We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-project.github.io/datasets) as a running example for how to fine-tune a base model on your own data. We will explain three steps:
-1. Convert your data to a LeRobot dataset (which we use for training)
-2. Defining training configs and running training
-3. Spinning up a policy server and running inference
-
-### 1. Convert your data to a LeRobot dataset
-
-We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
-
-```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
-```
-
-**Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
-
-### 2. Defining training configs and running training
-
-To fine-tune a base model on your own data, you need to define configs for data processing and training. We provide example configs with detailed comments for LIBERO below, which you can modify for your own dataset:
-
-- [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
-- [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
-
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
-
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
-
-```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
-```
-
-Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
-```
-
-The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
-
-**Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
-
-### 3. Spinning up a policy server and running inference
-
-Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
-```
-
-This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
-
-For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
-
-If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).
-
-
-
-### More Examples
-
-We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:
-- [ALOHA Simulator](examples/aloha_sim)
-- [ALOHA Real](examples/aloha_real)
-- [UR5](examples/ur5)
-
-## PyTorch Support
-
-openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
-
-- The π₀-FAST model
-- Mixed precision training
-- FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
-
-### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
-
-### Converting JAX Models to PyTorch
-
-To convert a JAX model checkpoint to PyTorch format:
-
-```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /path/to/jax/checkpoint \
-    --config_name <config name> \
-    --output_path /path/to/converted/pytorch/checkpoint
-```
-
-### Running Inference with PyTorch
-
-The PyTorch implementation uses the same API as the JAX version - you only need to change the checkpoint path to point to the converted PyTorch model:
-
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = "/path/to/converted/pytorch/checkpoint"
-
-# Create a trained policy (automatically detects PyTorch format)
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference (same API as JAX)
-action_chunk = policy.infer(example)["actions"]
-```
-
-### Policy Server with PyTorch
-
-The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir=/path/to/converted/pytorch/checkpoint
-```
-
-### Finetuning with PyTorch
-
-To finetune a model in PyTorch:
-
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
-
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
-
-3. Launch training using one of these modes:
-
-```bash
-# Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
-
-# Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
-
-# Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
-
-# Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
-
-# Multi-Node Training:
-uv run torchrun \
-    --nnodes=<num_nodes> \
-    --nproc_per_node=<gpus_per_node> \
-    --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> \
-    --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
-```
-
-### Precision Settings
-
-JAX and PyTorch implementations handle precision as follows:
-
-**JAX:**
-1. Inference: most weights and computations in bfloat16, with a few computations in float32 for stability
-2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
-
-**PyTorch:**
-1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
-
-With torch.compile, inference speed is comparable between JAX and PyTorch.
-
-## Troubleshooting
-
-We will collect common issues and their solutions here. If you encounter an issue, please check here first. If you can't find a solution, please file an issue on the repo (see [here](CONTRIBUTING.md) for guidelines).
-
-| Issue                                     | Resolution                                                                                                                                                                                   |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may want to consider disabling EMA.        |
-| Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
-| Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
-| CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
-| Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
-| Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
-| Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+## Credits
+
+Built on **openpi** by [Physical Intelligence](https://www.physicalintelligence.company/) — the
+π₀ / π₀.₅ flow-based VLA models and training/serving infrastructure. See the
+[upstream repo](https://github.com/Physical-Intelligence/openpi) for base-model checkpoints,
+PyTorch support, and the DROID / LIBERO / ALOHA examples.

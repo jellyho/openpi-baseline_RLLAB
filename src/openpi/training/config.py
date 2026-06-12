@@ -15,9 +15,6 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
-import openpi.models.pi0_alphaflow as pi0_alphaflow
-import openpi.models.pi0_alphaflow_critic as pi0_alphaflow_critic
-import openpi.models.pi0_lps_rft as pi0_lps_rft
 import openpi.models.pi0_rlt as pi0_rlt
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
@@ -761,20 +758,6 @@ def _tabletop_data(repo_id, *, include_mc_return=False, include_next_obs=False):
     )
 
 
-def _critic_model(*, warmup_ratio, transition_ratio, **kw):
-    """Pi0WithCriticConfig with the tuned AlphaFlow recipe (flow_ratio=0.25, λ 0.5/0.5)."""
-    return pi0_alphaflow_critic.Pi0WithCriticConfig(
-        pi05=True,
-        num_train_steps=30_000,
-        flow_ratio=0.25,
-        lambda_fm=0.5,
-        lambda_mf=0.5,
-        warmup_ratio=warmup_ratio,
-        transition_ratio=transition_ratio,
-        **kw,
-    )
-
-
 def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
     """DualYamDataConfig for a Challenge expert-data task (pi-adapted, delta actions).
 
@@ -785,8 +768,8 @@ def _dualyam_data(task, *, include_mc_return=False, include_next_obs=False):
         repo_id=f"jellyho/{task}_rl_224",
         base_config=DataConfig(
             prompt_from_task=True,
-            local_files_path=f"/home/yonsei_jell/{task}",
-            # local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
+            # local_files_path=f"/home/yonsei_jell/{task}",
+            local_files_path=f"/data5/jellyho/PFR_RSS/dataset/phase1_merged/{task}",
         ),
         use_delta_joint_actions=True,
         adapt_to_pi=True,
@@ -936,7 +919,8 @@ _CONFIGS = [
             repo_id="jellyho/phase1_combined",
             base_config=DataConfig(
                 prompt_from_task=True,
-                local_files_path="/home/yonsei_jell/dualyam_combined",
+                # local_files_path="/home/yonsei_jell/dualyam_combined",
+                local_files_path="/data5/jellyho/PFR_RSS/dataset/phase1_combined",
             ),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
@@ -948,7 +932,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.AlphaFlowWeightLoader(
-            "/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
+            "/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_generalist_bc_ft/pi05_generalist_bc_ft/99999/params"
         ),
         lr_schedule=_optimizer.ConstantSchedule(lr=1e-4),
         num_train_steps=100_000,

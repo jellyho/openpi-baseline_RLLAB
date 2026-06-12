@@ -129,6 +129,18 @@ Builds a deployable **bundle** directory: `params/` (RLT orbax params, symlink o
 `critic/{params.msgpack,net.json}` + `aqc_manifest.json`. A bundle (not a single spliced pytree)
 keeps the nnx VLA and the linen critic robustly co-located and framework-agnostic.
 
+**Two deployable flavors — same merge, same critic, just the `--rlt-config`.** merge is
+RLT-agnostic (it only records `rlt_config_name`); the inference wrapper then auto-detects the model
+class and picks the matching forward path, so the *same trained critic* deploys against either RLT:
+
+| `--rlt-config` | model | backbone forwards / step | token |
+|---|---|---|---|
+| `pi05_<task>_rlt` | `Pi0RLT` | **2** (image-only token + full sampling) | language-free |
+| `pi05_<task>_rlt_joint` | `Pi0RLTJoint` | **1** (token from the sampling forward) | language-conditioned |
+
+The critic action space is identical for both (raw joint), so a critic trained on one task's
+annotations serves either RLT flavor of that task.
+
 ## Stage 3 — adaptive inference (`inference.py`)
 
 `AQCAdaptive.load(bundle).sample_actions(rng, obs, exec_mode=...)`: RLT samples N base chunks +
@@ -151,6 +163,24 @@ out = policy.infer(obs_dict)   # -> {actions, h_star, n_star, q_by_h, policy_tim
 `infer` applies the RLT config's input transforms (repack / normalize / tokenize / resize), runs
 the adaptive selection, and returns raw actions. norm_stats load from the RLT checkpoint that
 produced the bundle (same stats as training/annotation). Drop-in for the websocket policy server.
+
+> **Raw-space critic query.** The critic trains on the raw joint `action` / `base_action` columns
+> (no normalization). `sample_actions` therefore **decodes** each sampled chunk
+> (Unnormalize → AbsoluteActions → YamOutputs) back to that raw joint space *before* scoring — the
+> decoder is identical to the one `compute_rl_tokens.py` used to write `base_action`, so the
+> train/infer action spaces match exactly. (Requires `norm_stats`; without it the score is a
+> shape-only passthrough and is loudly warned — smoke tests only.)
+
+**Verify either flavor end-to-end without a trained critic** (`scripts/smoke_aqc_full.py
+--mock-critic` fabricates a random-init critic; values are meaningless, it proves the path runs):
+
+```bash
+JAX_PLATFORMS=cpu .venv/bin/python scripts/smoke_aqc_full.py \
+  --rlt-config pi05_seal-water-bottle-cap_rlt \
+  --rlt-checkpoint checkpoints/pi05_seal-water-bottle-cap_rlt/.../20000 \
+  --mock-critic --num-samples 2 --num-flow-steps 2
+# vanilla (joint=False, decode=real): real 2B forward -> critic prefix-Q -> (n*,h*) -> both exec modes  ✓
+```
 
 ---
 
