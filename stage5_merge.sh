@@ -8,7 +8,7 @@
 #  only records the config name and inference auto-detects the model class.
 #
 #  Usage:
-#    ./merge_aqc.sh [RLT_CONFIG] [RLT_CKPT_STEPDIR] [CRITIC_RUN_DIR] [OUT_BUNDLE]
+#    ./stage5_merge.sh [RLT_CONFIG] [RLT_CKPT_STEPDIR] [CRITIC_RUN_DIR] [OUT_BUNDLE]
 #      any omitted positional falls back to the default below (or its env var).
 #
 #  Env knobs:

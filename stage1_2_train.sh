@@ -3,11 +3,15 @@
 #  Training launcher
 #
 #  Usage:
-#    ./train.sh <config> <num_gpus> <batch_per_gpu> <num_steps>
+#    ./stage1_2_train.sh <config>
 #
-#  Example:
-#    ./train.sh pi05_alphaflow_critic_tabletop 8 16 30000
-#      → 8 GPUs, 16 samples/GPU (global batch 128), 30k steps
+#  Examples:
+#    ./stage1_2_train.sh pi05_insert-mouse-battery_bc_ft    # stage 1 (BC)
+#    ./stage1_2_train.sh pi05_generalist_rlt_joint          # stage 2 (RLT)
+#
+#  Checkpoints go to $PI_CKPT_DIR/<config>/<config>/<step>.  $PI_CKPT_DIR is the
+#  global default from setup_env.sh; override per run with
+#    PI_CKPT_DIR=/path/to/checkpoints ./stage1_2_train.sh <config>
 # ============================================================
 
 source setup_env.sh
@@ -31,5 +35,6 @@ LOG_FILE="logs/${CONFIG}_$(date +%Y%m%d-%H%M%S).log"
 
 uv run scripts/train.py "$CONFIG" \
     --exp-name="$CONFIG" \
+    --checkpoint-base-dir="$PI_CKPT_DIR" \
     --fsdp-devices=1 \
     --resume

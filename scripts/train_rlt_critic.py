@@ -292,6 +292,7 @@ def main():
         mc_ramp_steps: int = -1            # >=0 overrides td.mc_ramp_steps (beta 0->1 ramp length)
         agg_beta: float = 0.0              # >0 overrides td.agg_beta (softmax temperature sweep)
         loader_processes: int = -1         # >=0 overrides cfg.loader_processes (0 = thread loader)
+        checkpoint_base_dir: str = ""      # override where runs are written (run dir = base/<name>/<exp>); "" = config default
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
@@ -311,7 +312,8 @@ def main():
             mc_ramp_steps=cfg.td.mc_ramp_steps if args.mc_ramp_steps < 0 else args.mc_ramp_steps))
     cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "",
                               task=args.task or cfg.task,
-                              data_root_override=args.data_root or cfg.data_root_override)
+                              data_root_override=args.data_root or cfg.data_root_override,
+                              checkpoint_base_dir=args.checkpoint_base_dir or cfg.checkpoint_base_dir)
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 

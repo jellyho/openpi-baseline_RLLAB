@@ -9,15 +9,15 @@
 #  either order on the same dataset root.
 #
 #  Usage:
-#    ./annotate_reward.sh <DATASET_ROOT> [WORKERS]
+#    ./stage3b_stage3b_annotate_reward.sh <DATASET_ROOT> [WORKERS]
 #      WORKERS  parallel episode workers (default 4)
 #
-#  Dry run (design summary, no writes):  DRY_RUN=1 ./annotate_reward.sh <DATASET_ROOT>
+#  Dry run (design summary, no writes):  DRY_RUN=1 ./stage3b_stage3b_annotate_reward.sh <DATASET_ROOT>
 # ============================================================
 set -e
 source setup_env.sh
 
-ROOT="${1:?usage: ./annotate_reward.sh <DATASET_ROOT> [WORKERS]}"
+ROOT="${1:?usage: ./stage3b_stage3b_annotate_reward.sh <DATASET_ROOT> [WORKERS]}"
 WORKERS="${2:-4}"
 
 EXTRA=()

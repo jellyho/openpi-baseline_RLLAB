@@ -15,26 +15,20 @@ The three challenge tasks are pre-registered as training configs:
 
 ## Pipeline
 
-```
-                 stage 1                stage 2                 stage 3                       stage 4              stage 5
-  pi05_base ──► BC fine-tune ──► RLT bottleneck (frozen ──► annotate dataset ───────────► AQC prefix ──► merge + deploy
-              (pi05_*_bc_ft)     VLA, train rlt_* only)     • rl_token + base_action       critic        (adaptive Q-chunking
-                                 (pi05_*_rlt[_joint])         (trained RLT, GPU)            (rlt_critic)   replanning policy)
-                                                            • reward v3 + mc_return
-                                                              (CPU annotate)
-```
+![Pipeline overview](docs/overview.png)
 
-Each stage is one command. The critic (stage 4) reads only the annotated `rl_token` /
-`base_action` / `mc_return` columns, so it trains **without any VLA forward pass** — fast and cheap.
+Each stage is one root-level launcher (`stageN_*.sh`). The critic (stage 4) reads only the
+annotated `rl_token` / `base_action` / `mc_return` columns, so it trains **without any VLA forward
+pass** — fast and cheap.
 
 | Stage | What | Command |
 |---|---|---|
-| 1 | BC fine-tune π₀.₅ on a challenge task | `bash train.sh pi05_<task>_bc_ft` |
-| 2 | Train the RL-token bottleneck on the frozen BC policy | `bash train.sh pi05_<task>_rlt_joint` |
-| 3a | Annotate `rl_token` + `base_action` (multi-GPU) | `bash annotate_rlt_joint.sh` |
-| 3b | Annotate reward v3 + `mc_return` | `bash annotate_reward.sh <dataset_root>` |
-| 4 | Train the AQC prefix critic | `scripts/train_rlt_critic.sh vla_aqc_warmup 64 <gpu>` |
-| 5 | Merge into a deployable bundle, then serve | `bash merge_aqc.sh <rlt_config> <rlt_ckpt> <critic_run> <out>` → deploy |
+| 1 | BC fine-tune π₀.₅ on a challenge task | `bash stage1_2_train.sh pi05_<task>_bc_ft` |
+| 2 | Train the RL-token bottleneck on the frozen BC policy | `bash stage1_2_train.sh pi05_<task>_rlt_joint` |
+| 3a | Annotate `rl_token` + `base_action` (multi-GPU) | `bash stage3a_annotate_rlt_joint.sh` |
+| 3b | Annotate reward v3 + `mc_return` | `bash stage3b_annotate_reward.sh <dataset_root>` |
+| 4 | Train the AQC prefix critic | `bash stage4_train_critic.sh vla_aqc_warmup 64 <gpu>` |
+| 5 | Merge into a deployable bundle, then serve | `bash stage5_merge.sh <rlt_config> <rlt_ckpt> <critic_run> <out>` → deploy |
 
 ---
 
@@ -54,7 +48,7 @@ GPU; the AQC critic (stage 4) is ~10 M params and fits in <8 GB.
 ## 1. Configure
 
 **Environment** — edit [`setup_env.sh`](setup_env.sh) for your cluster (sourced automatically by
-`train.sh`):
+every `stageN_*.sh` launcher):
 
 ```bash
 export OPENPI_DATA_HOME=...   # where pretrained checkpoints are downloaded / cached
@@ -79,10 +73,10 @@ dependencies:
 Fine-tune π₀.₅ on a single challenge task (or the merged generalist):
 
 ```bash
-bash train.sh pi05_insert-mouse-battery_bc_ft     # or _seal-water-bottle-cap_, _tower-of-hanoi-game_, _generalist_
+bash stage1_2_train.sh pi05_insert-mouse-battery_bc_ft   # or _seal-water-bottle-cap_, _tower-of-hanoi-game_, _generalist_
 ```
 
-`train.sh` sources `setup_env.sh`, runs `scripts/train.py <config> --resume`, and tees logs to
+`stage1_2_train.sh` sources `setup_env.sh`, runs `scripts/train.py <config> --resume`, and tees logs to
 `logs/<config>_<timestamp>.log`. Norm stats are computed once and saved next to the checkpoint
 (`params/<asset_id>/norm_stats.json`), making `params/` self-contained for inference.
 
@@ -97,7 +91,7 @@ the **frozen** BC policy. An encoder–decoder compresses the VLA's prefix image
 into a compact 2048-d latent `z_rl`; only the `rlt_*` params train (VLA + action expert stay frozen).
 
 ```bash
-bash train.sh pi05_generalist_rlt_joint           # or pi05_<task>_rlt_joint
+bash stage1_2_train.sh pi05_generalist_rlt_joint   # or pi05_<task>_rlt_joint
 ```
 
 Two variants:
@@ -116,7 +110,7 @@ The critic reads four columns from the LeRobot v3.0 dataset. Two annotation pass
 `CONFIG` / `CKPT` / `SRC` / `OUT` / `GPUS` variables at the top of the script, then:
 
 ```bash
-bash annotate_rlt_joint.sh        # joint model (single backbone forward); annotate_rlt.sh for vanilla
+bash stage3a_annotate_rlt_joint.sh   # joint model (single backbone forward); stage3a_annotate_rlt.sh for vanilla
 ```
 
 It shards files across GPUs (DDP-style: GPU sampling is the bottleneck, data loading is ~100× faster),
@@ -125,7 +119,7 @@ writes per-frame columns, and registers the new features in `meta/info.json` onc
 **(3b) Reward v3 + Monte-Carlo return** — CPU-only, idempotent (skips if already v3):
 
 ```bash
-bash annotate_reward.sh <dataset_root>          # add WORKERS as $2; DRY_RUN=1 for the design summary
+bash stage3b_annotate_reward.sh <dataset_root>   # add WORKERS as $2; DRY_RUN=1 for the design summary
 ```
 
 The annotated columns:
@@ -149,16 +143,19 @@ A small causal transformer (`src/openpi/rlt_critic/`) learns the **prefix-condit
 deployment pick how many steps to execute.
 
 ```bash
-# detached single run (survives the shell)
-scripts/train_rlt_critic.sh vla_aqc_warmup 64 3                 # CONFIG  BATCH  GPU
+# one GPU, foreground (logs to logs/); auto-resumes from the last checkpoint
+bash stage4_train_critic.sh vla_aqc_warmup 64 <gpu>            # CONFIG  BATCH  GPU
 
-# overnight / unattended: auto-resume on crash from the last checkpoint
-scripts/train_rlt_critic_supervised.sh vla_aqc_warmup 64 3
+# detached / overnight auto-resume-on-crash variants:
+scripts/train_rlt_critic.sh vla_aqc_warmup 64 <gpu>
+scripts/train_rlt_critic_supervised.sh vla_aqc_warmup 64 <gpu>
 ```
 
 Set the dataset per task in `src/openpi/rlt_critic/config.py` (`TASKS[...]`) or pass
-`--data_root <annotated_root>`. Checkpoints (every 25k), `metrics.csv`, and offline W&B land under
-`config.checkpoint_base_dir/<name>/<run>/`. Resume with `EXTRA="--resume"`.
+`EXTRA="--data_root <annotated_root>"`. Checkpoints (every 25k), `metrics.csv`, and offline W&B land
+under `<RLT_CRITIC_CKPT_DIR>/<name>/<run>/` — `RLT_CRITIC_CKPT_DIR` is set globally in
+[`setup_env.sh`](setup_env.sh); override per run with `CKPT_DIR=… bash stage4_train_critic.sh …` or
+the `--checkpoint_base_dir` flag.
 
 **Critic design** — `n_embd=384 / 3 layers / K=2` ensemble (min-aggregated), HL-Gauss 201 atoms over
 `[-1, 0]`, **macro-grouping** 10 (the 50-step chunk → 5 macro-tokens → replan at 10/20/30/40/50
@@ -184,7 +181,7 @@ baseline), `vla_aqc_hardmax` / `vla_aqc_no_floor` / `vla_aqc_warmup_softmax` (ta
 RLT flavor — vanilla `*_rlt` or `*_rlt_joint`):
 
 ```bash
-bash merge_aqc.sh <rlt_config> <rlt_step_dir> <critic_run_dir> <out_bundle>
+bash stage5_merge.sh <rlt_config> <rlt_step_dir> <critic_run_dir> <out_bundle>
 #   COPY_RLT=1 to copy (not symlink) the RLT params into a portable bundle.
 ```
 
@@ -231,12 +228,15 @@ src/openpi/
   policies/          input/output transforms (yam_policy for the challenge DualYam robot)
   training/          train loop, data loader, configs, checkpointing
 scripts/
-  train.py                       main VLA training loop  (stages 1–2, via train.sh)
-  compute_rl_tokens.py           rl_token + base_action annotation  (via annotate_rlt*.sh)
-  train_rlt_critic.py / .sh      AQC critic training  (stage 4)
+  train.py                       main VLA training loop  (stages 1–2, via stage1_2_train.sh)
+  compute_rl_tokens.py           rl_token + base_action annotation  (via stage3a_annotate_rlt*.sh)
+  train_rlt_critic.py            AQC critic training  (stage 4, via stage4_train_critic.sh)
   merge_lerobot.py               concatenate LeRobot datasets (generalist / DAgger)
 adaptive_q_chunking/data_annoation/reward_annotate.py   reward v3 + mc_return  (stage 3b)
-train.sh · annotate_rlt[_joint].sh · setup_env.sh       launchers
+
+root launchers (one per stage):
+  stage1_2_train.sh   stage3a_annotate_rlt[_joint].sh   stage3b_annotate_reward.sh
+  stage4_train_critic.sh   stage5_merge.sh   ·   setup_env.sh (shared env / paths)
 ```
 
 ---

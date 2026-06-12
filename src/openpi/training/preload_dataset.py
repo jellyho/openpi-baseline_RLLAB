@@ -11,7 +11,7 @@ tmpfs), then serve frames by index from the memmap — no per-step video decode,
 NFS, shared across workers via mmap.
 
 Usage (opt-in, no behavior change unless enabled):
-    OPENPI_PRELOAD_FRAMES=1 ./train.sh <config> ...
+    OPENPI_PRELOAD_FRAMES=1 ./stage1_2_train.sh <config> ...
 The cache is built on first use (idempotent) under
     $OPENPI_PRELOAD_DIR (default /dev/shm/openpi_framecache)/<repo_id>/
 and reused by every worker.  Size = total_frames * H * W * 3 * n_cameras bytes

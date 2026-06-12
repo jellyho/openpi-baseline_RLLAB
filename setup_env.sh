@@ -21,9 +21,21 @@ export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$CACHE_DIR/.cache/jax_compile}"
 export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
 
+# Checkpoint output bases (global defaults; override per run by exporting these or
+# passing the matching flag). Keep checkpoints off the small/quota'd home dir.
+#   PI_CKPT_DIR         pi/VLA training (scripts/train.py, stages 1-2) — dir =
+#                       <PI_CKPT_DIR>/<config>/<exp>/<step>. Passed by stage1_2_train.sh
+#                       as --checkpoint-base-dir.  Default "./checkpoints" = openpi default.
+#   RLT_CRITIC_CKPT_DIR RLT/AQC critic runs (stage4_train_critic.sh) — dir =
+#                       <base>/<name>/<exp>.  Passed as --checkpoint_base_dir.
+export PI_CKPT_DIR="${PI_CKPT_DIR:-./checkpoints}"
+export RLT_CRITIC_CKPT_DIR="${RLT_CRITIC_CKPT_DIR:-$CACHE_DIR/PFR_RSS/checkpoints/rlt_critic_runs}"
+
 echo "Environment variables set:"
 echo "  HF_HOME:          $HF_HOME"
 echo "  HF_LEROBOT_HOME:  $HF_LEROBOT_HOME"
 echo "  OPENPI_DATA_HOME: $OPENPI_DATA_HOME"
 echo "  JAX_COMPILATION_CACHE_DIR: $JAX_COMPILATION_CACHE_DIR"
 echo "  HF_HUB_ENABLE_HF_TRANSFER: $HF_HUB_ENABLE_HF_TRANSFER"
+echo "  PI_CKPT_DIR: $PI_CKPT_DIR"
+echo "  RLT_CRITIC_CKPT_DIR: $RLT_CRITIC_CKPT_DIR"

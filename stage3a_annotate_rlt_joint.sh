@@ -3,7 +3,7 @@
 #  Annotate a LeRobot dataset with rl_token + base_action
 #  using a JOINT RLT model (Pi0RLTJoint).
 #
-#  Difference vs annotate_rlt.sh (vanilla Pi0RLT):
+#  Difference vs stage3a_annotate_rlt.sh (vanilla Pi0RLT):
 #    The joint model's RL token comes from the image-token hidden
 #    states of the SAME full pi_vla forward used for action sampling,
 #    so compute_rl_tokens.py runs the 2B backbone ONCE per state
