@@ -64,27 +64,28 @@ class ArchConfig:
 @dataclass(frozen=True)
 class DistConfig:
     """Distributional (HL-Gauss) value head."""
-    num_atoms: int = 201            # 201 over [-0.5, 0] -> bin width 0.0025
+    num_atoms: int = 201            # 201 over [-1, 0] -> bin width 0.005
     hl_gauss_sigma_frac: float = 0.75   # sigma = frac * (v_max - v_min) / num_atoms
     # How the value support [v_min, v_max] is set:
     #   'fixed'       -> use v_min/v_max below
     #   'reward_norm' -> rewards scaled into [-1, 0]; support fixed to [-1, 0]
     #   'data'        -> p1/p99 of return-to-go + margin (DEAS data-centric)
     support_mode: Literal["fixed", "reward_norm", "data"] = "fixed"
-    # mouse-battery (v1/v2 annotation): precomputed mc_return is gamma=0.995, range exactly
-    # [-0.5, 0] (stats.json: living=-1e-4, success=0, failure-terminal=-0.5). Match the support
-    # to the data so the atoms aren't wasted on an empty [-1,-0.5] half.
-    v_min: float = -0.5
+    # v3 annotation (reward_annotate.py): raw living=-1/step, failure=-0.4*T_max, gamma=0.9999,
+    # globally normalized so the deepest return-to-go is exactly -1 -> mc_return in [-1, 0].
+    # This makes steps-to-go (hence prefix length) informative, which the [-0.5,0] v1/v2 scheme
+    # did not (its tiny -1e-4 living cost gave a near-flat value -> prefix_spread collapsed).
+    v_min: float = -1.0
     v_max: float = 0.0
 
 
 @dataclass(frozen=True)
 class TDConfig:
     """MC-return / multi-step TD bootstrap (the ACSAC expected-prefix-max)."""
-    discount: float = 0.995         # MUST match the precomputed mc_return column. mouse-battery
-                                    # (v1/v2 annotation) used gamma=0.995, mc_return in [-0.5,0].
-                                    # cum_reward + gamma^h*v_next and the MC floor all live on this
-                                    # scale. (v3 datasets use 0.9999 -> override per-task.)
+    discount: float = 0.9999        # MUST match the precomputed mc_return column. v3 annotation
+                                    # uses gamma=0.9999 (near-undiscounted; failure penalty stays
+                                    # visible from episode start), mc_return in [-1,0]. cum_reward +
+                                    # gamma^h*v_next and the MC floor all live on this scale.
     # Target kind:
     #   'td' -> per-prefix multi-step TD with the N-candidate joint-max bootstrap (paper)
     #   'mc' -> regress directly to precomputed mc_return (RECAP-style baseline; no bootstrap)
