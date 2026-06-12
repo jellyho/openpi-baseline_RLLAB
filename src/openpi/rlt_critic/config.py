@@ -170,9 +170,9 @@ class OptimConfig:
 # the others are placeholders with the same naming so --task can switch once they land.
 _DATA_BASE = "/NHNHOME/WORKSPACE/0526040008_A/jellyho"
 TASKS = {
-    # mouse-battery is the v1/v2 annotation actually on disk here: raw living=-1e-4,
-    # success=0, failure-terminal=-0.5; precomputed mc_return at gamma=0.995 in [-0.5,0]
-    # (stats.json). Use support [-0.5,0] + td.discount=0.995 (the config defaults).
+    # mouse-battery is v3-annotated on disk here (reward_annotate.py: living=-1/step,
+    # fail=-0.4*T_max, gamma=0.9999, globally normalized so mc_return in [-1,0]). Matches the
+    # config defaults: support [-1,0] + td.discount=0.9999.
     "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated",
     "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated",
     "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated",
