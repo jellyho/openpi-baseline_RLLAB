@@ -23,14 +23,14 @@ CONFIG=pi05_generalist_rlt_joint
 # Trained joint checkpoint STEP dir (must contain params/).  The joint config
 # trains for 100k steps (save_interval 20k) -> last step is 99999.  Update if
 # you annotate from an earlier checkpoint.
-CKPT=/home/yonsei_jell/openpi-baseline_RLLAB/checkpoints/pi05_generalist_rlt_joint/pi05_generalist_rlt_joint/99999
-SRC=/home/yonsei_jell/dualyam_combined                                          # v3.0 source (read-only)
-OUT=/NHNHOME/WORKSPACE/0526040008_A/annotated/generalist_joint_annotated        # roomy Lustre disk (3.8TB free)
+CKPT=/data5/jellyho/PFR_RSS/openpi-baseline_RLLAB/checkpoints/pi05_generalist_rlt_joint/pi05_generalist_rlt_joint/99999
+SRC=/data5/jellyho/PFR_RSS/dataset/phase1_combined                                         # v3.0 source (read-only)
+OUT=/data5/jellyho/PFR_RSS/dataset/phase1_annotated/generalist_joint_annotated        # roomy Lustre disk (3.8TB free)
 
 N=32          # base action samples per frame
 BATCH=128     # raise as GPU memory allows (B200 = 183GB); bigger = faster
 WORKERS=16    # per process (x4 = 64 cores)
-GPUS=(0 1 2 3)
+GPUS=(0 1 2 3 4 5 6 7)
 NUM_SHARDS=${#GPUS[@]}
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9

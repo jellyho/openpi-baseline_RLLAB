@@ -32,9 +32,9 @@ Each stage is one command. The critic (stage 4) reads only the annotated `rl_tok
 | 1 | BC fine-tune π₀.₅ on a challenge task | `bash train.sh pi05_<task>_bc_ft` |
 | 2 | Train the RL-token bottleneck on the frozen BC policy | `bash train.sh pi05_<task>_rlt_joint` |
 | 3a | Annotate `rl_token` + `base_action` (multi-GPU) | `bash annotate_rlt_joint.sh` |
-| 3b | Annotate reward v3 + `mc_return` | `python adaptive_q_chunking/data_annoation/reward_annotate.py --input <root> --inplace` |
+| 3b | Annotate reward v3 + `mc_return` | `bash annotate_reward.sh <dataset_root>` |
 | 4 | Train the AQC prefix critic | `scripts/train_rlt_critic.sh vla_aqc_warmup 64 <gpu>` |
-| 5 | Merge into a deployable bundle, then serve | `python -m openpi.rlt_critic.merge …` → `create_aqc_policy(bundle)` |
+| 5 | Merge into a deployable bundle, then serve | `bash merge_aqc.sh <rlt_config> <rlt_ckpt> <critic_run> <out>` → deploy |
 
 ---
 
@@ -125,8 +125,7 @@ writes per-frame columns, and registers the new features in `meta/info.json` onc
 **(3b) Reward v3 + Monte-Carlo return** — CPU-only, idempotent (skips if already v3):
 
 ```bash
-python adaptive_q_chunking/data_annoation/reward_annotate.py --input <dataset_root> --inplace --workers 4
-#   add --dry_run for the design summary
+bash annotate_reward.sh <dataset_root>          # add WORKERS as $2; DRY_RUN=1 for the design summary
 ```
 
 The annotated columns:
@@ -181,25 +180,25 @@ baseline), `vla_aqc_hardmax` / `vla_aqc_no_floor` / `vla_aqc_warmup_softmax` (ta
 
 ## 6. Stage 5 — Merge & deploy (adaptive Q-chunking)
 
-**Merge** the RLT backbone + trained critic into one deployable bundle:
+**Merge** the RLT backbone + trained critic into one deployable bundle (same command for either
+RLT flavor — vanilla `*_rlt` or `*_rlt_joint`):
 
 ```bash
-python -m openpi.rlt_critic.merge \
-  --rlt-config pi05_generalist_rlt_joint \
-  --rlt-checkpoint <rlt_step_dir> \
-  --critic-run-dir <critic_run_dir> --critic-step latest \
-  --out <bundle>
+bash merge_aqc.sh <rlt_config> <rlt_step_dir> <critic_run_dir> <out_bundle>
+#   COPY_RLT=1 to copy (not symlink) the RLT params into a portable bundle.
 ```
 
 This writes `params/` (RLT orbax params) + `critic/{params.msgpack,net.json}` +
-`aqc_manifest.json`. **Deploy** as an openpi policy:
+`aqc_manifest.json`. **Deploy** the bundle through the websocket server in
+`policy_deployment_RLLAB` with the AQC adapter (fixed-horizon: commits h* steps, pads the rest by
+holding the h*-th absolute target):
 
-```python
-from openpi.rlt_critic.inference import create_aqc_policy
-
-policy = create_aqc_policy("<bundle>", exec_mode="truncate")   # drop-in BasePolicy
-out = policy.infer(obs_dict)   # -> {actions, h_star, n_star, q_by_h, policy_timing}
+```bash
+--policy examples.openpi_aqc_policy:AQCPolicy  --policy-kwargs bundle_dir=<out_bundle>
 ```
+
+Or directly as an openpi policy: `create_aqc_policy("<bundle>", exec_mode="absolute_hold")` →
+`policy.infer(obs)` → `{actions [H,14], h_star, n_star, q_by_h}`.
 
 At each call the RLT samples N candidate chunks + `z_rl` (one backbone forward for the joint model),
 decodes them to raw action space, the prefix critic scores every `(candidate n, length h)`, and a

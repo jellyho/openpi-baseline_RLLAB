@@ -145,7 +145,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", required=True, help="output bundle directory")
     p.add_argument("--rlt-config", required=True, help="RLT TrainConfig name (e.g. pi05_insert-mouse-battery_rlt)")
-    p.add_argument("--rlt-checkpoint", required=True, help="RLT checkpoint STEP dir (contains params/)")
+    p.add_argument("--rlt-checkpoint", required=True, help="RLT checkpoint STEP dir (contains params/), or the params dir itself")
     p.add_argument("--critic-run-dir", required=True, help="critic run dir (has config.json + checkpoints/)")
     p.add_argument("--critic-step", default="latest", help="step number or 'latest'")
     p.add_argument("--num-action-samples", type=int, default=32)
@@ -154,7 +154,11 @@ def main():
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()
 
-    rlt_params = pathlib.Path(args.rlt_checkpoint).resolve() / "params"
+    # Accept either a training STEP dir (contains params/) or a params dir passed
+    # directly (some checkpoints have no params/ subfolder — the dir IS the orbax
+    # params, e.g. manifest.ocdbt/_METADATA live at its top level).
+    _ckpt = pathlib.Path(args.rlt_checkpoint).resolve()
+    rlt_params = _ckpt / "params" if (_ckpt / "params").is_dir() else _ckpt
     build_bundle(
         args.out, rlt_params, args.rlt_config, args.critic_run_dir, args.critic_step,
         num_action_samples=args.num_action_samples, num_flow_steps=args.num_flow_steps,
