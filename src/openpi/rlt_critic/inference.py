@@ -290,8 +290,22 @@ def create_aqc_policy(
     if norm_stats is None:
         if data_config.asset_id is None:
             raise ValueError("asset_id required to load norm stats for the AQC policy")
-        rlt_step_dir = pathlib.Path(manifest["rlt_params"]).resolve().parent  # <step>/params -> <step>
-        norm_stats = _checkpoints.load_norm_stats(rlt_step_dir, data_config.asset_id)
+        # The bundle's params/ is self-contained: for a step-dir RLT it symlinks
+        # <step>/params (carrying <asset_id>/norm_stats.json from save_state); for a flat
+        # orbax store it symlinks the store itself (norm_stats.json at its root). Either
+        # way load_norm_stats finds it under bundle/params. Fall back to the RLT
+        # checkpoint dir + its parent for older/edge layouts.
+        rlt_params = pathlib.Path(manifest["rlt_params"]).resolve()
+        for base in (bundle / "params", rlt_params, rlt_params.parent):
+            try:
+                norm_stats = _checkpoints.load_norm_stats(base, data_config.asset_id)
+                break
+            except FileNotFoundError:
+                continue
+        if norm_stats is None:
+            raise FileNotFoundError(
+                f"norm stats not found for AQC bundle {bundle} (asset_id={data_config.asset_id}); "
+                f"searched bundle/params, {rlt_params}, {rlt_params.parent}")
     data_config = dataclasses.replace(data_config, norm_stats=norm_stats)
 
     ada = AQCAdaptive.load(bundle, data_config=data_config)

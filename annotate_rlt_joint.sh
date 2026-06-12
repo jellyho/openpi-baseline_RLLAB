@@ -29,7 +29,7 @@ OUT=/data5/jellyho/PFR_RSS/dataset/phase1_annotated/generalist_joint_annotated  
 
 N=32          # base action samples per frame
 BATCH=128     # raise as GPU memory allows (B200 = 183GB); bigger = faster
-WORKERS=16    # per process (x4 = 64 cores)
+WORKERS=8    # per process (x4 = 64 cores)
 GPUS=(0 1 2 3 4 5 6 7)
 NUM_SHARDS=${#GPUS[@]}
 
