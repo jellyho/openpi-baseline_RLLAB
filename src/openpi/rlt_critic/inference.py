@@ -26,13 +26,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import pathlib
+import time
 
 import flax.serialization as fs
 import jax
 import jax.numpy as jnp
 import numpy as np
+from openpi_client import base_policy as _base_policy
 
 import openpi.models.model as _model
+import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.transforms as _transforms
 from openpi.rlt_critic.distributional import hl_gauss_transform
@@ -190,24 +193,113 @@ class AQCAdaptive:
         n_star, mh = divmod(flat, self.macro_H)
         h_star = (mh + 1) * self.macro_group_size                    # steps to execute (1..H)
 
-        chunk = base_np[0, n_star]                                   # [H, Dm] normalized (for execution)
+        # Return the chosen chunk in RAW action space (decoded above) — i.e. the absolute joint
+        # targets the robot consumes. exec_mode shapes the tail:
+        chosen = np.asarray(base_raw[n_star])                        # [H, Dr] raw
         if exec_mode == "truncate":
-            executed = chunk[:h_star]
+            executed = chosen[:h_star]                               # [h*, Dr] -> execute, then replan
         elif exec_mode == "absolute_hold":
-            executed = chunk.copy()
-            executed[h_star:] = chunk[h_star - 1]
+            executed = chosen.copy()
+            executed[h_star:] = chosen[h_star - 1]                   # [H, Dr] -> hold the h*-th absolute target
         else:
             raise ValueError(f"unknown exec_mode {exec_mode!r}")
 
         return {
-            "actions": executed,
-            "full_chunk": chunk,
+            "actions": executed,                       # raw absolute joint targets (exec_mode applied)
+            "full_chunk": chosen,                      # [H, Dr] raw chosen candidate (untrimmed)
+            "normalized_chunk": np.asarray(base_np[0, n_star]),  # [H, Dm] model space
             "h_star": int(h_star),
             "n_star": int(n_star),
-            "q_by_h": q.max(axis=0),         # best candidate value at each prefix length
+            "q_by_h": q.max(axis=0),                   # best candidate value at each prefix length
             "q_best": float(q[n_star, mh]),
         }
 
     def predict_value(self, z_rl, base_raw):
         """Prefix-Q [N, macro_H] for given candidates (z_rl [1,L], base_raw [N,H,Dr])."""
         return self._score(z_rl, np.asarray(base_raw))
+
+
+# ===========================================================================
+# Deployable policy: raw obs dict -> adaptive action (openpi serving interface)
+# ===========================================================================
+
+class AQCPolicy(_base_policy.BasePolicy):
+    """BasePolicy wrapper: applies the RLT config's INPUT transforms to a raw obs dict,
+    runs the adaptive (n*, h*) selection, and returns the executed chunk in raw action space.
+
+    ``infer(obs)`` -> ``{actions, h_star, n_star, q_by_h, policy_timing}``. The runtime should
+    execute ``h_star`` steps (``truncate``) — or all H with the tail held (``absolute_hold``) —
+    then call ``infer`` again to replan. Drop-in for the openpi websocket policy server.
+    """
+
+    def __init__(self, ada: "AQCAdaptive", input_transform, *,
+                 exec_mode: str = "truncate", num_samples=None, rng=None, metadata=None):
+        self._ada = ada
+        self._input = input_transform
+        self._exec_mode = exec_mode
+        self._num_samples = num_samples
+        self._rng = rng if rng is not None else jax.random.key(0)
+        self._metadata = metadata or {}
+
+    @property
+    def metadata(self):
+        return self._metadata
+
+    def infer(self, obs: dict) -> dict:  # type: ignore[override]
+        inputs = jax.tree.map(lambda x: x, obs)            # copy (transforms may mutate)
+        inputs = self._input(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[None, ...], inputs)  # add batch dim
+        self._rng, rng = jax.random.split(self._rng)
+        observation = _model.Observation.from_dict(inputs)
+        t0 = time.monotonic()
+        out = self._ada.sample_actions(rng, observation, exec_mode=self._exec_mode,
+                                       num_samples=self._num_samples)
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        return {
+            "actions": np.asarray(out["actions"]),         # raw absolute joint targets
+            "h_star": out["h_star"],
+            "n_star": out["n_star"],
+            "q_by_h": np.asarray(out["q_by_h"]),
+            "policy_timing": {"infer_ms": dt_ms},
+        }
+
+
+def create_aqc_policy(
+    bundle_dir,
+    *,
+    exec_mode: str = "truncate",
+    default_prompt: str | None = None,
+    norm_stats=None,
+    num_samples: int | None = None,
+    rng=None,
+) -> AQCPolicy:
+    """Build a deployable adaptive-Q-chunking policy from a merged bundle.
+
+    Mirrors ``policy_config.create_trained_policy``: the INPUT transforms come from the RLT
+    config's data pipeline (repack/data/normalize/model transforms); the OUTPUT decode is
+    folded into ``AQCAdaptive`` (its ``decode`` already maps sampled chunks to raw action
+    space, which is what the critic scored and what the robot executes). norm_stats are loaded
+    from the RLT checkpoint that produced the bundle, so deployment uses the SAME stats as
+    training/annotation.
+    """
+    bundle = pathlib.Path(bundle_dir).resolve()
+    manifest = json.loads((bundle / "aqc_manifest.json").read_text())
+    tcfg = _config.get_config(manifest["rlt_config_name"])
+    data_config = tcfg.data.create(tcfg.assets_dirs, tcfg.model)
+
+    if norm_stats is None:
+        if data_config.asset_id is None:
+            raise ValueError("asset_id required to load norm stats for the AQC policy")
+        rlt_step_dir = pathlib.Path(manifest["rlt_params"]).resolve().parent  # <step>/params -> <step>
+        norm_stats = _checkpoints.load_norm_stats(rlt_step_dir, data_config.asset_id)
+    data_config = dataclasses.replace(data_config, norm_stats=norm_stats)
+
+    ada = AQCAdaptive.load(bundle, data_config=data_config)
+    input_transform = _transforms.compose([
+        _transforms.InjectDefaultPrompt(default_prompt),
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ])
+    return AQCPolicy(ada, input_transform, exec_mode=exec_mode, num_samples=num_samples,
+                     rng=rng, metadata=tcfg.policy_metadata)

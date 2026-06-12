@@ -162,8 +162,11 @@ class VLALeRobotDataset:
     def summary(self) -> dict:
         n_groups = sum(r.metadata.num_row_groups for r in self._readers.values())
         n_rows = sum(r.metadata.num_rows for r in self._readers.values())
+        # NB: the critic's value support comes from the run config (cfg.dist.v_min/v_max),
+        # NOT from this loader. The old hard-coded ``value_support`` hint was reported here and
+        # was stale for v3 data ([-1,0] vs the constant's [-0.5,0]); dropped to avoid confusion.
         return {"files": len(self.files), "row_groups": n_groups, "rows": n_rows,
-                "horizon": self.horizon, "value_support": self.value_support}
+                "horizon": self.horizon}
 
     # ---- reward relabel (in-loader; avoids re-annotating 181GB of parquet) -------
     def _relabel(self, rew: np.ndarray) -> np.ndarray:

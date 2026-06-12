@@ -79,8 +79,15 @@ directory: `params/` (RLT orbax params, symlink|copy) + `critic/{params.msgpack,
 `AQCAdaptive.load(bundle)` → one model with `sample_actions(rng, obs, exec_mode=...)`:
 RLT samples N base chunks + `z_rl` (Joint 1-forward / vanilla 2-call) → decode to the critic's
 raw action space → prefix critic scores `Q(z_rl, a_{1:h})` (ensemble-min) → joint arg-max
-`(n*, h*)` → execute `h*` via **`truncate`** (chunk[:h*]) or **`absolute_hold`** (full H, tail
-held at the h*-th absolute action). Compose with an openpi `Policy` (has `sample_actions`/`predict_value`).
+`(n*, h*)` → return the chosen chunk in **raw action space** (absolute joint targets) under
+**`truncate`** (`chunk[:h*]`, execute then replan) or **`absolute_hold`** (full H, tail held at
+the h*-th absolute action).
+
+Deployable as an openpi policy: `create_aqc_policy(bundle, exec_mode=...)` →
+`AQCPolicy(BasePolicy)` whose `infer(obs_dict)` applies the RLT config's input transforms
+(repack/normalize/tokenize/resize) then the adaptive selection, returning
+`{actions, h_star, n_star, q_by_h, policy_timing}` — drop-in for the websocket policy server.
+norm_stats load from the RLT checkpoint that produced the bundle (same stats as training).
 
 Mechanism smoke-tested (merge bundle + critic-from-bundle forward + `(n*,h*)` selection + both
 exec modes). The real RLT forward path needs a GPU + a *matching* mouse-battery RLT checkpoint

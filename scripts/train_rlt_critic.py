@@ -131,7 +131,8 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
 
     trainer = VLACriticTrainer(cfg, seed=cfg.seed)
     print(f"    critic params: {trainer.num_params()/1e6:.2f}M  (n_embd={cfg.arch.n_embd}, "
-          f"{cfg.arch.num_layers}L)  target_kind={cfg.td.target_kind}")
+          f"{cfg.arch.num_layers}L)  target_kind={cfg.td.target_kind}  "
+          f"support=[{cfg.dist.v_min},{cfg.dist.v_max}]  discount={cfg.td.discount}")
     step_fn = trainer.make_train_step()
     params, opt_state = trainer.params, trainer.opt_state
     start_step = 0
