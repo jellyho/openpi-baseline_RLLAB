@@ -68,10 +68,21 @@ cap-OOM contained to this job.
 - `networks.py` / `distributional.py` — `default_init`/`ensemblize`, HL-Gauss transforms.
 - `scripts/train_rlt_critic.py` (+ `.sh`) — training entry / detached launcher.
 
-## Roadmap (not yet implemented)
-- **Stage 2 — merge.** Fold the trained critic into the `Pi0RLT` / `Pi0RLTJoint` checkpoint
-  as one deployable model (wrap `PrefixValue` as an `nnx` submodule via `nnx_bridge.ToNNX`,
-  co-locate params in one orbax `params/` tree; `weight_loaders.AlphaFlowWeightLoader` pattern).
-- **Stage 3 — adaptive inference.** In the openpi `Policy`: actor samples N chunks →
-  critic scores all prefixes → joint arg-max `(n*, h*)` → execute `h*`. Two execution modes:
-  (a) truncate the chunk to `h*`; (b) absolute-joint: run to `h*` then hold the last action.
+## Stage 2 — merge (`merge.py`, implemented)
+`python -m openpi.rlt_critic.merge --rlt-config <name> --rlt-checkpoint <step_dir> \
+  --critic-run-dir <run> --critic-step latest --out <bundle>` builds a deployable **bundle**
+directory: `params/` (RLT orbax params, symlink|copy) + `critic/{params.msgpack,net.json}` +
+`aqc_manifest.json`. Additive: reads checkpoints, writes a new dir; touches no existing model.
+(Chose a bundle over splicing the linen critic into the nnx pytree — robust + framework-agnostic.)
+
+## Stage 3 — adaptive inference (`inference.py`, implemented)
+`AQCAdaptive.load(bundle)` → one model with `sample_actions(rng, obs, exec_mode=...)`:
+RLT samples N base chunks + `z_rl` (Joint 1-forward / vanilla 2-call) → decode to the critic's
+raw action space → prefix critic scores `Q(z_rl, a_{1:h})` (ensemble-min) → joint arg-max
+`(n*, h*)` → execute `h*` via **`truncate`** (chunk[:h*]) or **`absolute_hold`** (full H, tail
+held at the h*-th absolute action). Compose with an openpi `Policy` (has `sample_actions`/`predict_value`).
+
+Mechanism smoke-tested (merge bundle + critic-from-bundle forward + `(n*,h*)` selection + both
+exec modes). The real RLT forward path needs a GPU + a *matching* mouse-battery RLT checkpoint
+(the local one is tower-of-hanoi); the decode needs that config's `norm_stats` (else a shape-only
+passthrough warns). Run the merge once the v3 critic finishes training.
