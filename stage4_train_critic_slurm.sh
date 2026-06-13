@@ -46,7 +46,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=3-00:00:00
 #SBATCH --output=logs/slurm_rlt_critic_%j.out
@@ -64,7 +64,10 @@ TASK="${TASK:-seal-water-bottle-cap}"
 DATA_ROOT="${DATA_ROOT:-/lustre/gwanwoo13/rss_post_training/Challenge-phase1-dataset/seal-water-bottle-cap_annotated_v3}"
 BATCH="${BATCH:-512}"
 LR="${LR:-3e-4}"
-LOADER="${LOADER:-8}"
+LOADER="${LOADER:-0}"   # 0 = in-process THREAD loader. For base_action TD the 1.2GB/batch is the
+                        # cost, and worker->main IPC dominates, so spawn workers are SLOWER:
+                        # measured lp=0 -> 2.9 it/s vs lp=8 -> 1.9 it/s. (Raise only for the no-base
+                        # MC path, where batches are tiny and multiprocess scales.)
 MEM_FRAC="${MEM_FRAC:-0.9}"
 
 [ -d "$DATA_ROOT/data" ] || { echo "ERROR: no data/ under DATA_ROOT=$DATA_ROOT"; exit 1; }
@@ -78,6 +81,10 @@ echo "batch     : $BATCH global (-> $((BATCH/4))/device)   lr: $LR   loader_proc
 echo "data_root : $DATA_ROOT"
 echo "ckpt_base : $RLT_CRITIC_CKPT_DIR   (run dir = <base>/$CONFIG/<run_name>)"
 
+# NCCL_P2P_DISABLE=1: these pro6000 GPUs have NO NVLink (topo=NODE, PCIe), so P2P-over-PCIe
+# is the flaky path that deadlocks the 2-GPU clique rendezvous on some nodes. Disabling it
+# loses nothing (no NVLink) and inits ~4x faster (SHM/host path). Required for reliable DDP.
+NCCL_P2P_DISABLE=1 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRAC" \
 uv run scripts/train_rlt_critic.py \
     --config "$CONFIG" \

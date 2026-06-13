@@ -223,6 +223,7 @@ class VLAAQCConfig:
     log_interval: int = 1_000       # ~7.7 min @ 2.16 it/s (slow run -> less log noise)
     eval_interval: int = 10_000     # trajectory value-curve viz -> W&B eval/value_curves (~77 min)
     eval_n_success: int = 3         # fixed success episodes shown in the eval plot
+    eval_n_intervention: int = 3    # fixed intervention episodes (inference+teleop; teleop span shaded)
     eval_n_fail: int = 3            # fixed failure episodes shown in the eval plot
     save_interval: int = 25_000
     keep_period: Optional[int] = 100_000   # checkpoints at step % keep_period == 0 are kept
@@ -391,6 +392,38 @@ _CONFIGS = [
         name="vla_aqc_warmup_stateenc",
         notes="PRIMARY + MLP state-encoder (512,) on the 2048-d latent (vs linear default).",
         arch=ArchConfig(state_encoder_dims=(512,)),
+    ),
+    # ---- Fast-iteration DEBUG config on the 30-episode seal_mini subset ------------------
+    # 10 success + 10 failure + 10 intervention (built by .diag/build_mini.py). Short beta
+    # schedule + frequent eval so the value-curve behaviour is visible in minutes. seal_mini is
+    # written ONE FULL EPISODE PER PARQUET ROW-GROUP, so an in-loader mc_gamma override (td.mc_gamma)
+    # recomputes FULL-EPISODE mc_return correctly -- handy for sweeping the discount on this set.
+    VLAAQCConfig(
+        name="vla_aqc_mini",
+        task="seal-water-bottle-cap",
+        data_root_override="/lustre/jellyho/seal_mini",
+        notes="DEBUG: 30-episode seal_mini subset; short warmup+ramp (5k+10k), frequent eval.",
+        td=TDConfig(mc_warmup_steps=5_000, mc_ramp_steps=10_000),
+        optim=OptimConfig(num_train_steps=50_000),
+        log_interval=100, eval_interval=1_000, save_interval=5_000, keep_period=25_000,
+    ),
+    # ---- DEBUG exp2: paper-style PROGRESS reward (Sec 3.1, Eq.1) -------------------------
+    # Target mc_return = gamma^(T-t) * I(success): positive "task progress" rising to 1 at a
+    # successful terminal, 0 for failures (no penalty). Support [0,1]; trained by MC regression
+    # (target_kind='mc') -- the positive progress reward doesn't fit the TD terminal/penalty
+    # logic. Data = seal_mini_progress (.diag/build_mini_progress.py rewrites only mc_return).
+    # NOTE: this is the progress signal WITHOUT the paper's hindsight-failure augmentation
+    # (truncate-at-retry); natural failures here are flat-0. Add hindsight (from intervention
+    # points) next for the "drop at the failing action" behaviour.
+    VLAAQCConfig(
+        name="vla_aqc_mini_progress",
+        task="seal-water-bottle-cap",
+        data_root_override="/lustre/jellyho/seal_mini_progress",
+        notes="DEBUG exp2: progress reward gamma^(T-t)*I(success), support [0,1], MC regression.",
+        dist=DistConfig(v_min=0.0, v_max=1.0),
+        td=TDConfig(target_kind="mc"),
+        optim=OptimConfig(num_train_steps=50_000),
+        log_interval=100, eval_interval=1_000, save_interval=5_000, keep_period=25_000,
     ),
 ]
 

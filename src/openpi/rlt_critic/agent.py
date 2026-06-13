@@ -129,8 +129,7 @@ class VLACriticTrainer:
         nl = batch["next_latents"].reshape(B * P, cfg.latent_dim)
         cand = batch["next_candidates"].reshape(B * P, batch["next_candidates"].shape[2], -1)
         vmax = self._expected_prefix_max(jax.lax.stop_gradient(params), nl, cand).reshape(B, P)
-        v_next = jnp.where(batch["term"] > 0, batch["next_mc_return"], vmax) \
-            if cfg.td.terminal_uses_mc else vmax
+        v_next = jnp.where(batch["term"] > 0, batch["next_mc_return"], vmax) if cfg.td.terminal_uses_mc else vmax
 
         gamma_h = cfg.td.discount ** prefixes.astype(jnp.float32)  # (P,)
         td_target = batch["cum_reward"] + gamma_h[None, :] * batch["valid"] * v_next

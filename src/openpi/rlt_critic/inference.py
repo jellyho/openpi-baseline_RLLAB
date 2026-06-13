@@ -163,12 +163,17 @@ class AQCAdaptive:
         return z_rl, base
 
     def _score(self, z_rl, base_raw):
-        """Critic prefix-Q for every candidate; ensemble-min. base_raw [N,H,Dr] -> q [N, macro_H]."""
+        """Critic prefix-Q for every candidate; ensemble-mean. base_raw [N,H,Dr] -> q [N, macro_H].
+
+        Uses the ensemble MEAN (not the conservative min) to match the eval value-curves
+        (eval_curves._episode_curve). Mean is less pessimistic than min: the Best-of-N argmax
+        below is slightly more optimistic about overestimated candidates.
+        """
         n = base_raw.shape[0]
         states = jnp.broadcast_to(jnp.asarray(z_rl[0]), (n, z_rl.shape[-1]))      # (N, L)
         acts = jnp.asarray(base_raw).reshape(n, -1)                              # (N, H*Dr)
         q = self._critic(states, acts)                                           # (K, N, macro_H)
-        return np.asarray(q.min(axis=0))                                         # (N, macro_H)
+        return np.asarray(q.mean(axis=0))                                        # (N, macro_H)
 
     def sample_actions(self, rng, observation, *, exec_mode="truncate", num_samples=None):
         """Adaptive (n*, h*) selection. Returns a dict with the chosen chunk + diagnostics.

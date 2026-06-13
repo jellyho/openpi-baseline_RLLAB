@@ -212,9 +212,11 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         try:
             from openpi.rlt_critic import eval_curves as vla_eval
             eval_set = vla_eval.build_eval_set(ds, n_success=cfg.eval_n_success,
-                                               n_fail=cfg.eval_n_fail, seed=cfg.seed)
-            print(f"    eval set: {sum(not e['fail'] for e in eval_set)} success + "
-                  f"{sum(e['fail'] for e in eval_set)} failure episodes (cached)")
+                                               n_fail=cfg.eval_n_fail,
+                                               n_intervention=cfg.eval_n_intervention, seed=cfg.seed)
+            import collections as _c
+            _cc = _c.Counter(e.get("category", "?") for e in eval_set)
+            print(f"    eval set: {dict(_cc)} episodes (cached)")
         except Exception as e:
             print(f"    [eval disabled] {type(e).__name__}: {e}")
 
