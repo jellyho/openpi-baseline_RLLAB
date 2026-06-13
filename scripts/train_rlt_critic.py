@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from openpi.rlt_critic.config import VLAAQCConfig, get_config
 from openpi.rlt_critic.data import VLALeRobotDataset, prefetch
+from openpi.rlt_critic.data_mm import make_dataset
 from openpi.rlt_critic.agent import VLACriticTrainer
 
 
@@ -174,8 +175,10 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         relabel_living=cfg.reward.relabel_living,
         relabel_fail=cfg.reward.relabel_fail,
         num_workers=cfg.num_workers, bootstrap_subset=cfg.td.bootstrap_subset,
-        n_step=cfg.td.n_step, preload=preload)
-    ds = VLALeRobotDataset(**ds_kwargs)    # main-process handle: summary + eval episodes + (lp=0) iteration
+        n_step=cfg.td.n_step, preload=preload, memmap_dir=cfg.memmap_dir)
+    ds = make_dataset(ds_kwargs)           # MemmapVLADataset if cfg.memmap_dir set, else parquet
+    if cfg.memmap_dir:
+        print(f"    [memmap] fast index loader on {cfg.memmap_dir}")
     print(f"    data: {ds.summary()}")
     rscale = reward_scale(cfg)
 
@@ -185,7 +188,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
                    and cfg.td.warmup_skip and cfg.td.mc_warmup_steps > start_step)
     mc_ds = mc_step_fn = None
     if warmup_skip:
-        mc_ds = VLALeRobotDataset(**{**ds_kwargs, "include_base_action": False, "preload": False})
+        mc_ds = make_dataset({**ds_kwargs, "include_base_action": False, "preload": False})
         mc_step_fn = trainer.make_train_step(kind="mc")
         print(f"    [warmup-skip] beta=0 for steps <{cfg.td.mc_warmup_steps}: pure-MC loader "
               f"(no base_action), then switch to the TD loader")

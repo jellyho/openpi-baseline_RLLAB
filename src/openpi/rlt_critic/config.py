@@ -241,6 +241,12 @@ class VLAAQCConfig:
     # so preload barely moves end-to-end it/s. Opt in with --preload only if the full-set lustre I/O
     # (not the page cache) is shown to be the wall; size SLURM --mem >= dataset size accordingly.
     preload: bool = False
+    # Fast index-based loader over a frame-indexed memmap (built once by scripts/preprocess_memmap.py).
+    # When set, the loader gathers batches by random index from the memmap (OS page cache holds it
+    # ONCE in RAM, shared read-only across all DDP workers -> no per-worker duplication, true global
+    # shuffle, and next_candidates gathered lazily per-batch -- no parquet read, no giant concat/
+    # permute). This is the recommended DDP fast path. "" -> the parquet streaming loader.
+    memmap_dir: Optional[str] = None
 
     # --- grouped hyperparameters ---
     arch: ArchConfig = field(default_factory=ArchConfig)

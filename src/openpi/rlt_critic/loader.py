@@ -24,7 +24,7 @@ import multiprocessing
 
 import torch.utils.data as tud
 
-from openpi.rlt_critic.data import VLALeRobotDataset
+from openpi.rlt_critic.data_mm import make_dataset
 
 
 class VLABatchIterable(tud.IterableDataset):
@@ -51,7 +51,7 @@ class VLABatchIterable(tud.IterableDataset):
     def __iter__(self):
         info = tud.get_worker_info()
         wid, nw = (info.id, info.num_workers) if info is not None else (0, 1)
-        ds = VLALeRobotDataset(**self.ds_kwargs)
+        ds = make_dataset(self.ds_kwargs)              # MemmapVLADataset if ds_kwargs has memmap_dir
         epoch = 0
         while True:                                    # infinite: consumer never restarts us
             seed = self.seed + 100_000 * epoch
