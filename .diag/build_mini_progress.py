@@ -1,48 +1,54 @@
-"""Exp2 data: seal_mini with mc_return REPLACED by the paper-style PROGRESS target.
+"""Exp2 data (PAPER-style progress reward, TD-ready): seal_mini ->seal_mini_progress.
 
-    progress(t) = GAMMA^(T-t)   on the SUCCESSFUL portion, else 0
+Per trajectory (one episode per row-group):
+  mc_return = GAMMA^(T-t) * I(success)         # progress target in [0,1]
+  reward    = 0 everywhere except the TERMINAL: +1 (success) / -0.5 (failure)   # outcome marker:
+              keeps the reward-based eval categorisation working AND, with the mc_floor, the TD
+              target stays consistent (failure target floored to 0 = progress).
+  done      = explicit terminal signal (1 at the last frame) -> data.py reads THIS for is_term,
+              so living=0 doesn't trip the reward heuristic.
 
-Per category (T = episode last frame):
-  success (autonomous)     -> GAMMA^(T-t) rising to 1 over the whole trajectory.
-  failure (autonomous)     -> 0 everywhere (policy failed; no positive signal).
-  intervention, recovered  -> HINDSIGHT: 0 for the PRE-intervention frames (the policy was
-                              failing, t < first teleop), then GAMMA^(T-t) rising once the human
-                              takes over and drives to success. => value 0 in the policy-failing
-                              region, rising after the intervention point.
-  intervention, still failed -> 0 everywhere.
-All other columns copied unchanged. One episode per row-group. Env: GAMMA (0.999), HINDSIGHT (1).
+Hindsight (Sec 3.1): for every RECOVERED intervention (policy failed -> teleop -> success) ALSO
+emit a NEW truncated FAILURE = frames before the first teleop, progress 0, terminal reward -0.5,
+done at the cut, new episode_index. (The original success episode is kept too -> paired data.)
+Env: GAMMA (0.999). Use with config target_kind='td', dist support [0,1].
 """
 import os, numpy as np, pyarrow as pa, pyarrow.parquet as pq
 
-GAMMA = float(os.environ.get("GAMMA", "0.999"))
-HINDSIGHT = os.environ.get("HINDSIGHT", "1") == "1"
+GAMMA = float(os.environ.get("GAMMA", "0.999")); MIN_TRUNC = 60
 SRC = "/lustre/jellyho/seal_mini/data/chunk-000/file-000.parquet"
-OUT = "/lustre/jellyho/seal_mini_progress"
-os.makedirs(OUT + "/data/chunk-000", exist_ok=True)
-pf = pq.ParquetFile(SRC)
-mc_idx = pf.schema_arrow.get_field_index("mc_return")
-mc_t = pf.schema_arrow.field("mc_return").type
-writer = None
-print(f"GAMMA={GAMMA}  HINDSIGHT={HINDSIGHT}  row_groups={pf.metadata.num_row_groups}")
+OUT = "/lustre/jellyho/seal_mini_progress"; os.makedirs(OUT + "/data/chunk-000", exist_ok=True)
+pf = pq.ParquetFile(SRC); sch = pf.schema_arrow
+MC, RW, EP = (sch.get_field_index(c) for c in ("mc_return", "reward", "episode_index"))
+MCt, RWt, EPt = (sch.field(c).type for c in ("mc_return", "reward", "episode_index"))
+
+def build(raw, prog, rew, done, ep=None):
+    t = raw.set_column(MC, "mc_return", pa.array(prog, MCt)).set_column(RW, "reward", pa.array(rew, RWt))
+    if ep is not None:
+        t = t.set_column(EP, "episode_index", pa.array(np.full(len(prog), ep), EPt))
+    return t.append_column("done", pa.array(done, pa.int8()))
+
+writer = None; new_ep = pf.metadata.num_row_groups; n_trunc = 0
 for g in range(pf.metadata.num_row_groups):
-    t = pf.read_row_group(g)                              # one full episode (sorted by frame_index)
-    fi = np.asarray(t["frame_index"].to_pylist())
-    rew = np.asarray(t["reward"].to_pylist(), float)
-    cs = np.asarray([str(c).lower() for c in t["observation.commander_state"].to_pylist()])
-    is_fail = bool((rew <= -0.05).any())
-    tel = np.where(cs == "teleop")[0]
-    T = fi.max()
-    prog = (GAMMA ** (T - fi)).astype(np.float32)          # success rise (default)
-    kind = "succ"
-    if is_fail:
-        prog[:] = 0.0; kind = "fail"                       # autonomous/post-intervention failure
-    elif HINDSIGHT and len(tel) > 0:
-        m = int(tel.min()); prog[:m] = 0.0; kind = f"interv(cut@{m})"   # 0 before human takeover
-    ep = int(np.asarray(t["episode_index"].to_pylist())[0])
-    t = t.set_column(mc_idx, "mc_return", pa.array(prog, type=mc_t))
-    if writer is None:
-        writer = pq.ParquetWriter(OUT + "/data/chunk-000/file-000.parquet", t.schema)
+    raw = pf.read_row_group(g)
+    fi = np.asarray(raw["frame_index"].to_pylist()); rew0 = np.asarray(raw["reward"].to_pylist(), float)
+    cs = np.asarray([str(c).lower() for c in raw["observation.commander_state"].to_pylist()])
+    is_fail = bool((rew0 <= -0.05).any()); tel = np.where(cs == "teleop")[0]; T = fi.max(); n = len(fi)
+    I = 0.0 if is_fail else 1.0
+    prog = (GAMMA ** (T - fi)).astype(np.float32) * np.float32(I)
+    rew = np.zeros(n, np.float32); rew[-1] = np.float32(I)   # terminal reward 1(success)/0(failure) -> clean [0,1]
+    done = np.zeros(n, np.int8); done[-1] = 1
+    t = build(raw, prog, rew, done)
+    if writer is None: writer = pq.ParquetWriter(OUT + "/data/chunk-000/file-000.parquet", t.schema)
     writer.write_table(t, row_group_size=10 ** 7)
-    print(f"  ep {ep:2d} [{kind:14s}] T={T:5d}  progress[{prog.min():.2f}..{prog.max():.2f}]  teleop={len(tel)}")
+    ep0 = int(np.asarray(raw["episode_index"].to_pylist())[0])
+    print(f"  ep {ep0:2d} [{'fail' if is_fail else 'succ'}] T={T:5d} prog[{prog.min():.2f}..{prog.max():.2f}] tel={len(tel)}", end="")
+    if (not is_fail) and len(tel) > 0 and int(tel.min()) > MIN_TRUNC:
+        m = int(tel.min()); sub = raw.slice(0, m)
+        sub = build(sub, np.zeros(m, np.float32), np.zeros(m, np.float32),
+                    np.r_[np.zeros(m - 1, np.int8), np.int8(1)], ep=new_ep)   # failure: reward 0, done at cut
+        writer.write_table(sub, row_group_size=10 ** 7)
+        print(f"  -> +trunc-fail ep{new_ep} ({m} frames)", end=""); new_ep += 1; n_trunc += 1
+    print()
 writer.close()
-print(f"wrote {OUT}/data/chunk-000/file-000.parquet")
+print(f"wrote {OUT}  (30 originals + {n_trunc} truncated hindsight failures; with done column)")

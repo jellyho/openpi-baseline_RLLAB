@@ -30,9 +30,10 @@ source setup_env.sh
 
 CONFIG="${1:-${CONFIG:-vla_aqc_mini}}"
 BATCH="${BATCH:-256}"
-LR="${LR:-3e-4}"
+LR="${LR:-1e-4}"   # lowered from 3e-4 for TD stability (override with LR=...)
 TIME="${TIME:-2:00:00}"
 PART="${PART:-asus_pro6000,gigabyte_pro6000}"
+EXTRA="${EXTRA:-}"                 # extra flags, e.g. EXTRA="--target_tau 0 --bootstrap_subset 8 --agg_beta 20"
 DATA_ROOT="/lustre/jellyho/seal_mini"
 
 [ -f "$DATA_ROOT/data/chunk-000/file-000.parquet" ] || { echo "ERROR: seal_mini not found at $DATA_ROOT (run .diag/build_mini.py)"; exit 1; }
@@ -45,7 +46,7 @@ echo "ckpt_base=$RLT_CRITIC_CKPT_DIR"
 exec srun \
     --partition="$PART" --qos=pro6000_qos \
     --nodes=1 --ntasks=1 --gres=gpu:1 \
-    --cpus-per-task=8 --mem=64G --time="$TIME" \
+    --cpus-per-task=32 --mem=64G --time="$TIME" \
     --job-name=rlt_mini --pty \
     env NCCL_P2P_DISABLE=1 \
     XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
@@ -55,4 +56,4 @@ exec srun \
         --lr "$LR" \
         --loader_processes 0 \
         --checkpoint_base_dir "$RLT_CRITIC_CKPT_DIR" \
-        "${EXP_ARG[@]}" --resume
+        "${EXP_ARG[@]}" $EXTRA --resume

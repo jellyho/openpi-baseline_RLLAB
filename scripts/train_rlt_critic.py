@@ -140,6 +140,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         start_step = list_checkpoints(cfg.checkpoint_dir)[-1]
         params, opt_state = load_checkpoint(cfg.checkpoint_dir, start_step, params, opt_state)
         print(f"    resumed from step {start_step}")
+    target_params = params   # EMA target network state (== online params when td.target_tau == 0)
 
     # Data-parallel mesh (openpi-style, single process): params replicated on every GPU,
     # each batch split along its leading axis -> jit inserts the grad all-reduce itself.
@@ -153,10 +154,17 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     repl_sharding = NamedSharding(mesh, PartitionSpec())
     params = jax.device_put(params, repl_sharding)
     opt_state = jax.device_put(opt_state, repl_sharding)
+    target_params = jax.device_put(target_params, repl_sharding)
     print(f"    devices: {n_dev} x {devices[0].device_kind}  "
           f"(global B={cfg.optim.batch_size} -> {cfg.optim.batch_size // n_dev}/device, "
           f"loader_processes={cfg.loader_processes})")
 
+    # preload (whole dataset -> RAM) only makes sense on the single-process path; under
+    # loader_processes>0 each worker would duplicate the cache, so ignore it there.
+    preload = cfg.preload
+    if preload and cfg.loader_processes > 0:
+        print("    [preload] ignored: requires loader_processes=0 (would duplicate per worker)")
+        preload = False
     ds_kwargs = dict(
         root=cfg.data_root, horizon=cfg.horizon,
         commander_filter=set(cfg.commander_filter) if cfg.commander_filter else None,
@@ -165,12 +173,24 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         mc_gamma=cfg.td.mc_gamma, discount=cfg.td.discount,
         relabel_living=cfg.reward.relabel_living,
         relabel_fail=cfg.reward.relabel_fail,
-        num_workers=cfg.num_workers)
-    ds = VLALeRobotDataset(**ds_kwargs)    # main-process handle: summary + eval episodes
+        num_workers=cfg.num_workers, bootstrap_subset=cfg.td.bootstrap_subset,
+        n_step=cfg.td.n_step, preload=preload)
+    ds = VLALeRobotDataset(**ds_kwargs)    # main-process handle: summary + eval episodes + (lp=0) iteration
     print(f"    data: {ds.summary()}")
     rscale = reward_scale(cfg)
 
-    def batch_iter(seed):
+    # warmup-skip: during the beta=0 MC warmup, train a pure-MC step that never reads base_action.
+    # A separate no-base_action handle (cheap; decoded on the fly even under preload) feeds it.
+    warmup_skip = (cfg.td.target_kind == "td" and cfg.td.mc_floor
+                   and cfg.td.warmup_skip and cfg.td.mc_warmup_steps > start_step)
+    mc_ds = mc_step_fn = None
+    if warmup_skip:
+        mc_ds = VLALeRobotDataset(**{**ds_kwargs, "include_base_action": False, "preload": False})
+        mc_step_fn = trainer.make_train_step(kind="mc")
+        print(f"    [warmup-skip] beta=0 for steps <{cfg.td.mc_warmup_steps}: pure-MC loader "
+              f"(no base_action), then switch to the TD loader")
+
+    def td_batch_iter(seed):
         # Host-side pipeline (the throughput bottleneck: ~217ms/batch assembly vs ~135ms
         # GPU step at B=256). loader_processes>0: N worker PROCESSES each stream a disjoint
         # row-group shard and yield full global batches (openpi pattern; vla_loader.py) --
@@ -187,6 +207,12 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         else:
             gen = ds.iter_bootstrap_batches(cfg.optim.batch_size, cfg.td.prefixes, seed=seed)
         yield from prefetch(gen, depth=cfg.prefetch_depth)
+
+    def mc_warmup_iter(seed):
+        # In-process MC stream (no base_action -> cheap, GPU-bound ~44 it/s; single-thread loader
+        # keeps up, so no worker processes needed here regardless of loader_processes).
+        yield from prefetch(mc_ds.iter_batches(cfg.optim.batch_size, seed=seed),
+                            depth=cfg.prefetch_depth)
 
     def shard_batch(b):
         """numpy loader batch -> jax arrays split over the dp mesh (prefixes replicated)."""
@@ -220,7 +246,12 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         except Exception as e:
             print(f"    [eval disabled] {type(e).__name__}: {e}")
 
-    it = batch_iter(cfg.seed + start_step)
+    # Phase: during [start_step, mc_warmup_steps) run the pure-MC warmup loader+step (warmup-skip);
+    # otherwise the TD loader+step. The boundary switch swaps both the iterator and the train step.
+    warmup_end = cfg.td.mc_warmup_steps if warmup_skip else 0
+    in_warmup = start_step < warmup_end
+    it = (mc_warmup_iter if in_warmup else td_batch_iter)(cfg.seed + start_step)
+    cur_step_fn = mc_step_fn if in_warmup else step_fn
     n_steps = timing_steps or cfg.optim.num_train_steps
     t0 = time.time(); t_log = t0
 
@@ -229,14 +260,21 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     pbar = tqdm(range(start_step, end_step), desc=cfg.name,
                 dynamic_ncols=True, smoothing=0.1, disable=not is_tty)
     for step in pbar:
+        if in_warmup and step >= warmup_end:           # warmup done -> switch to the TD loader/step
+            in_warmup = False
+            it = td_batch_iter(cfg.seed + step)
+            cur_step_fn = step_fn
+            target_params = params                      # resync EMA target to the warmed-up online weights
+            pbar.write(f"  [warmup-skip] step {step}: warmup done -> TD (base_action) loader engaged")
         try:
             b = scale_batch(next(it))
         except StopIteration:
-            it = batch_iter(cfg.seed + step); b = scale_batch(next(it))
+            it = (mc_warmup_iter if in_warmup else td_batch_iter)(cfg.seed + step)
+            b = scale_batch(next(it))
         jb, pf = shard_batch(b)
         # ReLU-blend MC-warmup coefficient for this step (jnp scalar -> traced, no recompile).
         beta = jnp.asarray(cfg.mc_blend_beta(step), jnp.float32)
-        params, opt_state, info = step_fn(params, opt_state, jb, pf, beta)
+        params, opt_state, target_params, info = cur_step_fn(params, opt_state, target_params, jb, pf, beta)
 
         if timing_steps and step == start_step:
             info["critic_loss"].block_until_ready()
@@ -294,24 +332,36 @@ def main():
         mc_ramp_steps: int = -1            # >=0 overrides td.mc_ramp_steps (beta 0->1 ramp length)
         agg_beta: float = 0.0              # >0 overrides td.agg_beta (softmax temperature sweep)
         loader_processes: int = -1         # >=0 overrides cfg.loader_processes (0 = thread loader)
+        target_tau: float = -1.0           # >=0 overrides td.target_tau (EMA target net; 0 = no target net)
+        bootstrap_subset: int = -1         # >=0 overrides td.bootstrap_subset (random N-of-32 candidate subset; 0 = all)
+        n_step: int = -1                   # >=0 overrides td.n_step (N-step return; 0 = standard h-step backup)
+        preload: Optional[bool] = None     # override cfg.preload (decode whole dataset into RAM; loader_processes=0 only)
+        warmup_skip: Optional[bool] = None # override td.warmup_skip (pure-MC beta=0 phase, no base_action read)
         checkpoint_base_dir: str = ""      # override where runs are written (run dir = base/<name>/<exp>); "" = config default
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
         cfg = dataclasses.replace(cfg, loader_processes=args.loader_processes)
+    if args.preload is not None:
+        cfg = dataclasses.replace(cfg, preload=args.preload)
     if args.batch_size > 0 or args.lr > 0:
         cfg = dataclasses.replace(cfg, optim=dataclasses.replace(
             cfg.optim,
             batch_size=args.batch_size or cfg.optim.batch_size,
             lr=args.lr or cfg.optim.lr))
-    if (args.mc_floor is not None or args.agg_beta > 0
-            or args.mc_warmup_steps >= 0 or args.mc_ramp_steps >= 0):
+    if (args.mc_floor is not None or args.agg_beta > 0 or args.target_tau >= 0
+            or args.bootstrap_subset >= 0 or args.n_step >= 0 or args.mc_warmup_steps >= 0
+            or args.mc_ramp_steps >= 0 or args.warmup_skip is not None):
         cfg = dataclasses.replace(cfg, td=dataclasses.replace(
             cfg.td,
             mc_floor=cfg.td.mc_floor if args.mc_floor is None else args.mc_floor,
             agg_beta=args.agg_beta or cfg.td.agg_beta,
+            target_tau=cfg.td.target_tau if args.target_tau < 0 else args.target_tau,
+            bootstrap_subset=cfg.td.bootstrap_subset if args.bootstrap_subset < 0 else args.bootstrap_subset,
+            n_step=cfg.td.n_step if args.n_step < 0 else args.n_step,
             mc_warmup_steps=cfg.td.mc_warmup_steps if args.mc_warmup_steps < 0 else args.mc_warmup_steps,
-            mc_ramp_steps=cfg.td.mc_ramp_steps if args.mc_ramp_steps < 0 else args.mc_ramp_steps))
+            mc_ramp_steps=cfg.td.mc_ramp_steps if args.mc_ramp_steps < 0 else args.mc_ramp_steps,
+            warmup_skip=cfg.td.warmup_skip if args.warmup_skip is None else args.warmup_skip))
     cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "",
                               task=args.task or cfg.task,
                               data_root_override=args.data_root or cfg.data_root_override,

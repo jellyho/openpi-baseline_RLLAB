@@ -134,10 +134,32 @@ class TDConfig:
     # the values, so the NxH max can't amplify a randomly-high early Q.
     mc_floor: bool = True
     # beta(step) schedule (used only when mc_floor=True): beta=0 for the first mc_warmup_steps
-    # (pure MC warmup), then a cosine ramp to 1 over mc_ramp_steps, then stays 1. Tie the lengths
-    # to how long MC needs to converge / the horizon: defaults give 20k warmup + 30k ramp.
+    # (pure MC warmup), then a cosine ramp to 1 over mc_ramp_steps, then stays 1. Default ramp=0 =
+    # a STEP function: beta jumps 0->1 at mc_warmup_steps. Since the target is the MC-floored
+    # max(MC, TD), the jump can only raise the target above the MC floor (never below), so once MC
+    # has grounded the values over the warmup a hard switch is safe; set mc_ramp_steps>0 to soften.
     mc_warmup_steps: int = 20_000
-    mc_ramp_steps: int = 30_000
+    mc_ramp_steps: int = 0
+    # Speed optimization (no effect on the math beyond the MC-vs-beta=0 masking nuance): during the
+    # beta=0 warmup the bootstrap term is multiplied by 0, so base_action is read + the NxH prefix-max
+    # is computed only to be discarded. With warmup_skip the warmup runs as a pure-MC step that never
+    # touches base_action (~44 it/s vs ~2-3), then switches to the TD step at mc_warmup_steps.
+    warmup_skip: bool = True
+    # Target network: bootstrap from an EMA copy of the online params, target <- (1-tau)*target +
+    # tau*online each step. 0 = no target net (online critic). 0.005 (DEFAULT) stabilises the TD
+    # bootstrap (the moving-target oscillation). At the warmup->TD switch the target is resynced to
+    # the warmed-up online params (train loop) so the first bootstrap isn't from stale init weights.
+    target_tau: float = 0.005
+    # Randomly subsample this many of the N=num_candidates base actions for the bootstrap max each
+    # batch (REDQ-style): <=0 or >=N uses all N. Smaller (8/16) = more conservative max (less
+    # overestimation) AND less next_candidates data to move (faster). Applied in the loader.
+    bootstrap_subset: int = 0
+    # N-step return: accumulate N EXTRA real-reward steps BEYOND each commit prefix h before
+    # bootstrapping -> target = (h+N)-step realized return + gamma^(h+N) * V(s_{t+h+N}). 0 = the
+    # standard h-step backup. Larger N pushes the (unstable) Best-of-N bootstrap further out
+    # (gamma^(h+N) smaller) => more real signal, less bootstrap reliance ("horizon reduction").
+    # Implemented in the loader (shifts the next-state to t+h+N and the cum_reward to h+N steps).
+    n_step: int = 0
 
 
 @dataclass(frozen=True)
@@ -210,6 +232,15 @@ class VLAAQCConfig:
     # CPU/lustre saturates. Total read threads = loader_processes * num_workers (size
     # SLURM --cpus-per-task accordingly). 0 = legacy in-process thread prefetch.
     loader_processes: int = 4
+    # Preload the WHOLE dataset into RAM (decoded numpy, base_action fp16) at startup, so training
+    # reads incur zero disk I/O and zero parquet re-decode -- only the per-batch host->device copy
+    # remains. Needs RAM >= dataset size (~160GB for the full base_action set on a 377GB node) and
+    # is meant for the single-process loader_processes=0 path (sharded multiprocess would duplicate
+    # the cache per worker -> auto-ignored there). One-time decode cost at startup (a few minutes).
+    # DEFAULT off: the bulk TD phase is GPU-bound (the loader already outruns the ~2-3 it/s step),
+    # so preload barely moves end-to-end it/s. Opt in with --preload only if the full-set lustre I/O
+    # (not the page cache) is shown to be the wall; size SLURM --mem >= dataset size accordingly.
+    preload: bool = False
 
     # --- grouped hyperparameters ---
     arch: ArchConfig = field(default_factory=ArchConfig)
@@ -285,6 +316,12 @@ class VLAAQCConfig:
             parts.append("rnorm")
         if self.commander_filter:
             parts.append("+".join(self.commander_filter))
+        if t.target_tau > 0:                         # EMA target network -> distinct run_dir per tau
+            parts.append(f"tnet{t.target_tau:g}")
+        if t.bootstrap_subset > 0:                   # random candidate subset -> distinct run_dir per M
+            parts.append(f"sub{t.bootstrap_subset}")
+        if t.n_step > 0:                             # N-step return -> distinct run_dir per N
+            parts.append(f"n{t.n_step}")
         parts.append(f"s{self.seed}")
         return "_".join(parts)
 
@@ -333,12 +370,12 @@ class VLAAQCConfig:
 _CONFIGS = [
     # ---- PRIMARY: the agreed design ----------------------------------------------------
     # Per-prefix multi-step TD with the 32-candidate joint-max bootstrap, ReLU-blend MC
-    # warmup (beta 0->1 over 20k+30k steps), HL-Gauss 201 atoms over [-0.5,0], ~10M critic
+    # warmup (beta 0 for 20k steps, then a step to 1), HL-Gauss 201 atoms over [-0.5,0], ~10M critic
     # (n_embd=384/3L/K2), macro grouping (5 macro-tokens -> replan at 10/20/30/40/50 steps).
     VLAAQCConfig(
         name="vla_aqc_warmup",
-        notes="PRIMARY. AQC-TD on mouse-battery with ReLU-blend MC warmup: pure MC for 20k "
-              "steps then cosine-ramp the bootstrap (improvement) trust to 1 over 30k. "
+        notes="PRIMARY. AQC-TD on mouse-battery: pure-MC warmup for 20k steps (no base_action) "
+              "then a HARD switch to TD bootstrap (ramp=0) with the MC floor + EMA target net. "
               "~10M critic, [-0.5,0] support, gamma=0.995, B=256.",
     ),
     # ---- Warmup stage 1 in isolation: pure MC regression (no bootstrap) -----------------
@@ -402,26 +439,27 @@ _CONFIGS = [
         name="vla_aqc_mini",
         task="seal-water-bottle-cap",
         data_root_override="/lustre/jellyho/seal_mini",
-        notes="DEBUG: 30-episode seal_mini subset; short warmup+ramp (5k+10k), frequent eval.",
-        td=TDConfig(mc_warmup_steps=5_000, mc_ramp_steps=10_000),
+        notes="DEBUG: 30-episode seal_mini subset; MC warmup (5k) -> hard TD switch (ramp=0), "
+              "frequent eval, EMA target net (tau=0.005) for stability.",
+        td=TDConfig(mc_warmup_steps=5_000, mc_ramp_steps=0),
         optim=OptimConfig(num_train_steps=50_000),
         log_interval=100, eval_interval=1_000, save_interval=5_000, keep_period=25_000,
     ),
     # ---- DEBUG exp2: paper-style PROGRESS reward (Sec 3.1, Eq.1) -------------------------
     # Target mc_return = gamma^(T-t) * I(success): positive "task progress" rising to 1 at a
-    # successful terminal, 0 for failures (no penalty). Support [0,1]; trained by MC regression
-    # (target_kind='mc') -- the positive progress reward doesn't fit the TD terminal/penalty
-    # logic. Data = seal_mini_progress (.diag/build_mini_progress.py rewrites only mc_return).
-    # NOTE: this is the progress signal WITHOUT the paper's hindsight-failure augmentation
-    # (truncate-at-retry); natural failures here are flat-0. Add hindsight (from intervention
-    # points) next for the "drop at the failing action" behaviour.
+    # successful terminal, 0 for failures (no penalty). Support [0,1]. Schedule = the universal
+    # one: pure-MC warmup (5k steps, no base_action) then a HARD switch to TD bootstrap (ramp=0).
+    # Data = seal_mini_progress (.diag/build_mini_progress.py); has an explicit `done` column for
+    # the bootstrap terminal mask. NOTE: progress signal WITHOUT the paper's hindsight-failure
+    # augmentation (truncate-at-retry); natural failures here are flat-0. Add hindsight next.
     VLAAQCConfig(
         name="vla_aqc_mini_progress",
         task="seal-water-bottle-cap",
         data_root_override="/lustre/jellyho/seal_mini_progress",
-        notes="DEBUG exp2: progress reward gamma^(T-t)*I(success), support [0,1], MC regression.",
+        notes="DEBUG exp2: progress reward gamma^(T-t)*I, support [0,1]. MC warmup (5k) -> hard TD "
+              "switch (ramp=0) + EMA target net. Sparse outcome reward (+1/-0.5 terminal) + done column.",
         dist=DistConfig(v_min=0.0, v_max=1.0),
-        td=TDConfig(target_kind="mc"),
+        td=TDConfig(target_kind="td", mc_warmup_steps=5_000, mc_ramp_steps=0),
         optim=OptimConfig(num_train_steps=50_000),
         log_interval=100, eval_interval=1_000, save_interval=5_000, keep_period=25_000,
     ),

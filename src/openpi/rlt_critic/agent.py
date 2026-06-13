@@ -116,7 +116,7 @@ class VLACriticTrainer:
                       "target_mean": batch["mc_return"].mean(),
                       "prefix_spread": (q.max(-1) - q.min(-1)).mean()}
 
-    def critic_loss_td(self, params, batch, prefixes, beta):
+    def critic_loss_td(self, params, batch, prefixes, beta, target_params):
         cfg = self.cfg
         B, P = batch["cum_reward"].shape
         mg = cfg.td.macro_group_size
@@ -125,13 +125,14 @@ class VLACriticTrainer:
         macro_idx = prefixes // mg - 1                            # e.g. [10,20,30,40,50]//10-1 = [0,1,2,3,4]
         pred = logits[:, :, macro_idx, :]                         # (K,B,P,atoms)
 
-        # Bootstrap: online critic with stop_gradient (paper default, no target network).
+        # Bootstrap with the TARGET network (EMA of online params when td.target_tau>0; with
+        # target_tau=0 the trainer passes the online params, recovering the no-target-net default).
         nl = batch["next_latents"].reshape(B * P, cfg.latent_dim)
         cand = batch["next_candidates"].reshape(B * P, batch["next_candidates"].shape[2], -1)
-        vmax = self._expected_prefix_max(jax.lax.stop_gradient(params), nl, cand).reshape(B, P)
+        vmax = self._expected_prefix_max(target_params, nl, cand).reshape(B, P)
         v_next = jnp.where(batch["term"] > 0, batch["next_mc_return"], vmax) if cfg.td.terminal_uses_mc else vmax
 
-        gamma_h = cfg.td.discount ** prefixes.astype(jnp.float32)  # (P,)
+        gamma_h = cfg.td.discount ** (prefixes + cfg.td.n_step).astype(jnp.float32)  # (P,) N-step: gamma^(h+N)
         td_target = batch["cum_reward"] + gamma_h[None, :] * batch["valid"] * v_next
         mc_col = batch["mc_return"][:, None]                       # (B,1) realized behavior return G_MC
         # ReLU-blend MC-warmup transition:  target = G_MC + beta * ReLU(TD - G_MC).
@@ -182,26 +183,34 @@ class VLACriticTrainer:
         return loss, info
 
     # ---- train steps -------------------------------------------------------------
-    def make_train_step(self):
+    def make_train_step(self, kind=None):
+        # kind overrides cfg.td.target_kind: the warmup-skip path requests an "mc" step (pure MC
+        # regression, no base_action / bootstrap) for the beta=0 phase, then the "td" step after.
         cfg = self.cfg
-        if cfg.td.target_kind == "mc":
+        kind = kind or cfg.td.target_kind
+        tau = float(cfg.td.target_tau)
+        def ema(target, online):                       # EMA target update (tau<=0 -> online, no target net)
+            if tau > 0:
+                return jax.tree_util.tree_map(lambda t, p: (1.0 - tau) * t + tau * p, target, online)
+            return online
+        if kind == "mc":
             @jax.jit
-            def step(params, opt_state, batch, prefixes, beta):
-                # MC baseline ignores beta (pure regression to mc_return); kept in the
-                # signature so the train loop can call both kinds uniformly.
+            def step(params, opt_state, target_params, batch, prefixes, beta):
+                # MC baseline ignores beta + target_params (pure regression to mc_return); kept in
+                # the signature so the train loop can call both kinds uniformly.
                 (loss, info), grads = jax.value_and_grad(self.critic_loss_mc, has_aux=True)(params, batch)
                 updates, opt_state = self.opt.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
-                return params, opt_state, info
+                return params, opt_state, target_params, info
             return step
 
         @jax.jit
-        def step(params, opt_state, batch, prefixes, beta):
+        def step(params, opt_state, target_params, batch, prefixes, beta):
             (loss, info), grads = jax.value_and_grad(self.critic_loss_td, has_aux=True)(
-                params, batch, prefixes, beta)
+                params, batch, prefixes, beta, target_params)
             updates, opt_state = self.opt.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
-            return params, opt_state, info
+            return params, opt_state, ema(target_params, params), info
         return step
 
     def num_params(self):

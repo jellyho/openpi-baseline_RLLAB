@@ -45,9 +45,10 @@ def scan_episodes(ds: VLALeRobotDataset):
     are read once per file from the small scalar/string columns (reward, commander_state).
     """
     groups: dict[int, list] = {}
-    is_fail: dict[int, bool] = {}
+    maxmc: dict[int, float] = {}
     has_inf: dict[int, bool] = {}
     has_tel: dict[int, bool] = {}
+    gmin, gmax = 1e9, -1e9
     for f in ds.files:
         pf = ds._readers[f]
         ei = _leaf_index(pf, "episode_index")
@@ -60,14 +61,20 @@ def scan_episodes(ds: VLALeRobotDataset):
                 ep = np.asarray(pf.read_row_group(g, columns=["episode_index"])["episode_index"].to_pylist())
                 for e in np.unique(ep):
                     groups.setdefault(int(e), []).append((f, g))
-        # one whole-file read of the small columns -> classify (vectorised)
-        t = pf.read(columns=["episode_index", "reward", "observation.commander_state"])
+        # Outcome from mc_return (scheme-agnostic: works for [-1,0] penalty AND [0,1] progress):
+        # a success reaches the HIGH end of the value range, a failure stays low. Commander
+        # composition -> intervention. (Avoids reward thresholds that break under a new reward.)
+        t = pf.read(columns=["episode_index", "mc_return", "observation.commander_state"])
         ep = np.asarray(t["episode_index"].to_pylist())
-        rew = np.asarray(t["reward"].to_pylist(), dtype=np.float32)
+        mc = np.asarray(t["mc_return"].to_pylist(), dtype=np.float32)
         cs = np.asarray([str(c).lower() for c in t["observation.commander_state"].to_pylist()])
-        for e in np.unique(ep[rew <= -0.05]):  is_fail[int(e)] = True
+        gmin = min(gmin, float(mc.min())); gmax = max(gmax, float(mc.max()))
+        for e in np.unique(ep):
+            maxmc[int(e)] = max(maxmc.get(int(e), -1e9), float(mc[ep == e].max()))
         for e in np.unique(ep[cs == "inference"]): has_inf[int(e)] = True
         for e in np.unique(ep[cs == "teleop"]):    has_tel[int(e)] = True
+    thr = gmax - 0.4 * (gmax - gmin) if gmax > gmin else gmax   # failure: max mc in the low 40% of the range
+    is_fail = {e: (mm < thr) for e, mm in maxmc.items()}
     return groups, is_fail, has_inf, has_tel
 
 

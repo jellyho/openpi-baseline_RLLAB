@@ -20,9 +20,12 @@ Design notes
   3M frames) to build the frame index and episode boundaries. The heavy per-row arrays
   (``rl_token`` (8 KB/row) and ``action``) are read per Parquet row-group with a shuffle
   buffer -- sequential reads, no giant in-memory copy.
-* For v1, an H-step executed chunk is only formed when the whole window stays inside one
-  Parquet row-group AND one episode; windows crossing a row-group boundary are skipped
-  (~H/rows_per_group of frames, a few %). This keeps reads sequential and simple.
+* An H-step executed chunk is formed for every frame up to its episode terminal; positions past
+  the terminal are padded by holding the last in-episode action (LeRobot delta_timestamps style),
+  so terminal states are sampled and their return/penalty propagates. The bootstrap ``valid``/
+  ``term`` masks gate which prefixes are trusted, so no bootstrap runs on padded/terminal steps.
+  Windows are still kept within one Parquet row-group (next-states past the group end are masked),
+  costing a few % of near-boundary transitions but keeping reads sequential and simple.
 """
 
 import glob
@@ -83,6 +86,43 @@ BASE_ACTION_SHAPE = (32, 50, 14)
 SCALAR_COLS = ["episode_index", "frame_index", "reward", "mc_return"]
 
 
+class _NpColumn:
+    """Adapter so a cached numpy column satisfies the tiny pyarrow-column interface the
+    samplers use: ``.to_pylist()`` (callers wrap it in ``np.asarray``) and the
+    ``_list_col_to_numpy`` fast path below. Used only by preload mode."""
+    __slots__ = ("array",)
+
+    def __init__(self, array):
+        self.array = array
+
+    def to_pylist(self):
+        return self.array          # samplers do np.asarray(...) / direct indexing -- both fine
+
+
+class _NpTable:
+    """In-RAM stand-in for a decoded pyarrow row-group table (preload mode).
+
+    Holds the decoded columns as numpy arrays (base_action kept fp16) so the existing
+    ``_samples_from_table`` / ``_bootstrap_samples_from_table`` run unchanged but with zero
+    disk I/O and zero parquet re-decode -- only the per-batch gather + host->device copy remain.
+    """
+    __slots__ = ("_cols", "num_rows")
+
+    def __init__(self, cols: dict):
+        self._cols = cols
+        self.num_rows = len(next(iter(cols.values())))
+
+    @property
+    def column_names(self):
+        return list(self._cols)
+
+    def __getitem__(self, k):
+        return _NpColumn(self._cols[k])
+
+    def nbytes(self) -> int:
+        return sum(a.nbytes for a in self._cols.values() if hasattr(a, "nbytes"))
+
+
 def _list_col_to_numpy(col, trailing_shape, dtype=np.float32) -> np.ndarray:
     """Fast (nested) list-column -> dense ndarray, avoiding the slow per-row to_pylist.
 
@@ -90,6 +130,9 @@ def _list_col_to_numpy(col, trailing_shape, dtype=np.float32) -> np.ndarray:
     descend ``.values`` to that leaf and reshape. ~4x faster than ``to_pylist`` for the big
     ``rl_token`` / ``base_action`` columns.
     """
+    if isinstance(col, _NpColumn):                  # preload: already decoded -> cast/reshape only
+        arr = col.array
+        return arr.astype(dtype, copy=False).reshape((arr.shape[0],) + tuple(trailing_shape))
     v = col.combine_chunks() if hasattr(col, "combine_chunks") else col
     n = len(v)
     while hasattr(v, "values"):
@@ -130,6 +173,9 @@ class VLALeRobotDataset:
         relabel_living: Optional[float] = None,
         relabel_fail: float = -0.6,
         num_workers: int = 8,
+        bootstrap_subset: int = 0,
+        n_step: int = 0,
+        preload: bool = False,
     ):
         """
         Args:
@@ -153,10 +199,21 @@ class VLALeRobotDataset:
         self.mc_gamma = mc_gamma
         self.relabel_living = relabel_living
         self.relabel_fail = relabel_fail
+        self.bootstrap_subset = bootstrap_subset
+        self.n_step = n_step
         self.files = find_parquet_files(root)
         self._readers = {f: pq.ParquetFile(f) for f in self.files}
+        self.has_done = "done" in self._readers[self.files[0]].schema_arrow.names
         self.value_support = VALUE_SUPPORT_UNDISCOUNTED if mc_gamma == 1.0 else VALUE_SUPPORT
         self.discount = discount
+        # preload: decode every row-group into RAM-resident numpy ONCE (base_action stays fp16),
+        # so training reads incur zero disk I/O and zero parquet re-decode -- only the per-batch
+        # gather + host->device copy remain. Intended for the single-process (loader_processes=0)
+        # path on a RAM-rich node; under sharded multiprocess each worker would cache its shard.
+        self.preload = preload
+        self._cache: dict = {}
+        if preload:
+            self._build_cache()
 
     # ---- introspection -----------------------------------------------------------
     def summary(self) -> dict:
@@ -167,6 +224,58 @@ class VLALeRobotDataset:
         # was stale for v3 data ([-1,0] vs the constant's [-0.5,0]); dropped to avoid confusion.
         return {"files": len(self.files), "row_groups": n_groups, "rows": n_rows,
                 "horizon": self.horizon}
+
+    # ---- preload (decode the whole dataset into RAM once) ------------------------
+    def _preload_cols(self) -> list[str]:
+        """Columns to cache: the union both samplers read (base_action only if needed)."""
+        cols = ["rl_token", "action", "episode_index", "reward", "mc_return",
+                "observation.commander_state"]
+        if self.include_base_action:
+            cols.append("base_action")
+        if self.has_done:
+            cols.append("done")
+        return cols
+
+    def _decode_table(self, t) -> _NpTable:
+        """Decode one (real pyarrow) row-group table into a RAM-resident _NpTable."""
+        cols = {
+            "rl_token": _list_col_to_numpy(t["rl_token"], (LATENT_DIM,)),         # f32 (n,2048)
+            "action": _list_col_to_numpy(t["action"], (ACTION_DIM,)),            # f32 (n,14)
+            "episode_index": np.asarray(t["episode_index"].to_pylist()),
+            "reward": np.asarray(t["reward"].to_pylist(), dtype=np.float32),
+            "mc_return": np.asarray(t["mc_return"].to_pylist(), dtype=np.float32),
+            "observation.commander_state": t["observation.commander_state"].to_pylist(),
+        }
+        if self.include_base_action:                                              # keep fp16 (huge)
+            cols["base_action"] = _list_col_to_numpy(t["base_action"], BASE_ACTION_SHAPE,
+                                                     dtype=np.float16)
+        if self.has_done:
+            cols["done"] = np.asarray(t["done"].to_pylist())
+        return _NpTable(cols)
+
+    def _build_cache(self) -> None:
+        work = [(f, g) for f in self.files
+                for g in range(self._readers[f].metadata.num_row_groups)]
+        cols = self._preload_cols()
+
+        def decode(fg):
+            f, g = fg
+            # Fresh handle per read (read_row_group on a shared handle isn't thread-safe);
+            # decode releases the GIL so the threads actually parallelize the base_action read.
+            return fg, self._decode_table(pq.ParquetFile(f).read_row_group(g, columns=cols))
+
+        n_workers = max(1, self.num_workers)
+        nbytes = 0
+        print(f"[preload] decoding {len(work)} row-groups into RAM "
+              f"(base_action={'fp16' if self.include_base_action else 'skipped'})...", flush=True)
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for done, (fg, tbl) in enumerate(ex.map(decode, work), 1):
+                self._cache[fg] = tbl
+                nbytes += tbl.nbytes()
+                if done % 50 == 0 or done == len(work):
+                    print(f"[preload]   {done}/{len(work)} groups, ~{nbytes/1e9:.1f} GB resident",
+                          flush=True)
+        print(f"[preload] done: {len(self._cache)} groups, ~{nbytes/1e9:.1f} GB in RAM.", flush=True)
 
     # ---- reward relabel (in-loader; avoids re-annotating 181GB of parquet) -------
     def _relabel(self, rew: np.ndarray) -> np.ndarray:
@@ -221,7 +330,7 @@ class VLALeRobotDataset:
         """
         H = self.horizon
         n = t.num_rows
-        if n <= H:
+        if n <= 1:
             return None
         ep = np.asarray(t["episode_index"].to_pylist())
         act = _list_col_to_numpy(t["action"], (ACTION_DIM,))                 # (n, 14)
@@ -232,21 +341,27 @@ class VLALeRobotDataset:
         else:
             mc = self._compute_mc(rew, ep)                                   # recomputed
         cmd = t["observation.commander_state"].to_pylist()
+        last_idx = self._episode_last_index(ep)                              # (n,) last frame of each ep block
 
-        starts = np.arange(0, n - H)
-        # window must stay in one episode: ep[i] == ep[i+H-1]
-        same_ep = ep[starts] == ep[starts + H - 1]
-        starts = starts[same_ep]
+        # Include starts right up to the episode terminal (LeRobot delta_timestamps style): the
+        # executed chunk is padded PAST the terminal by holding the last in-episode action, so the
+        # terminal states ARE sampled and their realized return propagates. (The old code dropped
+        # any H-window crossing an episode boundary, starving the last H frames of every episode.)
+        starts = np.arange(0, n - 1)
+        starts = starts[last_idx[starts] > starts]                           # keep frames w/ >=1 real next action
         if self.commander_filter is not None:
-            keep = np.array([cmd[i] in self.commander_filter for i in starts], dtype=bool)
-            starts = starts[keep]
+            starts = starts[[cmd[i] in self.commander_filter for i in starts]]
         if len(starts) == 0:
             return None
 
-        states = rl[starts]                                                  # (b, 2048)
-        chunks = np.stack([act[i:i + H] for i in starts])                    # (b, H, 14)
+        Li = last_idx[starts]                                                # (b,) episode-last per start
+        # Per-position chunk index, clamped to the episode end -> positions past the terminal repeat
+        # the last in-episode action (hold-last). mc[starts] is the realized return-to-end (correct),
+        # which the MC head regresses for every prefix (its by-design grounding; no per-prefix mask).
+        pos = np.minimum(starts[:, None] + np.arange(H)[None, :], Li[:, None])  # (b, H)
+        chunks = act[pos]                                                    # (b, H, 14) padded chunk
         out = {
-            "observations": states,
+            "observations": rl[starts],                                      # (b, 2048)
             "action_chunks": chunks.reshape(len(starts), H * ACTION_DIM),    # (b, H*14)
             "mc_return": mc[starts],                                         # (b,)
             "reward": rew[starts],                                           # (b,)
@@ -285,7 +400,7 @@ class VLALeRobotDataset:
         H = self.horizon
         gamma = self.discount
         n = t.num_rows
-        if n <= H + 1:
+        if n <= 1:
             return None
         ep = np.asarray(t["episode_index"].to_pylist())
         rl = _list_col_to_numpy(t["rl_token"], (LATENT_DIM,))               # (n, 2048)
@@ -301,41 +416,54 @@ class VLALeRobotDataset:
         cmd = t["observation.commander_state"].to_pylist()
         last_idx = self._episode_last_index(ep)
 
-        starts = np.arange(0, n - H)
+        # Start every frame up to the episode terminal (LeRobot delta_timestamps style); chunks are
+        # padded past the terminal (hold-last) below, and prefixes landing past the terminal / past
+        # the row-group are masked out by ``valid`` -> no bootstrap there. This keeps the failure
+        # terminal transitions (h s.t. i+h == episode end) that the old ``arange(0, n-H)`` dropped.
+        starts = np.arange(0, n - 1)
+        starts = starts[last_idx[starts] > starts]                          # keep frames w/ >=1 real next frame
         if self.commander_filter is not None:
             starts = starts[[cmd[i] in self.commander_filter for i in starts]]
         if len(starts) == 0:
             return None
         S, P = len(starts), len(prefixes)
         Li = last_idx[starts]                                               # (S,)
-        end = starts[:, None] + prefixes[None, :]                           # (S,P) = i+h
-        valid = (end <= Li[:, None]).astype(np.float32)                     # within episode
+        end = starts[:, None] + (prefixes[None, :] + self.n_step)           # (S,P) = i+h+N  (N-step bootstrap shift)
+        # valid h: transition stays inside the episode (end <= Li) AND its next-state is readable in
+        # this row-group (end <= n-1). Masked prefixes contribute nothing to the TD loss.
+        valid = ((end <= Li[:, None]) & (end <= n - 1)).astype(np.float32)
         end_c = np.clip(end, 0, n - 1)                                      # safe gather idx
-        # True episode terminal iff the next-state carries a TERMINAL reward (success 0.0 /
-        # failure penalty), NOT the living cost. This is robust to the ~1000-row row-group
-        # boundaries: every episode spans several groups, so a boundary frame holds a living
-        # reward and is NOT mis-flagged. (The old `end == Li` test treated every group-end as
-        # a terminal -> ~half of all flagged terminals were false, bootstrapping from a living
-        # value (-1e-4) instead of the critic. Verified: reward in {0.0, -0.5} only at true ends.)
-        is_term_frame = (rew >= -1e-6) | (rew <= -0.05)                     # (n,) bool
+        # Episode terminal signal. Prefer an explicit ``done`` column if the dataset has one
+        # (the right way -- read the terminal from data). Else FALL BACK to inferring it from the
+        # reward value (success 0.0 / failure penalty, NOT the -1e-4 living cost) -- a heuristic
+        # for legacy datasets without ``done`` (and unreliable under a different reward scheme).
+        if "done" in t.column_names:
+            is_term_frame = np.asarray(t["done"].to_pylist()).astype(bool)  # (n,) explicit signal
+        else:
+            is_term_frame = (rew >= -1e-6) | (rew <= -0.05)                 # (n,) inferred fallback
         term = ((valid > 0) & is_term_frame[end_c]).astype(np.float32)      # (S,P) genuine terminal
 
         # h-step discounted realized reward, per prefix (loop over the few prefixes).
         cum = np.zeros((S, P), np.float32)
         for p, h in enumerate(prefixes):
             acc = np.zeros(S, np.float32)
-            for j in range(int(h)):
-                acc += (gamma ** j) * rew[starts + j]
+            for j in range(int(h) + self.n_step):                          # N-step: sum h+N real rewards
+                idx = np.minimum(starts + j, Li)               # clamp within episode (only affects masked h)
+                acc += (gamma ** j) * rew[idx]
             cum[:, p] = acc
 
         N = ba.shape[1]
+        nc = ba[end_c]                                                      # (S,P,N,H,Dr)
+        if 0 < self.bootstrap_subset < N:                                  # REDQ-style random candidate subset
+            sub = np.random.default_rng().choice(N, self.bootstrap_subset, replace=False)
+            nc = nc[:, :, sub]; N = self.bootstrap_subset                  # (S,P,M,H,Dr) -> conservative max + less data
+        pos = np.minimum(starts[:, None] + np.arange(H)[None, :], Li[:, None])  # hold-last past terminal
         out = {
             "observations": rl[starts],                                     # (S,2048)
-            "action_chunks": np.stack([act[i:i + H] for i in starts]
-                                      ).reshape(S, H * ACTION_DIM),         # (S,H*14)
+            "action_chunks": act[pos].reshape(S, H * ACTION_DIM),           # (S,H*14) padded chunk
             "cum_reward": cum,                                              # (S,P)
             "next_latents": rl[end_c],                                      # (S,P,2048)
-            "next_candidates": ba[end_c].reshape(S, P, N, H * ACTION_DIM),  # (S,P,N,H*14)
+            "next_candidates": nc.reshape(S, P, N, H * ACTION_DIM),         # (S,P,N',H*14)
             "next_mc_return": mc[end_c],                                    # (S,P)
             "mc_return": mc[starts],                                        # (S,) start-state V^beta (Cal-QL floor)
             "term": term,                                                   # (S,P)
@@ -362,6 +490,8 @@ class VLALeRobotDataset:
         rng = np.random.default_rng(seed)
         cols = ["rl_token", "action", "reward", "mc_return", "base_action",
                 "episode_index", "observation.commander_state"]
+        if self.has_done:
+            cols = cols + ["done"]
         work = [(f, g) for f in self.files
                 for g in range(self._readers[f].metadata.num_row_groups)]
         rng.shuffle(work)
@@ -372,9 +502,12 @@ class VLALeRobotDataset:
         pool, pool_n = [], 0
 
         def read_form(fg):
-            # Fresh ParquetFile per read: read_row_group on a SHARED handle is not thread-safe;
-            # the footer read is cheap. pyarrow decode releases the GIL, so concurrent reads of
-            # the heavy base_action column (~828ms/group) actually parallelize across threads.
+            # Preload: serve the decoded in-RAM table (no disk read, no re-decode). Else fresh
+            # ParquetFile per read: read_row_group on a SHARED handle is not thread-safe; the
+            # footer read is cheap. pyarrow decode releases the GIL, so concurrent reads of the
+            # heavy base_action column (~828ms/group) actually parallelize across threads.
+            if self.preload:
+                return self._bootstrap_samples_from_table(self._cache[fg], prefixes)
             f, g = fg
             t = pq.ParquetFile(f).read_row_group(g, columns=cols)
             return self._bootstrap_samples_from_table(t, prefixes)
@@ -443,7 +576,7 @@ class VLALeRobotDataset:
 
         buf = 0
         for (f, g) in work:
-            t = self._readers[f].read_row_group(g, columns=cols)
+            t = self._cache[(f, g)] if self.preload else self._readers[f].read_row_group(g, columns=cols)
             s = self._samples_from_table(t)
             if s is not None:
                 pool.append(s)

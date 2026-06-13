@@ -155,6 +155,7 @@ def main():
     p.add_argument("--num-candidates", type=int, default=0, help="Use first N base-action candidates (0 = all).")
     p.add_argument("--frame-batch", type=int, default=64)
     p.add_argument("--fps", type=int, default=25)
+    p.add_argument("--stride", type=int, default=1, help="render every Nth frame (Nx faster video; curves use all frames).")
     args = p.parse_args()
     if not args.episode_npz and not args.dataset:
         p.error("provide --episode-npz (fast) or --dataset (+ --episode).")
@@ -222,7 +223,7 @@ def main():
             else:
                 i += 1
 
-    for t in range(T):
+    for t in range(0, T, max(1, args.stride)):
         fig = plt.figure(figsize=(12, 5))
         gs = fig.add_gridspec(2, 2, width_ratios=[1, 1.4], height_ratios=[2, 1])
         ax_img = fig.add_subplot(gs[:, 0]); ax_v = fig.add_subplot(gs[0, 1]); ax_h = fig.add_subplot(gs[1, 1])
