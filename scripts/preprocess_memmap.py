@@ -35,7 +35,7 @@ import json
 import os
 import pathlib
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -120,25 +120,28 @@ def _compute_last_idx(ep: np.ndarray) -> np.ndarray:
     return last
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--input", required=True, help="annotated dataset root (has data/ + meta/)")
-    p.add_argument("--out", required=True, help="output memmap dir")
-    p.add_argument("--workers", type=int, default=4, help="parallel file workers")
-    p.add_argument("--max-files", type=int, default=0, help=">0 -> only first N parquet files (subset/bench)")
-    p.add_argument("--overwrite", action="store_true")
-    args = p.parse_args()
+def memmap_ready(out_dir) -> bool:
+    """True if ``out_dir`` already holds a complete memmap (has meta.json)."""
+    return (pathlib.Path(out_dir) / "meta.json").exists()
 
-    paths = find_parquet_files(args.input)
-    if args.max_files > 0:
-        paths = paths[: args.max_files]
+
+def build_memmap(input_root, out_dir, workers: int = 4, max_files: int = 0,
+                 overwrite: bool = False) -> pathlib.Path:
+    """Convert an annotated dataset to a frame-indexed memmap. Importable so the trainer can
+    auto-build on first run (no separate preprocess step). Idempotent: returns immediately if
+    ``out_dir`` already has a meta.json (unless ``overwrite``)."""
+    out = pathlib.Path(out_dir).resolve()
+    if memmap_ready(out) and not overwrite:
+        print(f"[memmap] reuse {out}")
+        return out
+
+    paths = find_parquet_files(str(input_root))
+    if max_files > 0:
+        paths = paths[: max_files]
     rows = _file_rows(paths)
     offs = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)
     N = int(offs[-1])
     has_done = _has_done(paths[0])
-    out = pathlib.Path(args.out).resolve()
-    if out.exists() and not args.overwrite and (out / "meta.json").exists():
-        raise FileExistsError(f"{out} already has a memmap. Pass --overwrite.")
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"=== preprocess_memmap: {len(paths)} files, {N:,} frames -> {out} ===")
@@ -154,7 +157,7 @@ def main():
 
     t0 = time.time()
     jobs = [(str(out), str(paths[i]), int(offs[i]), int(rows[i]), has_done) for i in range(len(paths))]
-    with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs))) as ex:
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as ex:
         for path, r in ex.map(_convert_file, jobs):
             print(f"    wrote {r:,} rows from {pathlib.Path(path).name}  ({time.time()-t0:.0f}s)", flush=True)
 
@@ -166,10 +169,23 @@ def main():
 
     meta = {"n_frames": N, "latent_dim": LATENT_DIM, "action_dim": ACTION_DIM,
             "base_action_shape": list(BASE_ACTION_SHAPE), "base_flat": BASE_FLAT,
-            "has_done": has_done, "source": str(pathlib.Path(args.input).resolve()),
+            "has_done": has_done, "source": str(pathlib.Path(input_root).resolve()),
             "n_files": len(paths)}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
     print(f"=== done: {N:,} frames in {time.time()-t0:.0f}s -> {out} ===")
+    return out
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--input", required=True, help="annotated dataset root (has data/ + meta/)")
+    p.add_argument("--out", required=True, help="output memmap dir")
+    p.add_argument("--workers", type=int, default=4, help="parallel file workers")
+    p.add_argument("--max-files", type=int, default=0, help=">0 -> only first N parquet files (subset/bench)")
+    p.add_argument("--overwrite", action="store_true")
+    args = p.parse_args()
+    build_memmap(args.input, args.out, workers=args.workers, max_files=args.max_files,
+                 overwrite=args.overwrite)
 
 
 if __name__ == "__main__":

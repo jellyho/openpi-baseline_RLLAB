@@ -122,10 +122,16 @@ class MemmapVLADataset:
             term = (self.done[end_c].astype(bool) & (valid > 0)).astype(np.float32)  # (B,P)
 
             pos = np.minimum(starts[:, None] + Harange[None, :], Li[:, None])   # (B,H) hold-last
-            nc = self.ba[end_c.ravel()].reshape(batch_size, P, Ncand, H * Dr)   # (B,P,N,H*Dr)
+            ef = end_c.ravel()                                                  # (B*P,)
             if sub:
+                # Gather ONLY the subset candidates (strided index into the memmap) -- 4x less
+                # data read + transferred than gathering all N then slicing.
                 cidx = rng.choice(Ncand, self.bootstrap_subset, replace=False)
-                nc = nc[:, :, cidx]                                             # (B,P,M,H*Dr)
+                ba3 = self.ba.reshape(self.N, Ncand, H * Dr)                    # view, no copy
+                nc = np.asarray(ba3[ef[:, None], cidx[None, :]]).reshape(
+                    batch_size, P, self.bootstrap_subset, H * Dr)              # (B,P,M,H*Dr)
+            else:
+                nc = np.asarray(self.ba[ef]).reshape(batch_size, P, Ncand, H * Dr)  # (B,P,N,H*Dr)
 
             yield {
                 "observations": np.asarray(self.rl[starts]),                    # (B,2048)

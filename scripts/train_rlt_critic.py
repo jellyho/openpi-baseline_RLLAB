@@ -176,6 +176,15 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         relabel_fail=cfg.reward.relabel_fail,
         num_workers=cfg.num_workers, bootstrap_subset=cfg.td.bootstrap_subset,
         n_step=cfg.td.n_step, preload=preload, memmap_dir=cfg.memmap_dir)
+    if cfg.memmap_dir:
+        # Auto-build the memmap on first run (one-time) so a SINGLE `train` command handles
+        # preprocessing -> no separate step. Runs in this main process before the loader
+        # workers spawn; subsequent runs reuse it (idempotent: skips if meta.json exists).
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # scripts/ -> preprocess_memmap
+        from preprocess_memmap import build_memmap, memmap_ready
+        if not memmap_ready(cfg.memmap_dir):
+            print(f"    [memmap] not found at {cfg.memmap_dir} -> building from {cfg.data_root} (one-time)...")
+            build_memmap(cfg.data_root, cfg.memmap_dir, workers=cfg.num_workers)
     ds = make_dataset(ds_kwargs)           # MemmapVLADataset if cfg.memmap_dir set, else parquet
     if cfg.memmap_dir:
         print(f"    [memmap] fast index loader on {cfg.memmap_dir}")
@@ -341,6 +350,7 @@ def main():
         preload: Optional[bool] = None     # override cfg.preload (decode whole dataset into RAM; loader_processes=0 only)
         warmup_skip: Optional[bool] = None # override td.warmup_skip (pure-MC beta=0 phase, no base_action read)
         checkpoint_base_dir: str = ""      # override where runs are written (run dir = base/<name>/<exp>); "" = config default
+        memmap_dir: str = ""               # fast index loader over this memmap dir (scripts/preprocess_memmap.py); "" = parquet
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
@@ -368,7 +378,8 @@ def main():
     cfg = dataclasses.replace(cfg, seed=args.seed, exp_name=args.exp_name or "",
                               task=args.task or cfg.task,
                               data_root_override=args.data_root or cfg.data_root_override,
-                              checkpoint_base_dir=args.checkpoint_base_dir or cfg.checkpoint_base_dir)
+                              checkpoint_base_dir=args.checkpoint_base_dir or cfg.checkpoint_base_dir,
+                              memmap_dir=args.memmap_dir or cfg.memmap_dir)
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 
