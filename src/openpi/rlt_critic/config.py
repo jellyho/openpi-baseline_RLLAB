@@ -199,10 +199,10 @@ TASKS = {
     # mouse-battery is v3-annotated on disk here (reward_annotate.py: living=-1/step,
     # fail=-0.4*T_max, gamma=0.9999, globally normalized so mc_return in [-1,0]). Matches the
     # config defaults: support [-1,0] + td.discount=0.9999.
-    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_v3_annotated",
-    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_v3_annotated",
-    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_v3_annotated",
-    "generalist":   f"{_DATA_BASE}/generalist_v3_annotated",
+    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated_v3_augmented",
+    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated_v3_augmented",
+    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated_v3_augmented",
+    "generalist":   f"{_DATA_BASE}/generalist_annotated_v3_augmented",
 }
 
 
