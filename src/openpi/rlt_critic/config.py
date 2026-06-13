@@ -199,9 +199,10 @@ TASKS = {
     # mouse-battery is v3-annotated on disk here (reward_annotate.py: living=-1/step,
     # fail=-0.4*T_max, gamma=0.9999, globally normalized so mc_return in [-1,0]). Matches the
     # config defaults: support [-1,0] + td.discount=0.9999.
-    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated",
-    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated",
-    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated",
+    "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_v3_annotated",
+    "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_v3_annotated",
+    "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_v3_annotated",
+    "generalist":   f"{_DATA_BASE}/generalist_v3_annotated",
 }
 
 
@@ -443,14 +444,40 @@ _CONFIGS = [
     # written ONE FULL EPISODE PER PARQUET ROW-GROUP, so an in-loader mc_gamma override (td.mc_gamma)
     # recomputes FULL-EPISODE mc_return correctly -- handy for sweeping the discount on this set.
     VLAAQCConfig(
-        name="vla_aqc_mini",
+        name="vla_aqc_insert-mouse-battery",
+        task="insert-mouse-battery",
+        notes="MC warmup (0k) -> hard TD switch (ramp=0), "
+              "EMA target net (tau=0.005) for stability.",
+        td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
+        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),  # faster convergence on the small set
+        log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
+    ),
+    VLAAQCConfig(
+        name="vla_aqc_seal-water-bottle-cap",
         task="seal-water-bottle-cap",
-        data_root_override="/lustre/jellyho/seal_mini",
-        notes="DEBUG: 30-episode seal_mini subset; MC warmup (5k) -> hard TD switch (ramp=0), "
-              "frequent eval, EMA target net (tau=0.005) for stability.",
-        td=TDConfig(mc_warmup_steps=5_000, mc_ramp_steps=0),
-        optim=OptimConfig(num_train_steps=50_000),
-        log_interval=100, eval_interval=1_000, save_interval=5_000, keep_period=25_000,
+        notes="MC warmup (0k) -> hard TD switch (ramp=0), "
+              "EMA target net (tau=0.005) for stability.",
+        td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
+        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),  # faster convergence on the small set
+        log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
+    ),
+    VLAAQCConfig(
+        name="vla_aqc_tower-of-hanoi-game",
+        task="tower-of-hanoi-game",
+        notes="MC warmup (0k) -> hard TD switch (ramp=0), "
+              "EMA target net (tau=0.005) for stability.",
+        td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
+        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),
+        log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
+    ),
+    VLAAQCConfig(
+        name="vla_aqc_generalist",
+        task="generalist",
+        notes="MC warmup (0k) -> hard TD switch (ramp=0), "
+              "EMA target net (tau=0.005) for stability.",
+        td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
+        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),
+        log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
     ),
     # ---- DEBUG exp2: paper-style PROGRESS reward (Sec 3.1, Eq.1) -------------------------
     # Target mc_return = gamma^(T-t) * I(success): positive "task progress" rising to 1 at a
