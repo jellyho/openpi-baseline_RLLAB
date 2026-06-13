@@ -163,3 +163,38 @@ class MemmapVLADataset:
                 "mc_return": np.asarray(self.mc[starts]),
                 "reward": np.asarray(self.rew[starts]),
             }
+
+    # ---------------------------------------------------------------- eval (value-curve viz)
+    # Memmap-native equivalents of eval_curves.scan_episodes / load_episode, so the offline
+    # value-curve eval works on the memmap loader too (frame-indexed -> simpler than the
+    # parquet row-group scan; episodes are contiguous blocks -> reduceat aggregates).
+    def scan_episodes(self):
+        """-> (groups, is_fail, has_inf, has_tel). 'groups' is a placeholder ({ep: None}) since
+        load_episode gathers by frame index, not row-group. is_fail = max mc in the low 40% of
+        the global mc range (scheme-agnostic: works for [-1,0] penalty and [0,1] progress)."""
+        ep = np.asarray(self.ep); mc = np.asarray(self.mc); cmd = np.asarray(self.cmd)
+        bounds = np.r_[0, np.where(np.diff(ep) != 0)[0] + 1]      # start of each episode block
+        ids = ep[bounds]
+        maxmc = np.maximum.reduceat(mc, bounds)
+        has_inf = np.maximum.reduceat((cmd == 1).astype(np.int8), bounds) > 0
+        has_tel = np.maximum.reduceat((cmd == 0).astype(np.int8), bounds) > 0
+        gmin, gmax = float(mc.min()), float(mc.max())
+        thr = gmax - 0.4 * (gmax - gmin) if gmax > gmin else gmax
+        groups = {int(e): None for e in ids}
+        return (groups,
+                {int(e): bool(m < thr) for e, m in zip(ids, maxmc)},
+                {int(e): bool(b) for e, b in zip(ids, has_inf)},
+                {int(e): bool(b) for e, b in zip(ids, has_tel)})
+
+    def load_episode(self, ep: int, groups=None) -> dict:
+        """Gather one episode's frames (already in frame order) for the value-curve eval."""
+        idx = np.where(np.asarray(self.ep) == int(ep))[0]
+        s, e = int(idx[0]), int(idx[-1]) + 1                     # contiguous block [s, e)
+        code2str = {0: "teleop", 1: "inference", -1: "other"}
+        return {
+            "frame_index": np.arange(e - s),
+            "rl_token": np.asarray(self.rl[s:e]),
+            "action": np.asarray(self.act[s:e]),
+            "mc_return": np.asarray(self.mc[s:e]),
+            "commander": np.array([code2str.get(int(c), "other") for c in self.cmd[s:e]]),
+        }

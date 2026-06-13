@@ -108,7 +108,8 @@ def load_episode(ds: VLALeRobotDataset, ep: int, groups: dict) -> dict:
 def build_eval_set(ds: VLALeRobotDataset, n_success: int = 3, n_fail: int = 3,
                    n_intervention: int = 3, seed: int = 0) -> list[dict]:
     """Pick + load a fixed set of success / intervention / failure episodes (ONCE, reused)."""
-    groups, is_fail, has_inf, has_tel = scan_episodes(ds)
+    # MemmapVLADataset provides its own (frame-indexed) scan/load; fall back to the parquet scan.
+    groups, is_fail, has_inf, has_tel = ds.scan_episodes() if hasattr(ds, "scan_episodes") else scan_episodes(ds)
     all_eps = sorted(groups)
     interv = [e for e in all_eps if has_inf.get(e) and has_tel.get(e)]
     iset = set(interv)
@@ -122,7 +123,7 @@ def build_eval_set(ds: VLALeRobotDataset, n_success: int = 3, n_fail: int = 3,
                      ("intervention", pick(interv, n_intervention)),
                      ("failure", pick(fail_eps, n_fail))]:
         for e in sel:
-            d = load_episode(ds, e, groups)
+            d = ds.load_episode(e, groups) if hasattr(ds, "load_episode") else load_episode(ds, e, groups)
             d["ep"] = e; d["category"] = cat; d["fail"] = (cat == "failure")
             out.append(d)
     return out
