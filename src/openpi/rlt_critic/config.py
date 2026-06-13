@@ -103,14 +103,15 @@ class TDConfig:
     # the truncation. Set to a float only to override with an in-loader recompute.
     mc_gamma: Optional[float] = None   # use the precomputed gamma=0.999 column on disk
     num_candidates: int = 32        # N (== base_action's 32); the bootstrap max is over N x H
-    # Prefix subsample grid, stored as STEP COUNTS (not macro-prefix indices).
-    # Default: all 5 macro-prefix positions when macro_group_size=10.
-    # With macro_group_size=1 (standard): use e.g. (1, 10, 25, 50).
-    prefixes: tuple[int, ...] = (10, 20, 30, 40, 50)
+    # Prefix subsample grid, stored as STEP COUNTS (not macro-prefix indices). Must each be a
+    # multiple of macro_group_size and number at most macro_H = horizon // macro_group_size.
+    # macro_group_size=25 -> macro_H=2 -> replan at 25 / 50 steps. (For =10 use (10,20,30,40,50);
+    # for the standard =1 use e.g. (1,10,25,50).)
+    prefixes: tuple[int, ...] = (25, 50)
     # Group this many consecutive per-step actions into one transformer token.
-    # 10 → horizon 50 becomes 5 macro-action tokens (L=6 sequence, same as OGBench).
-    # 1 = standard per-step tokenisation (H=50 action tokens).
-    macro_group_size: int = 10
+    # 25 → horizon 50 becomes 2 macro-action tokens (replan granularity 25/50 steps).
+    # 10 → 5 macro-tokens; 1 = standard per-step tokenisation (H=50 action tokens).
+    macro_group_size: int = 25
     terminal_uses_mc: bool = True   # at the -0.5 failure terminal, bootstrap = mc_return
     # How to aggregate the N-candidate x prefix Q's into the bootstrap value V(s'):
     #   'max'      -> hard max (Best-of-N / EMaQ; optimistic, current default)
