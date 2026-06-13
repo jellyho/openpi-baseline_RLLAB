@@ -126,9 +126,18 @@ def reward_scale(cfg: VLAAQCConfig) -> float:
 
 # --------------------------------------------------------------------------- train
 def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
+    # Multi-process DDP (one OS process per GPU, jax.distributed): n_proc>1 here. The chief
+    # (process 0) owns all host-side side effects -- logging, checkpoints, the one-time memmap
+    # build -- while every process drives its single local GPU and XLA inserts the cross-process
+    # grad all-reduce. n_proc==1 (single-process multi-GPU, or 1 GPU) is the unchanged old path.
+    n_proc = jax.process_count()
+    proc_id = jax.process_index()
+    chief = (proc_id == 0)
+    seed_off = proc_id * 1_000_003               # decorrelate each process's data shard sampling
     print(f"=== run: {cfg.run_name} ===")
     print(f"    dir: {cfg.run_dir}")
-    cfg.save()                                   # dump config.json (self-documenting run)
+    if chief:
+        cfg.save()                               # dump config.json (self-documenting run)
 
     trainer = VLACriticTrainer(cfg, seed=cfg.seed)
     print(f"    critic params: {trainer.num_params()/1e6:.2f}M  (n_embd={cfg.arch.n_embd}, "
@@ -146,18 +155,22 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     # Data-parallel mesh (openpi-style, single process): params replicated on every GPU,
     # each batch split along its leading axis -> jit inserts the grad all-reduce itself.
     # With 1 device this is the identity setup, so the single-GPU path is unchanged.
-    devices = jax.devices()
+    devices = jax.devices()                          # GLOBAL devices (across all processes)
     n_dev = len(devices)
     assert cfg.optim.batch_size % n_dev == 0, \
         f"batch_size {cfg.optim.batch_size} must be divisible by {n_dev} devices"
+    # Each process feeds only its OWN shard of the global batch (B/n_proc); make_array_from_
+    # process_local_data then stitches the per-process shards into the global sharded array.
+    # n_proc==1 => local_B == global B (old single-process path, unchanged).
+    local_B = cfg.optim.batch_size // n_proc
     mesh = Mesh(np.asarray(devices), ("dp",))
     data_sharding = NamedSharding(mesh, PartitionSpec("dp"))
     repl_sharding = NamedSharding(mesh, PartitionSpec())
     params = jax.device_put(params, repl_sharding)
     opt_state = jax.device_put(opt_state, repl_sharding)
     target_params = jax.device_put(target_params, repl_sharding)
-    print(f"    devices: {n_dev} x {devices[0].device_kind}  "
-          f"(global B={cfg.optim.batch_size} -> {cfg.optim.batch_size // n_dev}/device, "
+    print(f"    devices: {n_dev} x {devices[0].device_kind}  procs={n_proc} (local={len(jax.local_devices())})  "
+          f"(global B={cfg.optim.batch_size} -> {local_B}/proc -> {cfg.optim.batch_size // n_dev}/device, "
           f"loader_processes={cfg.loader_processes})")
 
     # preload (whole dataset -> RAM) only makes sense on the single-process path; under
@@ -183,8 +196,15 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))   # scripts/ -> preprocess_memmap
         from preprocess_memmap import build_memmap, memmap_ready
         if not memmap_ready(cfg.memmap_dir):
-            print(f"    [memmap] not found at {cfg.memmap_dir} -> building from {cfg.data_root} (one-time)...")
-            build_memmap(cfg.data_root, cfg.memmap_dir, workers=cfg.num_workers)
+            # Only the chief builds (else N processes corrupt the same files); the others block
+            # on the barrier until it's done. (For a fresh, slow build prefer pre-building once
+            # via `--build_memmap_only` in the launcher so this barrier is instant.)
+            if chief:
+                print(f"    [memmap] not found at {cfg.memmap_dir} -> building from {cfg.data_root} (one-time)...")
+                build_memmap(cfg.data_root, cfg.memmap_dir, workers=cfg.num_workers)
+            if n_proc > 1:
+                from jax.experimental import multihost_utils
+                multihost_utils.sync_global_devices("rlt_memmap_built")
     ds = make_dataset(ds_kwargs)           # MemmapVLADataset if cfg.memmap_dir set, else parquet
     if cfg.memmap_dir:
         print(f"    [memmap] fast index loader on {cfg.memmap_dir}")
@@ -210,20 +230,20 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         # single background thread.
         if cfg.loader_processes > 0:
             from openpi.rlt_critic.loader import VLABatchIterable, make_torch_loader
-            it = VLABatchIterable(ds_kwargs, cfg.optim.batch_size, cfg.td.target_kind,
+            it = VLABatchIterable(ds_kwargs, local_B, cfg.td.target_kind,
                                   cfg.td.prefixes, seed)
             yield from make_torch_loader(it, cfg.loader_processes, cfg.prefetch_depth)
             return
         if cfg.td.target_kind == "mc":
-            gen = ds.iter_batches(cfg.optim.batch_size, seed=seed)
+            gen = ds.iter_batches(local_B, seed=seed)
         else:
-            gen = ds.iter_bootstrap_batches(cfg.optim.batch_size, cfg.td.prefixes, seed=seed)
+            gen = ds.iter_bootstrap_batches(local_B, cfg.td.prefixes, seed=seed)
         yield from prefetch(gen, depth=cfg.prefetch_depth)
 
     def mc_warmup_iter(seed):
         # In-process MC stream (no base_action -> cheap, GPU-bound ~44 it/s; single-thread loader
         # keeps up, so no worker processes needed here regardless of loader_processes).
-        yield from prefetch(mc_ds.iter_batches(cfg.optim.batch_size, seed=seed),
+        yield from prefetch(mc_ds.iter_batches(local_B, seed=seed),
                             depth=cfg.prefetch_depth)
 
     def shard_batch(b):
@@ -241,12 +261,14 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
                     b[k] = b[k] * rscale
         return b
 
-    logger = None if timing_steps else RunLogger(cfg)
+    logger = RunLogger(cfg) if (chief and not timing_steps) else None   # only chief logs/ckpts
     # Offline eval (trajectory value-curve viz vs mc_return) is OPTIONAL: it only runs if an
     # eval module (openpi.rlt_critic.eval_curves) is present. Stage-1 critic training doesn't
     # need it, so skip cleanly when it's absent.
     vla_eval, eval_set = None, None
-    if logger:
+    # Offline eval runs single-device eager ops on the chief only; under multi-process DDP that
+    # would desync the collective lockstep (other procs never call it), so skip it when n_proc>1.
+    if logger and n_proc == 1:
         try:
             from openpi.rlt_critic import eval_curves as vla_eval
             eval_set = vla_eval.build_eval_set(ds, n_success=cfg.eval_n_success,
@@ -262,7 +284,7 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     # otherwise the TD loader+step. The boundary switch swaps both the iterator and the train step.
     warmup_end = cfg.td.mc_warmup_steps if warmup_skip else 0
     in_warmup = start_step < warmup_end
-    it = (mc_warmup_iter if in_warmup else td_batch_iter)(cfg.seed + start_step)
+    it = (mc_warmup_iter if in_warmup else td_batch_iter)(cfg.seed + start_step + seed_off)
     cur_step_fn = mc_step_fn if in_warmup else step_fn
     n_steps = timing_steps or cfg.optim.num_train_steps
     t0 = time.time(); t_log = t0
@@ -270,18 +292,18 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     is_tty = sys.stderr.isatty()
     end_step = start_step + n_steps
     pbar = tqdm(range(start_step, end_step), desc=cfg.name,
-                dynamic_ncols=True, smoothing=0.1, disable=not is_tty)
+                dynamic_ncols=True, smoothing=0.1, disable=not is_tty or not chief)
     for step in pbar:
         if in_warmup and step >= warmup_end:           # warmup done -> switch to the TD loader/step
             in_warmup = False
-            it = td_batch_iter(cfg.seed + step)
+            it = td_batch_iter(cfg.seed + step + seed_off)
             cur_step_fn = step_fn
             target_params = params                      # resync EMA target to the warmed-up online weights
             pbar.write(f"  [warmup-skip] step {step}: warmup done -> TD (base_action) loader engaged")
         try:
             b = scale_batch(next(it))
         except StopIteration:
-            it = (mc_warmup_iter if in_warmup else td_batch_iter)(cfg.seed + step)
+            it = (mc_warmup_iter if in_warmup else td_batch_iter)(cfg.seed + step + seed_off)
             b = scale_batch(next(it))
         jb, pf = shard_batch(b)
         # ReLU-blend MC-warmup coefficient for this step (jnp scalar -> traced, no recompile).
@@ -320,13 +342,24 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
         dt = time.time() - t0
         print(f"\n=== timing: {timing_steps-1} steps in {dt:.1f}s -> {(timing_steps-1)/dt:.2f} it/s")
         print(f"    => 500k steps ~= {500_000/max((timing_steps-1)/dt,1e-9)/3600:.1f} h")
-    else:
+    elif chief:
         save_checkpoint(cfg.checkpoint_dir, start_step + n_steps, params, opt_state)
         logger.close()
         print("=== done ===")
 
 
 def main():
+    import os
+    # Multi-process DDP launch (one process per GPU): the launcher sets these env vars and
+    # CUDA_VISIBLE_DEVICES=<one gpu> per process. jax.distributed.initialize MUST run before any
+    # jax backend use (first jax.devices()/jit). Absent the env (single-process), this is skipped
+    # and everything behaves exactly as before.
+    _nproc = int(os.environ.get("RLT_NUM_PROCESSES", "1"))
+    if _nproc > 1:
+        jax.distributed.initialize(
+            coordinator_address=os.environ.get("RLT_COORDINATOR", "127.0.0.1:29500"),
+            num_processes=_nproc,
+            process_id=int(os.environ["RLT_PROCESS_ID"]))
     import tyro
     @dataclasses.dataclass
     class Args:
@@ -351,6 +384,7 @@ def main():
         warmup_skip: Optional[bool] = None # override td.warmup_skip (pure-MC beta=0 phase, no base_action read)
         checkpoint_base_dir: str = ""      # override where runs are written (run dir = base/<name>/<exp>); "" = config default
         memmap_dir: str = ""               # fast index loader: a path, or "auto" (= <data_root>_memmap, derived from the config's dataset); "" = parquet
+        build_memmap_only: bool = False    # build the memmap (if missing) then exit -- pre-build once before a multi-process DDP launch
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
@@ -386,6 +420,16 @@ def main():
         # the config's own dataset; no need to repeat the path. (Override with an explicit path,
         # e.g. --memmap_dir /dev/shm/foo, to put it on tmpfs.)
         cfg = dataclasses.replace(cfg, memmap_dir=cfg.data_root.rstrip("/") + "_memmap")
+    if args.build_memmap_only:
+        # Pre-build the memmap once (single process) so the DDP launch never races/barriers on it.
+        assert cfg.memmap_dir, "--build_memmap_only requires --memmap_dir (path or 'auto')"
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from preprocess_memmap import build_memmap, memmap_ready
+        if memmap_ready(cfg.memmap_dir):
+            print(f"[memmap] ready at {cfg.memmap_dir} (reuse)")
+        else:
+            build_memmap(cfg.data_root, cfg.memmap_dir, workers=cfg.num_workers)
+        return
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 
