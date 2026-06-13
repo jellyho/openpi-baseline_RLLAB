@@ -350,7 +350,7 @@ def main():
         preload: Optional[bool] = None     # override cfg.preload (decode whole dataset into RAM; loader_processes=0 only)
         warmup_skip: Optional[bool] = None # override td.warmup_skip (pure-MC beta=0 phase, no base_action read)
         checkpoint_base_dir: str = ""      # override where runs are written (run dir = base/<name>/<exp>); "" = config default
-        memmap_dir: str = ""               # fast index loader over this memmap dir (scripts/preprocess_memmap.py); "" = parquet
+        memmap_dir: str = ""               # fast index loader: a path, or "auto" (= <data_root>_memmap, derived from the config's dataset); "" = parquet
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
@@ -380,6 +380,12 @@ def main():
                               data_root_override=args.data_root or cfg.data_root_override,
                               checkpoint_base_dir=args.checkpoint_base_dir or cfg.checkpoint_base_dir,
                               memmap_dir=args.memmap_dir or cfg.memmap_dir)
+    if cfg.memmap_dir == "auto":
+        # Derive the memmap location FROM the dataset (cfg.data_root = data_root_override or
+        # TASKS[task]) -> <data_root>_memmap. So just `--config X --memmap_dir auto` builds + reads
+        # the config's own dataset; no need to repeat the path. (Override with an explicit path,
+        # e.g. --memmap_dir /dev/shm/foo, to put it on tmpfs.)
+        cfg = dataclasses.replace(cfg, memmap_dir=cfg.data_root.rstrip("/") + "_memmap")
     train(cfg, timing_steps=args.timing_steps, resume=args.resume)
 
 

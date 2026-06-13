@@ -2,63 +2,61 @@
 # ============================================================
 #  Stage 4 (FAST) — train the RLT/AQC critic over a frame-indexed MEMMAP.
 #
-#  Builds the memmap ONCE (scripts/preprocess_memmap.py), then runs DDP training
-#  that reads it by index. The memmap is page-cached in RAM and shared read-only
-#  across the DDP loader workers (one physical copy), so the loader is no longer
-#  the bottleneck: ~3.4x single-process and near-linear multi-process vs parquet
-#  (4w 232/s, 8w 431/s @ B=256). Drop-in alternative to stage4_train_critic.sh.
+#  CONFIG-FIRST: the preset's own data_root (data_root_override, or TASKS[task]) IS the
+#  dataset -- you don't repeat the path. train_rlt_critic.py auto-builds the memmap from it
+#  on first run (one-time) and reuses it after; the memmap is page-cached in RAM and shared
+#  read-only across the DDP loader workers, so the loader is no longer the bottleneck.
 #
 #  Usage:
-#    ./stage4_train_critic_memmap.sh <DATASET_ROOT> [CONFIG] [GPUS] [BATCH]
-#      DATASET_ROOT  annotated dataset (has rl_token/base_action/reward/mc_return)
-#      CONFIG        VLAAQCConfig preset (default vla_aqc_warmup)
-#      GPUS          comma list for DDP (default 0,1,2,3); BATCH must be divisible
-#      BATCH         global batch size (default 256)
+#    ./stage4_train_critic_memmap.sh [CONFIG] [GPUS] [BATCH]
+#      CONFIG  VLAAQCConfig preset (default vla_aqc_warmup); its data_root is the dataset
+#      GPUS    comma list for DDP (default 0,1,2,3); BATCH must be divisible
+#      BATCH   global batch size (default 1024)
 #
 #  Env:
-#    MEMMAP_DIR    build/read the memmap here (default <DATASET>_memmap). Put on a
-#                  fast disk, or /dev/shm if it fits in RAM (instant share).
-#    WORKERS       loader worker processes (default 8; they share the page cache).
-#    SUBSET        bootstrap_subset candidates (default 0 = all 32; 8 = 4x less
-#                  candidate read + host->device transfer, REDQ-style).
-#    MEM_FRACTION  XLA GPU mem cap (default 0.9; PREALLOCATE=false so it only grows
-#                  to need — LOWER to ~0.04 when sharing busy GPUs).
-#    CKPT_DIR      run output base (default $RLT_CRITIC_CKPT_DIR from setup_env.sh).
-#    EXTRA         extra args to train_rlt_critic.py (e.g. "--resume").
+#    DATA_ROOT     override the config's dataset path (default: the config's data_root)
+#    MEMMAP_DIR    memmap location (default "auto" = <data_root>_memmap; e.g. set to
+#                  /dev/shm/<name> for a RAM-tmpfs copy)
+#    WORKERS       loader worker processes (default 32; they share the page cache)
+#    SUBSET        bootstrap_subset candidates (default 0 = all 32; 8/16 = less candidate I/O)
+#    MEM_FRACTION  XLA GPU mem cap (default 0.9; PREALLOCATE=false so it only grows; LOWER to
+#                  ~0.04 when sharing busy GPUs)
+#    CKPT_DIR      run output base (default $RLT_CRITIC_CKPT_DIR from setup_env.sh)
+#    EXTRA         extra args to train_rlt_critic.py (e.g. "--resume")
 #
-#  Background it for overnight runs:
-#    nohup setsid ./stage4_train_critic_memmap.sh <DATASET> ... >/dev/null 2>&1 </dev/null &
+#  Examples:
+#    ./stage4_train_critic_memmap.sh vla_aqc_insert-mouse-battery          # uses the config's dataset
+#    DATA_ROOT=/path/to/other_ds ./stage4_train_critic_memmap.sh vla_aqc_warmup 0,1 512
+#    MEMMAP_DIR=/dev/shm/mb_mm SUBSET=16 ./stage4_train_critic_memmap.sh vla_aqc_insert-mouse-battery
+#  Background (overnight):
+#    nohup setsid ./stage4_train_critic_memmap.sh vla_aqc_insert-mouse-battery >/dev/null 2>&1 </dev/null &
 # ============================================================
 set -e
 source setup_env.sh
 
-DATASET="${1:?usage: ./stage4_train_critic_memmap.sh <DATASET_ROOT> [CONFIG] [GPUS] [BATCH]}"
-CONFIG="${2:-vla_aqc_warmup}"
-GPUS="${3:-0,1,2,3}"
-BATCH="${4:-1024}"
-MEMMAP_DIR="${MEMMAP_DIR:-${DATASET%/}_memmap}"
+CONFIG="${1:-vla_aqc_warmup}"
+GPUS="${2:-0,1,2,3}"
+BATCH="${3:-1024}"
+MEMMAP_DIR="${MEMMAP_DIR:-auto}"          # "auto" -> <data_root>_memmap (derived in train)
 WORKERS="${WORKERS:-32}"
 SUBSET="${SUBSET:-0}"
 MEM_FRACTION="${MEM_FRACTION:-0.9}"
 CKPT_DIR="${CKPT_DIR:-$RLT_CRITIC_CKPT_DIR}"
 EXTRA="${EXTRA:-}"
 
-# train_rlt_critic.py auto-builds the memmap from $DATASET on first run (one-time), then
-# reuses it -> a single command handles preprocessing. (To pre-build explicitly instead:
-#   uv run scripts/preprocess_memmap.py --input "$DATASET" --out "$MEMMAP_DIR" --workers 4)
-
-# DDP train over the memmap (--data_root tells the auto-builder where to read from).
 mkdir -p logs
 LOG="logs/rlt_critic_${CONFIG}_memmap_$(date +%Y%m%d-%H%M%S).log"
 NGPU=$(awk -F, '{print NF}' <<< "$GPUS")
 echo "config=$CONFIG  gpus=$GPUS (DDP x$NGPU)  batch=$BATCH (=$((BATCH / NGPU))/dev)  workers=$WORKERS  subset=$SUBSET"
-echo "memmap=$MEMMAP_DIR   ckpt=$CKPT_DIR"
+echo "memmap=$MEMMAP_DIR   data_root=${DATA_ROOT:-<config default>}   ckpt=$CKPT_DIR"
 echo "log -> $LOG"
 
+# --data_root is passed ONLY when DATA_ROOT is set (else the config's data_root_override drives it).
 CUDA_VISIBLE_DEVICES="$GPUS" \
 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \
 uv run scripts/train_rlt_critic.py \
-    --config "$CONFIG" --data_root "$DATASET" --memmap_dir "$MEMMAP_DIR" \
+    --config "$CONFIG" --memmap_dir "$MEMMAP_DIR" \
+    ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
     --batch_size "$BATCH" --loader_processes "$WORKERS" --bootstrap_subset "$SUBSET" \
     --checkpoint_base_dir "$CKPT_DIR" $EXTRA \
   2>&1 | tee "$LOG"
