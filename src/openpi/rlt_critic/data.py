@@ -442,6 +442,15 @@ class VLALeRobotDataset:
         else:
             is_term_frame = (rew >= -1e-6) | (rew <= -0.05)                 # (n,) inferred fallback
         term = ((valid > 0) & is_term_frame[end_c]).astype(np.float32)      # (S,P) genuine terminal
+        # Terminal truncation: a prefix whose N-step transition OVERSHOOTS a genuine terminal (end > Li,
+        # Li a real terminal) ends the macro-action AT the goal. Its value is then the start's realized
+        # return-to-go mc_return[start] with V(goal)=0 (no bootstrap past the goal) -- this gives the last
+        # < min(prefix)+N states, which otherwise have NO valid prefix, a proper TD target.
+        real_term = is_term_frame[np.clip(Li, 0, n - 1)]                    # (S,) Li is a genuine terminal
+        trunc = (end > Li[:, None]) & real_term[:, None]                    # (S,P) overshoots the terminal
+        valid = np.maximum(valid, trunc.astype(np.float32))                 # unmask truncated prefixes
+        end_c = np.where(trunc, Li[:, None], end_c)                         # clamp next-state to the terminal
+        term = ((valid > 0) & is_term_frame[end_c]).astype(np.float32)      # (S,P) recomputed (terminal at clamp)
 
         # h-step discounted realized reward, per prefix (loop over the few prefixes).
         cum = np.zeros((S, P), np.float32)
@@ -451,6 +460,9 @@ class VLALeRobotDataset:
                 idx = np.minimum(starts + j, Li)               # clamp within episode (only affects masked h)
                 acc += (gamma ** j) * rew[idx]
             cum[:, p] = acc
+        # Truncated prefixes: the realized return-to-goal IS mc_return[start]; V(goal)=0 (next_mc_return
+        # forced to 0 below) zeroes the bootstrap, so the target = mc_return[start] regardless of gamma^(h+N).
+        cum = np.where(trunc, mc[starts][:, None], cum).astype(np.float32)  # (S,P)
 
         N = ba.shape[1]
         nc = ba[end_c]                                                      # (S,P,N,H,Dr)
@@ -464,7 +476,7 @@ class VLALeRobotDataset:
             "cum_reward": cum,                                              # (S,P)
             "next_latents": rl[end_c],                                      # (S,P,2048)
             "next_candidates": nc.reshape(S, P, N, H * ACTION_DIM),         # (S,P,N',H*14)
-            "next_mc_return": mc[end_c],                                    # (S,P)
+            "next_mc_return": np.where(trunc, np.float32(0.0), mc[end_c]),  # (S,P) V(goal)=0 at truncated
             "mc_return": mc[starts],                                        # (S,) start-state V^beta (Cal-QL floor)
             "term": term,                                                   # (S,P)
             "valid": valid,                                                 # (S,P)
