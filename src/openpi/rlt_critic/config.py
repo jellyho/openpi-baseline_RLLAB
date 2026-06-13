@@ -446,10 +446,11 @@ _CONFIGS = [
     VLAAQCConfig(
         name="vla_aqc_insert-mouse-battery",
         task="insert-mouse-battery",
+        data_root_override="/NHNHOME/WORKSPACE/0526040008_A/jellyho/insert-mouse-battery_annotated_v3_augmented",
         notes="MC warmup (0k) -> hard TD switch (ramp=0), "
               "EMA target net (tau=0.005) for stability.",
         td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
-        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),  # faster convergence on the small set
+        optim=OptimConfig(num_train_steps=1_000_000, lr=3e-4),  # faster convergence on the small set
         log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
     ),
     VLAAQCConfig(
@@ -458,7 +459,7 @@ _CONFIGS = [
         notes="MC warmup (0k) -> hard TD switch (ramp=0), "
               "EMA target net (tau=0.005) for stability.",
         td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
-        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),  # faster convergence on the small set
+        optim=OptimConfig(num_train_steps=1_000_000, lr=3e-4),  # faster convergence on the small set
         log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
     ),
     VLAAQCConfig(
@@ -467,7 +468,7 @@ _CONFIGS = [
         notes="MC warmup (0k) -> hard TD switch (ramp=0), "
               "EMA target net (tau=0.005) for stability.",
         td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
-        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),
+        optim=OptimConfig(num_train_steps=1_000_000, lr=3e-4),
         log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
     ),
     VLAAQCConfig(
@@ -476,7 +477,7 @@ _CONFIGS = [
         notes="MC warmup (0k) -> hard TD switch (ramp=0), "
               "EMA target net (tau=0.005) for stability.",
         td=TDConfig(mc_warmup_steps=0, mc_ramp_steps=0),
-        optim=OptimConfig(num_train_steps=1_000_000, learning_rate=3e-4),
+        optim=OptimConfig(num_train_steps=1_000_000, lr=3e-4),
         log_interval=100, eval_interval=10_000, save_interval=50_000, keep_period=250_000,
     ),
     # ---- DEBUG exp2: paper-style PROGRESS reward (Sec 3.1, Eq.1) -------------------------
