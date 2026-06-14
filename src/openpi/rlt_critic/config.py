@@ -202,7 +202,7 @@ TASKS = {
     "insert-mouse-battery":  f"{_DATA_BASE}/insert-mouse-battery_annotated_v3_augmented",
     "seal-water-bottle-cap": f"{_DATA_BASE}/seal-water-bottle-cap_annotated_v3_augmented",
     "tower-of-hanoi-game":   f"{_DATA_BASE}/tower-of-hanoi-game_annotated_v3_augmented",
-    "generalist":   f"{_DATA_BASE}/generalist_annotated_v3_augmented",
+    "generalist":   f"{_DATA_BASE}/generalist_joint_annotated_v3_augmented",
 }
 
 

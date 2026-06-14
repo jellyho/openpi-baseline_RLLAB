@@ -4,8 +4,8 @@
 # the libraries to write caches into the current working directory (the repo).
 # Use the standard user cache location instead.
 
-export CACHE_DIR="${CACHE_DIR:-/NHNHOME/WORKSPACE/0526040008_A/jellyho}"
-# export CACHE_DIR="${CACHE_DIR:-/data5/jellyho}"
+# export CACHE_DIR="${CACHE_DIR:-/NHNHOME/WORKSPACE/0526040008_A/jellyho}"
+export CACHE_DIR="${CACHE_DIR:-/data5/jellyho}"
 export HF_HOME="${HF_HOME:-$CACHE_DIR/.cache/huggingface}"
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-$HF_HOME/lerobot}"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-$CACHE_DIR/.cache/openpi}"
@@ -29,7 +29,7 @@ export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_CO
 #   RLT_CRITIC_CKPT_DIR RLT/AQC critic runs (stage4_train_critic.sh) — dir =
 #                       <base>/<name>/<exp>.  Passed as --checkpoint_base_dir.
 export PI_CKPT_DIR="${PI_CKPT_DIR:-./checkpoints}"
-export RLT_CRITIC_CKPT_DIR="${RLT_CRITIC_CKPT_DIR:-$CACHE_DIR/PFR_RSS/checkpoints/rlt_critic_runs}"
+export RLT_CRITIC_CKPT_DIR="${RLT_CRITIC_CKPT_DIR:-$CACHE_DIR/PFR_RSS/checkpoints/rlt_critic_runs_hk}"
 
 # Machine-specific roots read by config.py / rlt_critic/config.py so the per-config
 # paths don't have to be hand-edited when moving boxes. Override here per machine.

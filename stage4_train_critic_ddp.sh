@@ -30,8 +30,8 @@ set -e
 source setup_env.sh
 
 CONFIG="${1:-vla_aqc_warmup}"
-GPUS="${2:-0,1,2,3}"
-BATCH="${3:-1024}"
+GPUS="${2:-0,1,2,3,4,5,6,7}"
+BATCH="${3:-4096}"
 MEMMAP_DIR="${MEMMAP_DIR:-auto}"
 SUBSET="${SUBSET:-0}"
 MEM_FRACTION="${MEM_FRACTION:-0.9}"

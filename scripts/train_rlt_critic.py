@@ -20,6 +20,7 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 import numpy as np
 import flax.serialization as fs
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -266,9 +267,11 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     # eval module (openpi.rlt_critic.eval_curves) is present. Stage-1 critic training doesn't
     # need it, so skip cleanly when it's absent.
     vla_eval, eval_set = None, None
-    # Offline eval runs single-device eager ops on the chief only; under multi-process DDP that
-    # would desync the collective lockstep (other procs never call it), so skip it when n_proc>1.
-    if logger and n_proc == 1:
+    # Offline eval (value-curve viz) runs single-device EAGER ops on the chief only (net.apply on
+    # a host copy of the replicated params -> no cross-process collective).  Under multi-process
+    # DDP we keep the collective lockstep in sync by bracketing the chief's eval with
+    # sync_global_devices barriers (in the loop below), so it is safe to enable for n_proc>1.
+    if logger:
         try:
             from openpi.rlt_critic import eval_curves as vla_eval
             eval_set = vla_eval.build_eval_set(ds, n_success=cfg.eval_n_success,
@@ -323,16 +326,24 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
             else:                                              # non-tty heartbeat line
                 print(f"  step {step:>7}/{end_step} loss={m['critic_loss']:.4f} "
                       f"q={m.get('q_mean', 0):.4f} {sps:.1f} it/s", flush=True)
-        if logger and vla_eval is not None and eval_set and step > start_step and step % cfg.eval_interval == 0:
-            import matplotlib.pyplot as plt
-            # device_get: eval builds its own single-device inputs, which can't mix with
-            # mesh-replicated params in eager ops; a host copy (~60MB) sidesteps that.
-            curves = vla_eval.compute_curves(trainer, jax.device_get(params), eval_set,
-                                             cfg.horizon, cfg.action_dim)
-            fig = vla_eval.plot_curves(curves, cfg.dist.v_min, cfg.dist.v_max)
-            logger.log_image(step, "eval/value_curves", fig)
-            plt.close(fig)
-            pbar.write(f"  [eval {step}] logged eval/value_curves to W&B")
+        # Offline value-curve eval.  The trigger is purely STEP-based so every process evaluates it
+        # identically and enters the barriers together (collective lockstep preserved).  Only the
+        # chief runs the actual single-device eval + W&B log between the barriers; the other procs
+        # idle at eval_post until it returns.  device_get of the replicated params is a local d2h
+        # copy and net.apply is eager single-device -> NO collective inside the bracket.
+        if step > start_step and step % cfg.eval_interval == 0:
+            if n_proc > 1:
+                multihost_utils.sync_global_devices(f"eval_pre_{step}")
+            if logger and vla_eval is not None and eval_set:
+                import matplotlib.pyplot as plt
+                curves = vla_eval.compute_curves(trainer, jax.device_get(params), eval_set,
+                                                 cfg.horizon, cfg.action_dim)
+                fig = vla_eval.plot_curves(curves, cfg.dist.v_min, cfg.dist.v_max)
+                logger.log_image(step, "eval/value_curves", fig)
+                plt.close(fig)
+                pbar.write(f"  [eval {step}] logged eval/value_curves to W&B")
+            if n_proc > 1:
+                multihost_utils.sync_global_devices(f"eval_post_{step}")
         if logger and step > start_step and step % cfg.save_interval == 0:
             save_checkpoint(cfg.checkpoint_dir, step, params, opt_state)
             prune_checkpoints(cfg.checkpoint_dir, cfg.keep_period)
