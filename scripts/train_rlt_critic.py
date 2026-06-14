@@ -204,7 +204,6 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
                 print(f"    [memmap] not found at {cfg.memmap_dir} -> building from {cfg.data_root} (one-time)...")
                 build_memmap(cfg.data_root, cfg.memmap_dir, workers=cfg.num_workers)
             if n_proc > 1:
-                from jax.experimental import multihost_utils
                 multihost_utils.sync_global_devices("rlt_memmap_built")
     ds = make_dataset(ds_kwargs)           # MemmapVLADataset if cfg.memmap_dir set, else parquet
     if cfg.memmap_dir:
