@@ -19,6 +19,10 @@
 #  Env:
 #    DATA_ROOT, MEMMAP_DIR, SUBSET, MEM_FRACTION, CKPT_DIR, EXTRA  -- as in the memmap script
 #    PORT          jax.distributed coordinator port (default 29500)
+#    SHM           set SHM=1 to stage the memmap on /dev/shm (tmpfs=RAM) so loader reads NEVER
+#                  touch lustre -- removes the cold-page / hanging-lustre-read straggler that can
+#                  collapse DDP from 45 to ~0.2 it/s. OFF by default (lustre + page-cache warm).
+#                  Needs the memmap (~171G) to fit in /dev/shm.
 #
 #  Examples:
 #    ./stage4_train_critic_ddp.sh vla_aqc_insert-mouse-battery 0,1,2,3 1024
@@ -59,6 +63,28 @@ CUDA_VISIBLE_DEVICES="" \
 uv run scripts/train_rlt_critic.py --config "$CONFIG" --memmap_dir "$MEMMAP_DIR" \
     ${DATA_ROOT:+--data_root "$DATA_ROOT"} --build_memmap_only \
   2>&1 | tee -a "$LOG"
+
+# 1b) OPTIONAL (SHM=1): stage the (already-built, warm) lustre memmap onto /dev/shm = tmpfs = RAM.
+#     tmpfs pages are never reclaimed and never backed by lustre, so loader reads can never miss
+#     the cache or hang on a slow OST -> kills the straggler that collapses DDP. Off by default.
+if [ -n "$SHM" ]; then
+  LUSTRE_MM=$(CUDA_VISIBLE_DEVICES="" uv run scripts/train_rlt_critic.py --config "$CONFIG" \
+      --memmap_dir "$MEMMAP_DIR" ${DATA_ROOT:+--data_root "$DATA_ROOT"} --print_memmap_dir 2>/dev/null | tail -1)
+  SHM_MM="/dev/shm/$(basename "$LUSTRE_MM")"
+  NEED_KB=$(du -sk "$LUSTRE_MM" 2>/dev/null | cut -f1)
+  FREE_KB=$(df -k --output=avail /dev/shm | tail -1)
+  echo "=== SHM: stage $LUSTRE_MM -> $SHM_MM (need $((NEED_KB/1024/1024))G, /dev/shm free $((FREE_KB/1024/1024))G) ==="
+  if [ -f "$SHM_MM/meta.json" ]; then
+    echo "    already staged ($(du -sh "$SHM_MM" 2>/dev/null | cut -f1))"
+  elif (( FREE_KB < NEED_KB + 5*1024*1024 )); then
+    echo "ERROR: /dev/shm too small for the memmap (need ~$((NEED_KB/1024/1024))G + headroom). Unset SHM or free /dev/shm."; exit 1
+  else
+    mkdir -p "$SHM_MM"
+    cp -a "$LUSTRE_MM"/. "$SHM_MM"/        # source pages are warm in cache -> fast RAM->RAM copy
+    echo "    staged $(du -sh "$SHM_MM" 2>/dev/null | cut -f1)"
+  fi
+  MEMMAP_DIR="$SHM_MM"                       # training procs now read from RAM, never lustre
+fi
 
 # 2) Spawn one process per GPU. Each sees a single GPU (CUDA_VISIBLE_DEVICES) and its DDP rank
 #    via RLT_* env. EVERY rank writes its own log file (so a non-chief crash is debuggable -- a

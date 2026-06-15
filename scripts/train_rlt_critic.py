@@ -423,6 +423,7 @@ def main():
         memmap_dir: str = ""               # fast index loader: a path, or "auto" (= <data_root>_memmap, derived from the config's dataset); "" = parquet
         build_memmap_only: bool = False    # build the memmap (if missing) then exit -- pre-build once before a multi-process DDP launch
         no_warm: bool = False              # skip the startup page-cache warm (use only if the memmap is already resident in RAM)
+        print_memmap_dir: bool = False     # resolve the memmap dir (after 'auto') and print it, then exit -- for launcher scripting
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
@@ -458,6 +459,9 @@ def main():
         # the config's own dataset; no need to repeat the path. (Override with an explicit path,
         # e.g. --memmap_dir /dev/shm/foo, to put it on tmpfs.)
         cfg = dataclasses.replace(cfg, memmap_dir=cfg.data_root.rstrip("/") + "_memmap")
+    if args.print_memmap_dir:
+        print(cfg.memmap_dir)
+        return
     if args.build_memmap_only:
         # Pre-build the memmap once (single process) so the DDP launch never races/barriers on it.
         assert cfg.memmap_dir, "--build_memmap_only requires --memmap_dir (path or 'auto')"
