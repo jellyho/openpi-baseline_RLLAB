@@ -37,7 +37,7 @@ SUBSET="${SUBSET:-0}"
 MEM_FRACTION="${MEM_FRACTION:-0.9}"
 CKPT_DIR="${CKPT_DIR:-$RLT_CRITIC_CKPT_DIR}"
 PORT="${PORT:-29500}"
-EXTRA="${EXTRA:-}"
+EXTRA="${EXTRA:---resume}"
 
 IFS=',' read -ra GPU_ARR <<< "$GPUS"
 NGPU=${#GPU_ARR[@]}
@@ -49,7 +49,7 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="logs/rlt_critic_${CONFIG}_ddp_${STAMP}.log"
 echo "config=$CONFIG  DDP(multi-process) x$NGPU  gpus=$GPUS  global_batch=$BATCH (=$((BATCH/NGPU))/proc)  subset=$SUBSET"
 echo "memmap=$MEMMAP_DIR  data_root=${DATA_ROOT:-<config default>}  ckpt=$CKPT_DIR  port=$PORT"
-echo "chief log -> $LOG  (non-chief procs -> /dev/null)"
+echo "chief log -> $LOG  (rank N -> ${LOG%.log}_rankN.log)"
 
 # 1) Pre-build the memmap ONCE (single process, no DDP) so the workers never race on it, and
 #    warm the page cache (a fresh memmap is cold on lustre -> random gathers crawl -> DDP collapses
@@ -61,11 +61,15 @@ uv run scripts/train_rlt_critic.py --config "$CONFIG" --memmap_dir "$MEMMAP_DIR"
   2>&1 | tee -a "$LOG"
 
 # 2) Spawn one process per GPU. Each sees a single GPU (CUDA_VISIBLE_DEVICES) and its DDP rank
-#    via RLT_* env. Chief (rank 0) -> tee to the log; others -> /dev/null.
+#    via RLT_* env. EVERY rank writes its own log file (so a non-chief crash is debuggable -- a
+#    DDP job dies whole when ANY rank faults, and the coordination error only names the dead
+#    rank, not WHY); rank 0 additionally tees to the chief log for a live view. Use `python -u`
+#    (PYTHONUNBUFFERED) so the last lines before a crash are actually flushed.
 echo "=== launch $NGPU DDP processes ==="
 PIDS=()
 for i in "${!GPU_ARR[@]}"; do
   GPU="${GPU_ARR[$i]}"
+  RANK_LOG="${LOG%.log}_rank${i}.log"
   COMMON=( scripts/train_rlt_critic.py
     --config "$CONFIG" --memmap_dir "$MEMMAP_DIR"
     ${DATA_ROOT:+--data_root "$DATA_ROOT"}
@@ -73,12 +77,12 @@ for i in "${!GPU_ARR[@]}"; do
     --checkpoint_base_dir "$CKPT_DIR" --no_warm $EXTRA )   # pre-build step above already warmed the cache
   if [ "$i" -eq 0 ]; then
     CUDA_VISIBLE_DEVICES="$GPU" RLT_NUM_PROCESSES="$NGPU" RLT_PROCESS_ID="$i" RLT_COORDINATOR="127.0.0.1:$PORT" \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \
-    uv run "${COMMON[@]}" 2>&1 | tee -a "$LOG" &
+    PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \
+    uv run "${COMMON[@]}" 2>&1 | tee -a "$LOG" "$RANK_LOG" &
   else
     CUDA_VISIBLE_DEVICES="$GPU" RLT_NUM_PROCESSES="$NGPU" RLT_PROCESS_ID="$i" RLT_COORDINATOR="127.0.0.1:$PORT" \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \
-    uv run "${COMMON[@]}" >/dev/null 2>&1 &
+    PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \
+    uv run "${COMMON[@]}" > "$RANK_LOG" 2>&1 &
   fi
   PIDS+=($!)
 done
