@@ -188,6 +188,7 @@ def main():
     # ── Critic forward (batched over frames) ───────────────────────────────────
     V_gt = np.empty(T, np.float32); V_adapt = np.empty(T, np.float32)
     h_star = np.empty(T, np.int32); n_star = np.empty(T, np.int32)
+    q_cand = np.empty((T, N), np.float32)          # per-candidate value (best-over-prefix per cand.)
     for s0 in range(0, T, args.frame_batch):
         s1 = min(s0 + args.frame_batch, T); bsz = s1 - s0
         q_gt = np.asarray(critic_fn(jnp.asarray(z[s0:s1]), jnp.asarray(gt[s0:s1].reshape(bsz, -1))))
@@ -198,17 +199,23 @@ def main():
         flat = q_c.reshape(bsz, -1).argmax(axis=1)
         ns, mk = np.divmod(flat, macro_H)
         V_adapt[s0:s1] = q_c.reshape(bsz, -1).max(axis=1)
+        q_cand[s0:s1] = q_c.max(axis=2)            # each candidate's best-prefix value -> [bsz, N]
         h_star[s0:s1] = (mk + 1) * macro_g; n_star[s0:s1] = ns
 
+    # Per-frame distribution of the N candidate values (the spread of the VLA samples' quality).
+    qc_lo, qc_hi = q_cand.min(1), q_cand.max(1)
+    qc_p25, qc_p75 = np.percentile(q_cand, [25, 75], axis=1)
+    qc_med = np.median(q_cand, axis=1)
     print(f"V_gt:[{V_gt.min():.3f},{V_gt.max():.3f}] MAE_vs_mc={np.mean(np.abs(V_gt-mc)):.3f} | "
-          f"V_adapt:[{V_adapt.min():.3f},{V_adapt.max():.3f}] | h*: mean={h_star.mean():.1f}")
+          f"V_adapt:[{V_adapt.min():.3f},{V_adapt.max():.3f}] | "
+          f"cand spread(mean min..max)=[{qc_lo.mean():.3f}..{qc_hi.mean():.3f}] | h*: mean={h_star.mean():.1f}")
 
     # ── Render mp4 ─────────────────────────────────────────────────────────────
     out_path = pathlib.Path(args.output); out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = imageio.get_writer(str(out_path), fps=args.fps)
     x = np.arange(T)
-    vmin = min(mc.min(), V_gt.min(), V_adapt.min()) - 0.05
-    vmax = max(mc.max(), V_gt.max(), V_adapt.max(), 0.0) + 0.05
+    vmin = min(mc.min(), V_gt.min(), qc_lo.min()) - 0.05
+    vmax = max(mc.max(), V_gt.max(), qc_hi.max(), 0.0) + 0.05
 
     def shade_teleop(ax):
         # contiguous teleop spans → light red bands (human in control).
@@ -235,13 +242,22 @@ def main():
 
         shade_teleop(ax_v)
         ax_v.plot(x, mc, color="#888", lw=2, label="GT MC return")
-        ax_v.plot(x[:t+1], V_gt[:t+1], color="#2e86de", lw=2, label="critic V (demo action)")
-        ax_v.plot(x[:t+1], V_adapt[:t+1], color="#27ae60", lw=2, label="V adaptive (best cand.)")
-        ax_v.scatter([t], [V_adapt[t]], color="#27ae60", zorder=5, s=20)
+        # distribution of the N candidate values over the episode: min–max spread + IQR + median.
+        ax_v.fill_between(x, qc_lo, qc_hi, color="#27ae60", alpha=0.10, lw=0,
+                          label=f"{N} cand. spread")
+        ax_v.fill_between(x, qc_p25, qc_p75, color="#27ae60", alpha=0.22, lw=0, label="cand. IQR")
+        ax_v.plot(x, qc_med, color="#27ae60", lw=1, ls=":", alpha=0.7, label="cand. median")
+        ax_v.plot(x[:t+1], V_gt[:t+1], color="#2e86de", lw=2, label="critic V (demo)")
+        ax_v.plot(x[:t+1], V_adapt[:t+1], color="#1e8449", lw=2, label="V adaptive (max cand.)")
+        # the actual N candidate values at the CURRENT frame (instantaneous distribution).
+        ax_v.scatter(np.full(N, t), q_cand[t], color="#27ae60", s=10, alpha=0.55,
+                     zorder=4, edgecolors="none")
+        ax_v.scatter([t], [V_adapt[t]], color="#1e8449", zorder=5, s=24)
         ax_v.axvline(t, color="#ccc", ls="--", lw=1)
         ax_v.set_xlim(0, T-1); ax_v.set_ylim(vmin, vmax); ax_v.set_ylabel("value"); ax_v.grid(alpha=0.3)
-        ax_v.legend(loc="lower right", fontsize=8)
-        ax_v.set_title(f"V_demo={V_gt[t]:.3f}  V_adapt={V_adapt[t]:.3f}  GT={mc[t]:.3f}")
+        ax_v.legend(loc="lower right", fontsize=7, ncol=2)
+        ax_v.set_title(f"V_demo={V_gt[t]:.3f}  V_adapt(max)={V_adapt[t]:.3f}  "
+                       f"cand=[{q_cand[t].min():.3f}, {q_cand[t].max():.3f}]  GT={mc[t]:.3f}")
 
         shade_teleop(ax_h)
         ax_h.step(x[:t+1], h_star[:t+1], where="post", color="#e67e22", lw=2)
