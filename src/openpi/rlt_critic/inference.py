@@ -35,6 +35,7 @@ import numpy as np
 from openpi_client import base_policy as _base_policy
 
 import openpi.models.model as _model
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.transforms as _transforms
@@ -89,18 +90,19 @@ class AQCAdaptive:
         self.rlt_config_name = rlt_config_name
         self._joint = hasattr(model, "extract_token_and_base_actions")
 
-        # jit the (frozen) RLT extractors.
+        # jit the (frozen) RLT extractors via module_jit, NOT a raw `jax.jit(lambda obs: model.m(obs))`.
+        # A closure over `model` makes XLA bake the 2B params into each executable as a multi-GB
+        # CONSTANT (allocated out-of-pool, lazily on first run) — that duplicated the weights on the
+        # GPU and OOMed inference ("Failed to allocate ... for new constant"). module_jit splits the
+        # module and passes its state as a JIT ARGUMENT (the existing on-device buffer), so there is
+        # no baked constant and no duplicate copy. Same compute; ~half the GPU memory.
         if self._joint:
-            self._extract_both = jax.jit(
-                lambda rng, obs, n: model.extract_token_and_base_actions(
-                    rng, obs, num_samples=n, num_steps=self.num_flow_steps),
-                static_argnums=(2,))
+            self._extract_both = nnx_utils.module_jit(
+                model.extract_token_and_base_actions, static_argnames=("num_samples", "num_steps"))
         else:
-            self._extract_token = jax.jit(lambda obs: model.extract_rl_token(obs))
-            self._sample_base = jax.jit(
-                lambda rng, obs, n: model.sample_base_actions(
-                    rng, obs, num_samples=n, num_steps=self.num_flow_steps),
-                static_argnums=(2,))
+            self._extract_token = nnx_utils.module_jit(model.extract_rl_token)
+            self._sample_base = nnx_utils.module_jit(
+                model.sample_base_actions, static_argnames=("num_samples", "num_steps"))
 
         # jit the critic forward -> expected scalar prefix values (always distributional here).
         def _prefix_values(obs2d, act2d):
@@ -156,10 +158,12 @@ class AQCAdaptive:
     def _propose(self, rng, observation, num_samples):
         """RLT forward -> (z_rl [1,L], base [1,N,H,Dm-model])."""
         if self._joint:
-            z_rl, base = self._extract_both(rng, observation, num_samples)
+            z_rl, base = self._extract_both(
+                rng, observation, num_samples=num_samples, num_steps=self.num_flow_steps)
         else:
             z_rl = self._extract_token(observation)
-            base = self._sample_base(rng, observation, num_samples)
+            base = self._sample_base(
+                rng, observation, num_samples=num_samples, num_steps=self.num_flow_steps)
         return z_rl, base
 
     def _score(self, z_rl, base_raw):
