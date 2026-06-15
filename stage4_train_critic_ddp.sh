@@ -30,8 +30,8 @@ set -e
 source setup_env.sh
 
 CONFIG="${1:-vla_aqc_warmup}"
-GPUS="${2:-0,1,2,3,4,5,6,7}"
-BATCH="${3:-4096}"
+GPUS="${2:-0,1,2,3}"
+BATCH="${3:-2048}"
 MEMMAP_DIR="${MEMMAP_DIR:-auto}"
 SUBSET="${SUBSET:-0}"
 MEM_FRACTION="${MEM_FRACTION:-0.9}"
@@ -51,9 +51,10 @@ echo "config=$CONFIG  DDP(multi-process) x$NGPU  gpus=$GPUS  global_batch=$BATCH
 echo "memmap=$MEMMAP_DIR  data_root=${DATA_ROOT:-<config default>}  ckpt=$CKPT_DIR  port=$PORT"
 echo "chief log -> $LOG  (non-chief procs -> /dev/null)"
 
-# 1) Pre-build the memmap ONCE (single process, no DDP) so the workers never race on it.
-#    Instant no-op if it already exists.
-echo "=== pre-build memmap (one-time, no-op if present) ==="
+# 1) Pre-build the memmap ONCE (single process, no DDP) so the workers never race on it, and
+#    warm the page cache (a fresh memmap is cold on lustre -> random gathers crawl -> DDP collapses
+#    to ~0.2 it/s; one sequential pass pulls it into RAM). Both are no-ops if already done.
+echo "=== pre-build + warm memmap (one-time) ==="
 CUDA_VISIBLE_DEVICES="" \
 uv run scripts/train_rlt_critic.py --config "$CONFIG" --memmap_dir "$MEMMAP_DIR" \
     ${DATA_ROOT:+--data_root "$DATA_ROOT"} --build_memmap_only \
@@ -69,7 +70,7 @@ for i in "${!GPU_ARR[@]}"; do
     --config "$CONFIG" --memmap_dir "$MEMMAP_DIR"
     ${DATA_ROOT:+--data_root "$DATA_ROOT"}
     --batch_size "$BATCH" --loader_processes 0 --bootstrap_subset "$SUBSET"
-    --checkpoint_base_dir "$CKPT_DIR" $EXTRA )
+    --checkpoint_base_dir "$CKPT_DIR" --no_warm $EXTRA )   # pre-build step above already warmed the cache
   if [ "$i" -eq 0 ]; then
     CUDA_VISIBLE_DEVICES="$GPU" RLT_NUM_PROCESSES="$NGPU" RLT_PROCESS_ID="$i" RLT_COORDINATOR="127.0.0.1:$PORT" \
     XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION="$MEM_FRACTION" \

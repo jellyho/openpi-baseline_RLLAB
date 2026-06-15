@@ -126,7 +126,25 @@ def reward_scale(cfg: VLAAQCConfig) -> float:
 
 
 # --------------------------------------------------------------------------- train
-def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
+def _warm_page_cache(memmap_dir) -> tuple:
+    """Sequentially read every .dat into the OS page cache so the loader's RANDOM frame gathers
+    hit RAM rather than cold lustre. A FRESH (just-built) memmap is uncached -> random 1024-frame
+    gathers cost ~200ms over the network FS, and under DDP lockstep that collapses throughput
+    (the slowest rank gates every all-reduce: 0.2 it/s, GPUs 0/100/0/100). One sequential pass at
+    lustre seq-BW (~25s for 167GB) fixes it; with abundant RAM the pages then stay resident."""
+    import glob
+    t = time.time(); total = 0
+    for f in sorted(glob.glob(str(pathlib.Path(memmap_dir) / "*.dat"))):
+        with open(f, "rb", buffering=0) as fh:
+            while True:
+                chunk = fh.read(1 << 28)            # 256MB sequential reads
+                if not chunk:
+                    break
+                total += len(chunk)
+    return total, time.time() - t
+
+
+def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False, warm_cache: bool = True):
     # Multi-process DDP (one OS process per GPU, jax.distributed): n_proc>1 here. The chief
     # (process 0) owns all host-side side effects -- logging, checkpoints, the one-time memmap
     # build -- while every process drives its single local GPU and XLA inserts the cross-process
@@ -209,6 +227,15 @@ def train(cfg: VLAAQCConfig, timing_steps: int = 0, resume: bool = False):
     if cfg.memmap_dir:
         print(f"    [memmap] fast index loader on {cfg.memmap_dir}")
     print(f"    data: {ds.summary()}")
+    if cfg.memmap_dir and warm_cache:
+        # Pull the memmap into the page cache up front so random gathers hit RAM. The chief warms
+        # it (the cache is shared across all DDP processes); the others wait on the barrier. Without
+        # this, a freshly-built dataset trains at ~0.2 it/s until the cache slowly self-warms.
+        if chief:
+            gb, dt = _warm_page_cache(cfg.memmap_dir)
+            print(f"    [memmap] page-cache warm: {gb/1e9:.0f} GB in {dt:.0f}s (random gathers now hit RAM)")
+        if n_proc > 1:
+            multihost_utils.sync_global_devices("rlt_memmap_warm")
     rscale = reward_scale(cfg)
 
     # warmup-skip: during the beta=0 MC warmup, train a pure-MC step that never reads base_action.
@@ -395,6 +422,7 @@ def main():
         checkpoint_base_dir: str = ""      # override where runs are written (run dir = base/<name>/<exp>); "" = config default
         memmap_dir: str = ""               # fast index loader: a path, or "auto" (= <data_root>_memmap, derived from the config's dataset); "" = parquet
         build_memmap_only: bool = False    # build the memmap (if missing) then exit -- pre-build once before a multi-process DDP launch
+        no_warm: bool = False              # skip the startup page-cache warm (use only if the memmap is already resident in RAM)
     args = tyro.cli(Args)
     cfg = get_config(args.config)
     if args.loader_processes >= 0:
@@ -439,8 +467,10 @@ def main():
             print(f"[memmap] ready at {cfg.memmap_dir} (reuse)")
         else:
             build_memmap(cfg.data_root, cfg.memmap_dir, workers=cfg.num_workers)
+        gb, dt = _warm_page_cache(cfg.memmap_dir)      # warm now so the DDP procs start hot
+        print(f"[memmap] page-cache warm: {gb/1e9:.0f} GB in {dt:.0f}s")
         return
-    train(cfg, timing_steps=args.timing_steps, resume=args.resume)
+    train(cfg, timing_steps=args.timing_steps, resume=args.resume, warm_cache=not args.no_warm)
 
 
 if __name__ == "__main__":
